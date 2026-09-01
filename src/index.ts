@@ -1,4 +1,4 @@
-// 插件入口：导出 7 个 SSH 工具 + 会话生命周期管理 + HTTP 终端记录服务
+// 插件入口：导出 5 个 SSH 工具 + 会话生命周期管理 + HTTP 终端记录服务
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
@@ -11,24 +11,45 @@ import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
 import { createDecider } from "./permission.js"
 import { SshSession, type SessionStatus } from "./session.js"
-import { startServer, type ServerHandle } from "./server.js"
+import { startServer, type ServerHandle, type SessionEntry } from "./server.js"
 
 const log = createLogger("opencode-ssh-tool")
 
-/** 会话表：key = opencode sessionID */
-export const sshSessions = new Map<string, SshSession>()
+/** 默认终端名（不传 name 时用） */
+const DEFAULT_NAME = "default"
+
+/** 会话表：key = opencode sessionID → 内层 key = 终端名 → SshSession */
+export const sshSessions = new Map<string, Map<string, SshSession>>()
+
+/** 会话元信息（标题/目录，供 HTTP 页面显示），key = sessionID */
+const sessionMeta = new Map<string, { title: string; directory: string }>()
 
 /** HTTP 终端记录服务句柄（可能未启用） */
 let httpServer: ServerHandle | null = null
 
 /** 进程退出兜底：关闭全部连接 */
 process.on("exit", () => {
-  for (const s of sshSessions.values()) s.close()
+  for (const map of sshSessions.values()) for (const s of map.values()) s.close()
 })
 
-/** 按 sessionID 取会话 */
-function getSession(sessionID: string): SshSession | undefined {
+/** 按 sessionID 取内层终端表（无则返回 undefined） */
+function getSessionMap(sessionID: string): Map<string, SshSession> | undefined {
   return sshSessions.get(sessionID)
+}
+
+/** 按 sessionID + 终端名取会话（name 默认 default） */
+function getSession(sessionID: string, name = DEFAULT_NAME): SshSession | undefined {
+  return getSessionMap(sessionID)?.get(name)
+}
+
+/** 扁平化会话条目列表（供 HTTP 服务展示） */
+function listSessionEntries(): SessionEntry[] {
+  const entries: SessionEntry[] = []
+  for (const [sessionID, map] of sshSessions) {
+    const meta = sessionMeta.get(sessionID)
+    for (const [name, session] of map) entries.push({ sessionID, name, session, title: meta?.title, directory: meta?.directory })
+  }
+  return entries
 }
 
 /** 插件缓存根目录（历史消息对存文件，随会话清理） */
@@ -37,14 +58,31 @@ function cacheRoot(): string {
   return join(home, CACHE_DIR)
 }
 
-/** 清理指定会话：关闭 SSH 连接 + 删除缓存目录 + 从会话表移除 */
-function cleanupSession(sessionID: string): void {
-  const session = sshSessions.get(sessionID)
+/** 清理指定会话（一个终端）：关闭连接 + 删缓存目录 + 从会话表移除 */
+function cleanupSession(sessionID: string, name = DEFAULT_NAME): void {
+  const map = getSessionMap(sessionID)
+  const session = map?.get(name)
   if (session) {
     session.close() // 内部会 history.dispose() 删除缓存目录
+    map!.delete(name)
+    if (map!.size === 0) sshSessions.delete(sessionID)
+  } else {
+    // 无活动连接：直接删该终端缓存目录（如有残留）
+    try {
+      rmSync(join(cacheRoot(), sessionID, name), { recursive: true, force: true })
+    } catch {
+      /* 忽略 */
+    }
+  }
+}
+
+/** 清理一个 sessionID 下全部终端 */
+function cleanupAllSessions(sessionID: string): void {
+  const map = getSessionMap(sessionID)
+  if (map) {
+    for (const s of map.values()) s.close()
     sshSessions.delete(sessionID)
   } else {
-    // 无活动连接：直接删该会话缓存目录（如有残留）
     try {
       rmSync(join(cacheRoot(), sessionID), { recursive: true, force: true })
     } catch {
@@ -64,7 +102,7 @@ export const OpenCodeSshTool: Plugin = async () => {
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
   if (cfg.server.enabled) {
     try {
-      httpServer = await startServer(cfg.server.port, () => sshSessions)
+      httpServer = await startServer(cfg.server.port, listSessionEntries)
       log.info(`HTTP 服务已启动 ${httpServer.url}`)
     } catch (e) {
       log.error("HTTP 服务启动失败", e instanceof Error ? e : String(e))
@@ -75,12 +113,20 @@ export const OpenCodeSshTool: Plugin = async () => {
 
   return {
     event: async ({ event }) => {
-      // 会话删除时清理：关闭连接 + 删缓存目录
+      // 会话创建/更新时记录标题与目录（供 HTTP 页面显示会话名称）
+      if (event.type === "session.created" || event.type === "session.updated") {
+        const info = (event as { properties?: { info?: { id?: string; title?: string; directory?: string } } }).properties?.info
+        if (info?.id) {
+          sessionMeta.set(info.id, { title: info.title ?? "", directory: info.directory ?? "" })
+        }
+      }
+      // 会话删除时清理：关闭全部终端连接 + 删缓存目录 + 删元信息
       if (event.type === "session.deleted") {
-        const props = event.properties as Record<string, unknown> | undefined
-        const sid = props?.sessionID as string | undefined
+        const info = (event as { properties?: { info?: { id?: string } } }).properties?.info
+        const sid = info?.id
         if (sid) {
-          cleanupSession(sid)
+          cleanupAllSessions(sid)
+          sessionMeta.delete(sid)
           log.info(`会话 ${sid} 删除，已清理`)
         }
       }
@@ -92,9 +138,11 @@ export const OpenCodeSshTool: Plugin = async () => {
           host: tool.schema.string().describe(T.ssh_connect_args.host[lang]),
           user: tool.schema.string().describe(T.ssh_connect_args.user[lang]),
           port: tool.schema.number().optional().describe(T.ssh_connect_args.port[lang]),
+          name: tool.schema.string().optional().describe(T.ssh_connect_args.name[lang]),
         },
         async execute(args, context) {
           const { sessionID } = context
+          const name = args.name ?? DEFAULT_NAME
           try {
             await context.ask({
               permission: "ssh_connect",
@@ -106,16 +154,17 @@ export const OpenCodeSshTool: Plugin = async () => {
             return tr("rejected_connect", lang)
           }
 
-          // 同 sessionID 已有连接 → 先关旧的
-          const old = getSession(sessionID)
+          // 同名终端已有连接 → 先关旧的
+          const map = getSessionMap(sessionID)
+          const old = map?.get(name)
           if (old) {
             old.close()
-            sshSessions.delete(sessionID)
+            map!.delete(name)
           }
 
-          const session = new SshSession(sessionID, new SessionHistory(cacheRoot(), sessionID, cfg.history.maxMessages))
+          const session = new SshSession(sessionID, new SessionHistory(join(cacheRoot(), sessionID), name, cfg.history.maxMessages), name)
           const result = await session.connect(args)
-          log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22 })
+          log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22, name })
 
           if (!result.ok) {
             return {
@@ -124,15 +173,17 @@ export const OpenCodeSshTool: Plugin = async () => {
             }
           }
 
-          sshSessions.set(sessionID, session)
+          if (!map) sshSessions.set(sessionID, new Map())
+          sshSessions.get(sessionID)!.set(name, session)
           return {
             title: `${tr("connect_title_ok", lang)} ${args.user}@${args.host}`,
             output: tr("connect_ok", lang)
               .replace("{user}", args.user)
               .replace("{host}", args.host)
               .replace("{port}", String(args.port ?? 22))
-              .replace("{sid}", sessionID),
-            metadata: { host: args.host, user: args.user, port: args.port ?? 22 },
+              .replace("{sid}", sessionID)
+              .replace("{name}", name),
+            metadata: { host: args.host, user: args.user, port: args.port ?? 22, name },
           }
         },
       }),
@@ -142,10 +193,11 @@ export const OpenCodeSshTool: Plugin = async () => {
         args: {
           command: tool.schema.string().describe(T.ssh_exec_args.command[lang]),
           waitResult: tool.schema.boolean().optional().describe(T.ssh_exec_args.waitResult[lang]),
+          name: tool.schema.string().optional().describe(T.ssh_exec_args.name[lang]),
         },
         async execute(args, context) {
           const { sessionID } = context
-          const session = getSession(sessionID)
+          const session = getSession(sessionID, args.name)
           if (!session) return tr("not_connected", lang)
 
           // 权限判定：先黑后白再问
@@ -155,6 +207,7 @@ export const OpenCodeSshTool: Plugin = async () => {
             return tr("denied_danger", lang)
           }
           if (decision === "ask") {
+            log.info(`[ask] 命令需审批，调用 context.ask: ${args.command.slice(0, 60)}`)
             try {
               await context.ask({
                 permission: "ssh_exec",
@@ -162,7 +215,9 @@ export const OpenCodeSshTool: Plugin = async () => {
                 always: [`ssh_exec:${args.command}`],
                 metadata: { title: args.command.slice(0, 60) },
               })
+              log.info(`[ask] context.ask 返回（已允许）: ${args.command.slice(0, 60)}`)
             } catch {
+              log.info(`[ask] context.ask 抛异常（已拒绝）: ${args.command.slice(0, 60)}`)
               return tr("denied", lang)
             }
           }
@@ -199,9 +254,10 @@ export const OpenCodeSshTool: Plugin = async () => {
           direction: tool.schema.enum(["tail", "head"]).optional().describe(T.ssh_read_args.direction[lang]),
           limit: tool.schema.number().optional().describe(T.ssh_read_args.limit[lang]),
           includeCommand: tool.schema.boolean().optional().describe(T.ssh_read_args.includeCommand[lang]),
+          name: tool.schema.string().optional().describe(T.ssh_read_args.name[lang]),
         },
         async execute(args, context) {
-          const session = getSession(context.sessionID)
+          const session = getSession(context.sessionID, args.name)
           if (!session) return tr("not_connected", lang)
           const source = args.source ?? "history"
 
@@ -244,21 +300,38 @@ export const OpenCodeSshTool: Plugin = async () => {
 
       ssh_status: tool({
         description: T.ssh_status[lang],
-        args: {},
-        async execute(_args, context) {
-          const session = getSession(context.sessionID)
-          if (!session) return tr("no_sessions", lang)
-          const st: SessionStatus = session.getStatus()
-          if (!st.connected) return tr("session_disconnected", lang)
-          const lines = [
-            `connected: ${st.connected}`,
-            `busy: ${st.busy}`,
-            `pending: ${st.pending} bytes`,
-            `host: ${st.host}@${st.user}:${st.port}`,
-            st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
-            st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
-          ].filter(Boolean)
-          const runningHint = st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang)
+        args: {
+          name: tool.schema.string().optional().describe(T.ssh_status_args.name[lang]),
+        },
+        async execute(args, context) {
+          const map = getSessionMap(context.sessionID)
+          if (!map || map.size === 0) return tr("no_sessions", lang)
+
+          // 未指定 name → 列出全部终端状态
+          const session = args.name ? map.get(args.name) : undefined
+          if (args.name && !session) return tr("no_sessions", lang)
+          const sessions = session ? [session] : [...map.values()]
+
+          const parts: string[] = []
+          for (const s of sessions) {
+            const st: SessionStatus = s.getStatus()
+            if (!st.connected) {
+              parts.push(tr("session_disconnected", lang))
+              continue
+            }
+            parts.push(
+              [
+                `name: ${st.name ?? "default"}`,
+                `connected: ${st.connected}`,
+                `busy: ${st.busy}`,
+                `pending: ${st.pending} bytes`,
+                `host: ${st.host}@${st.user}:${st.port}`,
+                st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
+                st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
+              ].filter(Boolean).join("\n")
+            )
+            parts.push(st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang))
+          }
 
           // 并入 HTTP 服务状态
           const serverLines = httpServer
@@ -266,22 +339,34 @@ export const OpenCodeSshTool: Plugin = async () => {
                 "",
                 `httpServer: ${httpServer.url}`,
                 `httpPort: ${httpServer.port}`,
-                `activeSessions: ${sshSessions.size}`,
+                `activeSessions: ${listSessionEntries().length}`,
               ]
             : ["", "httpServer: disabled"]
 
-          return { title: tr("status_title", lang), output: lines.join("\n") + runningHint + serverLines.join("\n") }
+          return { title: tr("status_title", lang), output: parts.join("\n\n") + serverLines.join("\n") }
         },
       }),
 
       ssh_disconnect: tool({
         description: T.ssh_disconnect[lang],
-        args: {},
-        async execute(_args, context) {
-          const session = getSession(context.sessionID)
+        args: {
+          name: tool.schema.string().optional().describe(T.ssh_disconnect_args.name[lang]),
+        },
+        async execute(args, context) {
+          const { sessionID } = context
+          const map = getSessionMap(sessionID)
+          if (!map || map.size === 0) return tr("no_sessions", lang)
+
+          // 未指定 name → 断开全部终端；否则断开指定终端
+          if (!args.name) {
+            const host = [...map.values()][0]?.getStatus().host
+            cleanupAllSessions(sessionID)
+            return tr("disconnected_all_ok", lang).replace("{host}", host ?? "-")
+          }
+          const session = map.get(args.name)
           if (!session) return tr("no_sessions", lang)
           const host = session.getStatus().host
-          cleanupSession(context.sessionID)
+          cleanupSession(sessionID, args.name)
           return tr("disconnected_ok", lang).replace("{host}", host ?? "-")
         },
       }),

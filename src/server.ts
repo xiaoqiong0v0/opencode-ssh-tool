@@ -13,13 +13,22 @@ export interface ServerHandle {
   close(): void
 }
 
+/** 扁平会话条目（多终端：sessionID × name 一个条目） */
+export interface SessionEntry {
+  sessionID: string
+  name: string
+  session: SshSession
+  title?: string
+  directory?: string
+}
+
 /**
  * 启动 HTTP 服务（监听 127.0.0.1）
  * @param port 端口，0 或未指定 → 系统随机分配（避免冲突）
- * @param getSessions 获取会话表的函数（供页面展示）
+ * @param getSessions 获取扁平会话条目列表的函数（供页面展示）
  * @returns 服务句柄（含实际端口与 URL）
  */
-export function startServer(port: number, getSessions: () => Map<string, SshSession>): Promise<ServerHandle> {
+export function startServer(port: number, getSessions: () => SessionEntry[]): Promise<ServerHandle> {
   let actualPort = port
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -32,29 +41,39 @@ export function startServer(port: number, getSessions: () => Map<string, SshSess
     }
 
     if (path === "/api/status") {
-      const sessions = getSessions()
-      const list = [...sessions.entries()].map(([sid, s]) => {
-        const st = s.getStatus()
-        return { sessionID: sid, host: st.host, user: st.user, port: st.port, connected: st.connected, busy: st.busy, pending: st.pending }
-      })
+      const entries = getSessions()
+      // 按 sessionID 分组（一个会话下多个终端）
+      const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; host?: string; user?: string; port?: number; connected: boolean; busy: boolean; pending: number }[] }>()
+      for (const { sessionID, name, session, title, directory } of entries) {
+        const st = session.getStatus()
+        if (!bySession.has(sessionID)) bySession.set(sessionID, { title, directory, terminals: [] })
+        bySession.get(sessionID)!.terminals.push({ name, host: st.host, user: st.user, port: st.port, connected: st.connected, busy: st.busy, pending: st.pending })
+      }
+      const sessions = [...bySession.entries()].map(([sessionID, v]) => ({
+        sessionID,
+        title: v.title,
+        directory: v.directory,
+        terminals: v.terminals,
+      }))
       res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(JSON.stringify({ port: actualPort, sessions: list }))
+      res.end(JSON.stringify({ port: actualPort, sessions }))
       return
     }
 
     if (path === "/api/transcript") {
       const sid = url.searchParams.get("session") ?? ""
-      const session = getSessions().get(sid)
-      if (!session) {
+      const name = url.searchParams.get("name") ?? "default"
+      const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
+      if (!entry) {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
         res.end("Session not found or disconnected")
         return
       }
       // 渲染命令+输出消息对
       const lines: string[] = []
-      for (const pair of session.getHistory().getPairs()) {
+      for (const pair of entry.session.getHistory().getPairs()) {
         lines.push(`$ ${pair.command}`)
-        lines.push(cleanAnsi(session.getHistory().readOutput(pair)))
+        lines.push(cleanAnsi(entry.session.getHistory().readOutput(pair)))
       }
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
       res.end(lines.join("\n"))
@@ -106,38 +125,68 @@ function renderPage(): string {
 <body>
 <header>
   <h1>SSH 终端记录</h1>
-  <select id="session" onchange="loadTranscript()"></select>
+  <select id="session" onchange="onSessionChange()"></select>
+  <select id="terminal" onchange="loadTranscript()"></select>
   <span id="meta"></span>
 </header>
 <pre id="term">加载中...</pre>
 <script>
-  let current = "";
+  let sessionsData = [];
+
+  function sessionLabel(s) {
+    // 优先显示会话标题，其次 host@user，最后短 sessionID
+    if (s.title && s.title.trim()) return s.title;
+    const t = s.terminals && s.terminals[0];
+    if (t && t.host) return (t.user ? t.user + "@" : "") + t.host;
+    return s.sessionID.slice(0, 8) + "…";
+  }
 
   async function loadSessions() {
     const r = await fetch("/api/status");
     const data = await r.json();
+    sessionsData = data.sessions || [];
     const sel = document.getElementById("session");
     const prev = sel.value;
     sel.innerHTML = "";
-    for (const s of data.sessions) {
+    for (const s of sessionsData) {
       const opt = document.createElement("option");
       opt.value = s.sessionID;
-      opt.textContent = (s.host || "?") + (s.user ? "@" + s.user : "") + "  " + (s.connected ? "●" : "○");
+      opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " 终端)";
       sel.appendChild(opt);
     }
     if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
-    else current = sel.value || "";
+    else sel.selectedIndex = sessionsData.length ? 0 : -1;
+    onSessionChange();
+  }
+
+  function onSessionChange() {
+    const sel = document.getElementById("session");
+    const sid = sel.value;
+    const tsel = document.getElementById("terminal");
+    const prev = tsel.value;
+    tsel.innerHTML = "";
+    const s = sessionsData.find(x => x.sessionID === sid);
+    for (const t of (s ? s.terminals : [])) {
+      const opt = document.createElement("option");
+      opt.value = t.name || "default";
+      opt.textContent = (t.name || "default") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
+      tsel.appendChild(opt);
+    }
+    if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
+    else tsel.selectedIndex = tsel.options.length ? 0 : -1;
     loadTranscript();
   }
 
   async function loadTranscript() {
     const sel = document.getElementById("session");
+    const tsel = document.getElementById("terminal");
     const sid = sel.value;
-    if (!sid) { document.getElementById("term").textContent = "无会话，请先 ssh_connect"; return; }
-    const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid));
+    const name = tsel.value;
+    if (!sid || !name) { document.getElementById("term").textContent = "无会话，请先 ssh_connect"; return; }
+    const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
     const text = await r.text();
     document.getElementById("term").textContent = text;
-    document.getElementById("meta").textContent = sid + " · " + text.length + " 字符 · 每 2s 自动刷新";
+    document.getElementById("meta").textContent = sid + "/" + name + " · " + text.length + " 字符 · 每 2s 自动刷新";
     document.getElementById("term").scrollTop = document.getElementById("term").scrollHeight;
   }
 

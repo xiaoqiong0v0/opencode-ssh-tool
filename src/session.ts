@@ -46,6 +46,7 @@ export interface SessionStatus {
   connected: boolean
   busy: boolean
   pending: number
+  name?: string
   host?: string
   user?: string
   port?: number
@@ -83,6 +84,7 @@ export class SshSession {
   constructor(
     private readonly sessionID: string,
     history: SessionHistory,
+    private readonly name = "default",
   ) {
     this._history = history
   }
@@ -309,6 +311,7 @@ export class SshSession {
       connected: this._connected,
       busy: this._connected && this._remoteBusy,
       pending: this._buffer.length,
+      name: this.name,
       host: this._host,
       user: this._user,
       port: this._port,

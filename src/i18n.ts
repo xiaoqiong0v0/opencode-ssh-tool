@@ -29,16 +29,24 @@ export const T = {
     host: { en: "Target host or IP", zh: "目标主机 host / IP" },
     user: { en: "Login username", zh: "登录用户名" },
     port: { en: "Port, default 22", zh: "端口，默认 22" },
+    name: {
+      en: "Terminal name within the session, default 'default'. Creating with an existing name closes the old one first. Use distinct names to keep multiple terminals.",
+      zh: "会话内的终端名，默认 'default'。同名创建会先关闭旧终端。用不同名称可保持多个终端。",
+    },
   },
   ssh_exec: {
-    en: "Execute a command in the current SSH session, preserving cwd and environment. Commands outside the read-only allowlist require user approval.",
-    zh: "在当前 SSH 会话执行命令，保留 cwd 与环境变量；白名单外的命令需用户审批。",
+    en: "Execute a command in the current SSH session (by terminal name), preserving cwd and environment. Commands outside the read-only allowlist require user approval.",
+    zh: "在当前 SSH 会话（按终端名）执行命令，保留 cwd 与环境变量；白名单外的命令需用户审批。",
   },
   ssh_exec_args: {
     command: { en: "Shell command to execute", zh: "要执行的 shell 命令" },
     waitResult: {
       en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via ssh_read.",
       zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 ssh_read 读取结果。",
+    },
+    name: {
+      en: "Target terminal name, default 'default'. Must match a name from ssh_connect.",
+      zh: "目标终端名，默认 'default'。需与 ssh_connect 创建的名称一致。",
     },
   },
   submitted: {
@@ -67,14 +75,30 @@ export const T = {
       en: "Whether to include the command line in history output. Default false (output only).",
       zh: "是否在 history 结果中包含命令行。默认 false（只返回输出）。",
     },
+    name: {
+      en: "Target terminal name, default 'default'.",
+      zh: "目标终端名，默认 'default'。",
+    },
   },
   ssh_status: {
-    en: "Check SSH session state (busy, pending, connection) and the HTTP server state (URL/port/session count). Use busy to poll completion instead of reading animated output.",
-    zh: "检查 SSH 会话状态（busy、未消费量、连接）及 HTTP 服务状态（URL/端口/会话数）。用 busy 轮询完成情况，避免读取动画中间态。",
+    en: "Check SSH session state (busy, pending, connection) by terminal name (all terminals if omitted) and the HTTP server state (URL/port/session count). Use busy to poll completion instead of reading animated output.",
+    zh: "按终端名检查 SSH 会话状态（busy、未消费量、连接；省略则列出全部终端）及 HTTP 服务状态（URL/端口/会话数）。用 busy 轮询完成情况，避免读取动画中间态。",
+  },
+  ssh_status_args: {
+    name: {
+      en: "Terminal name to check; omit to list all terminals.",
+      zh: "要检查的终端名；省略则列出全部终端。",
+    },
   },
   ssh_disconnect: {
-    en: "Close the current SSH connection and clean up session state.",
-    zh: "关闭当前 SSH 连接并清理会话态。",
+    en: "Close the SSH connection of a terminal (default 'default'), or all terminals when name is omitted, and clean up session state.",
+    zh: "关闭指定终端（默认 'default'）的 SSH 连接，name 省略则关闭全部终端，并清理会话态。",
+  },
+  ssh_disconnect_args: {
+    name: {
+      en: "Terminal name to disconnect; omit to disconnect all terminals.",
+      zh: "要断开的终端名；省略则断开全部终端。",
+    },
   },
   denied: {
     en: "Denied by user.",
@@ -101,8 +125,8 @@ export const T = {
     zh: "SSH 已连接",
   },
   connect_ok: {
-    en: "Connected: {user}@{host}:{port} (session {sid})",
-    zh: "连接成功：{user}@{host}:{port}（session {sid}）",
+    en: "Connected: {user}@{host}:{port} (session {sid}, terminal {name})",
+    zh: "连接成功：{user}@{host}:{port}（session {sid}，终端 {name}）",
   },
   connect_title_fail: {
     en: "SSH connection failed",
@@ -167,6 +191,10 @@ export const T = {
   disconnected_ok: {
     en: "SSH connection closed ({host}).",
     zh: "SSH 连接已断开（{host}）。",
+  },
+  disconnected_all_ok: {
+    en: "All SSH terminals closed (last host {host}).",
+    zh: "已断开全部 SSH 终端（最后主机 {host}）。",
   },
   err_not_connected: {
     en: "Not connected",

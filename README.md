@@ -27,11 +27,13 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
-| `ssh_connect` | `host`, `user`, `port?` | 建立长驻 SSH 连接 + 打开 PTY shell |
-| `ssh_exec` | `command`, `waitResult?` | 执行命令；默认异步提交立即返回，`waitResult=true` 同步等结果 |
-| `ssh_read` | `source?`, `lines?`, `direction?`, `limit?`, `includeCommand?` | 读输出：`buffer` 实时未消费 / `history` 已完成对（前/后 N 条） |
-| `ssh_status` | — | 会话状态（busy/pending/连接）+ HTTP 服务状态 |
-| `ssh_disconnect` | — | 关闭连接，清理会话态 |
+| `ssh_connect` | `host`, `user`, `port?`, `name?` | 建立长驻 SSH 连接 + 打开 PTY shell；`name` 指定终端名（默认 `default`），同名先关旧终端 |
+| `ssh_exec` | `command`, `waitResult?`, `name?` | 在指定终端执行命令；默认异步提交立即返回，`waitResult=true` 同步等结果 |
+| `ssh_read` | `source?`, `lines?`, `direction?`, `limit?`, `includeCommand?`, `name?` | 读指定终端输出：`buffer` 实时未消费 / `history` 已完成对（前/后 N 条） |
+| `ssh_status` | `name?` | 指定终端状态（busy/pending/连接）；省略则列出全部终端 + HTTP 服务状态 |
+| `ssh_disconnect` | `name?` | 断开指定终端（默认 `default`）；省略则断开全部终端 |
+
+> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。
 
 ## 配置
 
@@ -55,7 +57,11 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝）：
-    //   rm\s+-rf | shutdown | reboot | mkfs | dd\s | DROP\s+TABLE | TRUNCATE\s+TABLE | >\s*\/etc\/passwd
+    //   rm 危险目标(/ ~ . /etc /var /usr 等) | shutdown/reboot/halt/poweroff | mkfs/mkswap/fdisk/parted/dd
+    //   iptables/ufw/firewall-cmd | systemctl | service stop/restart/kill | kill/killall/pkill
+    //   passwd/useradd/userdel/groupadd/groupdel | chown -R | chmod -R 777 / | apt remove | npm uninstall
+    //   DROP TABLE/TRUNCATE/DROP DATABASE | fork炸弹 | > /etc/{passwd,shadow,sudoers,fstab}
+    //   curl|sh / wget|sh / base64 -d |
     // 自定义补充示例：["^mkfs\\s", "^dd\\s"]（空数组 = 仅使用内置默认）
     "deny": [],
     // 内置默认只读白名单（命中且无 shell 元字符则直接放行）：
