@@ -8,7 +8,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
 - **命令完成判定**：哨兵标记 + 静默窗口 + 超时三重兜底，动画输出（进度条等）自动识别
-- **历史消息对**：命令+输出 按对数保留（默认 100 对），单条超大落盘文件
+- **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），重启不丢、会话关闭清理
 - **HTTP 终端查看**：默认开启本地服务，浏览器打开可滚动、自动刷新的终端记录页面
 - **多语言**：工具描述默认英文，`SSH_TOOL_LANG=zh` 切中文
 
@@ -29,10 +29,8 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
 |---|---|---|
 | `ssh_connect` | `host`, `user`, `port?` | 建立长驻 SSH 连接 + 打开 PTY shell |
 | `ssh_exec` | `command`, `waitResult?` | 执行命令；默认异步提交立即返回，`waitResult=true` 同步等结果 |
-| `ssh_read` | `lines?` | 读取未消费缓冲输出（交互/轮询场景） |
-| `ssh_status` | — | 检查命令是否仍在执行（busy）、缓冲量、连接状态 |
-| `ssh_server` | — | 查询本地 HTTP 服务地址/端口/会话数 |
-| `ssh_terminal` | `direction?`, `limit?`, `includeCommand?` | 取前/后 N 条历史输出；返回浏览器查看地址 |
+| `ssh_read` | `source?`, `lines?`, `direction?`, `limit?`, `includeCommand?` | 读输出：`buffer` 实时未消费 / `history` 已完成对（前/后 N 条） |
+| `ssh_status` | — | 会话状态（busy/pending/连接）+ HTTP 服务状态 |
 | `ssh_disconnect` | — | 关闭连接，清理会话态 |
 
 ## 配置
@@ -47,12 +45,10 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
     // 端口：不设默认值。0 = 自动分配随机端口（推荐，避免冲突）；可显式指定，如 8137
     "port": 0
   },
-  // 会话记录（命令+输出 消息对）管理
+  // 会话记录（命令+输出 消息对）管理：全部存文件（~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/），随会话清理
   "history": {
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
-    "maxMessages": 100,
-    // 单条命令+输出超过此字节数时写入文件（默认 3145728 = 3MB），内存只存引用
-    "spillThreshold": 3145728
+    "maxMessages": 100
   },
   // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
@@ -97,7 +93,7 @@ ssh_exec(command)
 
 ## HTTP 终端查看
 
-服务默认开启（配置 `server.enabled`）。`ssh_server` / `ssh_terminal` 会返回实际地址（端口 0 时自动分配，避免冲突）：
+服务默认开启（配置 `server.enabled`）。`ssh_status` / `ssh_read`（history 模式）会返回实际地址（端口 0 时自动分配，避免冲突）：
 
 ```
 浏览器访问 http://127.0.0.1:<port> 查看可滚动、每 2s 自动刷新的终端记录
@@ -146,8 +142,8 @@ npm publish      # 只发布 dist/
 - [ ] 白名单命令不弹审批直接执行；`rm -rf` 被拒绝
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
 - [ ] 长命令超时：`ssh_exec("sleep 60")` 30s 超时返回，不挂死会话
-- [ ] `ssh_terminal` 取最后/前 N 条输出（含 `includeCommand`）
-- [ ] `ssh_server` / HTTP 页面浏览器可访问
+- [ ] `ssh_read` 取前/后 N 条历史输出（含 `includeCommand`、`source=buffer`）
+- [ ] `ssh_status` / HTTP 页面浏览器可访问
 - [ ] `ssh_disconnect` 后连接释放
 
 ## 文档

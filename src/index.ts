@@ -2,7 +2,10 @@
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
-import { SWEEP_INTERVAL_MS, IDLE_TIMEOUT_MS } from "./constants.js"
+import { CACHE_DIR } from "./constants.js"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { rmSync } from "node:fs"
 import { loadConfig } from "./config.js"
 import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
@@ -18,20 +21,6 @@ export const sshSessions = new Map<string, SshSession>()
 /** HTTP 终端记录服务句柄（可能未启用） */
 let httpServer: ServerHandle | null = null
 
-/** 空闲清扫：定期关闭超时未活动的会话 */
-const sweeper = setInterval(() => {
-  const now = Date.now()
-  for (const [sid, s] of sshSessions) {
-    const st = s.getStatus()
-    if (st.connected && now - (st.lastActive ?? 0) > IDLE_TIMEOUT_MS) {
-      log.info(`空闲超时，关闭会话 ${sid} @${st.host}`)
-      s.close()
-      sshSessions.delete(sid)
-    }
-  }
-}, SWEEP_INTERVAL_MS)
-sweeper.unref?.()
-
 /** 进程退出兜底：关闭全部连接 */
 process.on("exit", () => {
   for (const s of sshSessions.values()) s.close()
@@ -40,6 +29,28 @@ process.on("exit", () => {
 /** 按 sessionID 取会话 */
 function getSession(sessionID: string): SshSession | undefined {
   return sshSessions.get(sessionID)
+}
+
+/** 插件缓存根目录（历史消息对存文件，随会话清理） */
+function cacheRoot(): string {
+  const home = process.env.USERPROFILE || process.env.HOME || homedir()
+  return join(home, CACHE_DIR)
+}
+
+/** 清理指定会话：关闭 SSH 连接 + 删除缓存目录 + 从会话表移除 */
+function cleanupSession(sessionID: string): void {
+  const session = sshSessions.get(sessionID)
+  if (session) {
+    session.close() // 内部会 history.dispose() 删除缓存目录
+    sshSessions.delete(sessionID)
+  } else {
+    // 无活动连接：直接删该会话缓存目录（如有残留）
+    try {
+      rmSync(join(cacheRoot(), sessionID), { recursive: true, force: true })
+    } catch {
+      /* 忽略 */
+    }
+  }
 }
 
 export const OpenCodeSshTool: Plugin = async () => {
@@ -63,6 +74,17 @@ export const OpenCodeSshTool: Plugin = async () => {
   }
 
   return {
+    event: async ({ event }) => {
+      // 会话删除时清理：关闭连接 + 删缓存目录
+      if (event.type === "session.deleted") {
+        const props = event.properties as Record<string, unknown> | undefined
+        const sid = props?.sessionID as string | undefined
+        if (sid) {
+          cleanupSession(sid)
+          log.info(`会话 ${sid} 删除，已清理`)
+        }
+      }
+    },
     tool: {
       ssh_connect: tool({
         description: T.ssh_connect[lang],
@@ -91,7 +113,7 @@ export const OpenCodeSshTool: Plugin = async () => {
             sshSessions.delete(sessionID)
           }
 
-          const session = new SshSession(sessionID, new SessionHistory(cfg.history.maxMessages, cfg.history.spillThreshold))
+          const session = new SshSession(sessionID, new SessionHistory(cacheRoot(), sessionID, cfg.history.maxMessages))
           const result = await session.connect(args)
           log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22 })
 
@@ -147,7 +169,6 @@ export const OpenCodeSshTool: Plugin = async () => {
 
           // 默认异步提交（立即返回，不占上下文）；waitResult=true 同步等结果
           const result = args.waitResult ? await session.exec(args.command) : await session.submit(args.command)
-          session.touch()
           log.tool("ssh_exec", { command: args.command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
 
           const meta: Record<string, string | number | boolean | undefined> = {
@@ -173,65 +194,25 @@ export const OpenCodeSshTool: Plugin = async () => {
       ssh_read: tool({
         description: T.ssh_read[lang],
         args: {
+          source: tool.schema.enum(["buffer", "history"]).optional().describe(T.ssh_read_args.source[lang]),
           lines: tool.schema.number().optional().describe(T.ssh_read_args.lines[lang]),
-        },
-        async execute(_args, context) {
-          const session = getSession(context.sessionID)
-          if (!session) return tr("not_connected", lang)
-          const r = await session.readBuffer()
-          const out = _args.lines ? r.output.split(/\r?\n/).slice(0, _args.lines).join("\n") : r.output
-          return { title: tr("session_output_title", lang), output: out }
-        },
-      }),
-
-      ssh_status: tool({
-        description: T.ssh_status[lang],
-        args: {},
-        async execute(_args, context) {
-          const session = getSession(context.sessionID)
-          if (!session) return tr("no_sessions", lang)
-          const st: SessionStatus = session.getStatus()
-          if (!st.connected) return tr("session_disconnected", lang)
-          const lines = [
-            `connected: ${st.connected}`,
-            `busy: ${st.busy}`,
-            `pending: ${st.pending} bytes`,
-            `host: ${st.host}@${st.user}:${st.port}`,
-            st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
-            st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
-          ].filter(Boolean)
-          const runningHint = st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang)
-          return { title: tr("status_title", lang), output: lines.join("\n") + runningHint }
-        },
-      }),
-
-      ssh_server: tool({
-        description: T.ssh_server[lang],
-        args: {},
-        async execute(_args, _context) {
-          if (!httpServer) return tr("server_disabled", lang)
-          const sessions = sshSessions.size
-          return {
-            title: tr("server_title", lang),
-            output: tr("server_info", lang)
-              .replace("{url}", httpServer.url)
-              .replace("{port}", String(httpServer.port))
-              .replace("{n}", String(sessions)),
-            metadata: { url: httpServer.url, port: httpServer.port, enabled: true },
-          }
-        },
-      }),
-
-      ssh_terminal: tool({
-        description: T.ssh_terminal[lang],
-        args: {
-          direction: tool.schema.enum(["tail", "head"]).optional().describe(T.ssh_terminal_args.direction[lang]),
-          limit: tool.schema.number().optional().describe(T.ssh_terminal_args.limit[lang]),
-          includeCommand: tool.schema.boolean().optional().describe(T.ssh_terminal_args.includeCommand[lang]),
+          direction: tool.schema.enum(["tail", "head"]).optional().describe(T.ssh_read_args.direction[lang]),
+          limit: tool.schema.number().optional().describe(T.ssh_read_args.limit[lang]),
+          includeCommand: tool.schema.boolean().optional().describe(T.ssh_read_args.includeCommand[lang]),
         },
         async execute(args, context) {
           const session = getSession(context.sessionID)
           if (!session) return tr("not_connected", lang)
+          const source = args.source ?? "history"
+
+          if (source === "buffer") {
+            // 实时未消费缓冲
+            const r = await session.readBuffer()
+            const out = args.lines ? r.output.split(/\r?\n/).slice(0, args.lines).join("\n") : r.output
+            return { title: tr("session_output_title", lang), output: out }
+          }
+
+          // history：已完成命令+输出对（前 N / 后 N）
           const history = session.getHistory()
           const all = history.getPairs()
           const limit = Math.max(1, args.limit ?? 10)
@@ -261,6 +242,38 @@ export const OpenCodeSshTool: Plugin = async () => {
         },
       }),
 
+      ssh_status: tool({
+        description: T.ssh_status[lang],
+        args: {},
+        async execute(_args, context) {
+          const session = getSession(context.sessionID)
+          if (!session) return tr("no_sessions", lang)
+          const st: SessionStatus = session.getStatus()
+          if (!st.connected) return tr("session_disconnected", lang)
+          const lines = [
+            `connected: ${st.connected}`,
+            `busy: ${st.busy}`,
+            `pending: ${st.pending} bytes`,
+            `host: ${st.host}@${st.user}:${st.port}`,
+            st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
+            st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
+          ].filter(Boolean)
+          const runningHint = st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang)
+
+          // 并入 HTTP 服务状态
+          const serverLines = httpServer
+            ? [
+                "",
+                `httpServer: ${httpServer.url}`,
+                `httpPort: ${httpServer.port}`,
+                `activeSessions: ${sshSessions.size}`,
+              ]
+            : ["", "httpServer: disabled"]
+
+          return { title: tr("status_title", lang), output: lines.join("\n") + runningHint + serverLines.join("\n") }
+        },
+      }),
+
       ssh_disconnect: tool({
         description: T.ssh_disconnect[lang],
         args: {},
@@ -268,8 +281,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           const session = getSession(context.sessionID)
           if (!session) return tr("no_sessions", lang)
           const host = session.getStatus().host
-          session.close()
-          sshSessions.delete(context.sessionID)
+          cleanupSession(context.sessionID)
           return tr("disconnected_ok", lang).replace("{host}", host ?? "-")
         },
       }),

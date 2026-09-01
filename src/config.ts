@@ -14,7 +14,6 @@ export interface ServerConfig {
 /** 会话记录（命令+输出 消息对）配置 */
 export interface HistoryConfig {
   maxMessages: number
-  spillThreshold: number
 }
 
 /** 权限自定义正则配置（追加到内置默认，控制"拒绝"与"需审批"命令） */
@@ -44,8 +43,6 @@ const DEFAULT_CONFIG: ToolConfig = {
   history: {
     // 保留的消息对数（最小 1，保留最新）
     maxMessages: 100,
-    // 单条命令+输出超此字节数写文件（默认 3MB）
-    spillThreshold: 3 * 1024 * 1024,
   },
   toolLang: "en",
   permission: {
@@ -68,12 +65,10 @@ const CONFIG_TEMPLATE = `{
     // 端口：不设默认值。0 = 自动分配随机端口（推荐，避免冲突）；可显式指定，如 8137
     "port": 0
   },
-  // 会话记录（命令+输出 消息对）管理
+  // 会话记录（命令+输出 消息对）管理：全部存文件（~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/），随会话清理
   "history": {
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
-    "maxMessages": 100,
-    // 单条命令+输出超过此字节数时写入文件（默认 3145728 = 3MB），内存只存引用
-    "spillThreshold": 3145728
+    "maxMessages": 100
   },
   // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
@@ -127,7 +122,6 @@ export function loadConfig(): ToolConfig {
       },
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
-        spillThreshold: history.spillThreshold ?? DEFAULT_CONFIG.history.spillThreshold,
       },
       toolLang,
       permission: {

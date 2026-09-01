@@ -37,58 +37,44 @@ export const T = {
   ssh_exec_args: {
     command: { en: "Shell command to execute", zh: "要执行的 shell 命令" },
     waitResult: {
-      en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via ssh_status / ssh_terminal / ssh_read.",
-      zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 ssh_status / ssh_terminal / ssh_read 读取结果。",
+      en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via ssh_read.",
+      zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 ssh_read 读取结果。",
     },
   },
   submitted: {
-    en: "Command submitted (async). Running in background: check ssh_status for completion, then ssh_terminal / ssh_read to read output.",
-    zh: "命令已异步提交，后台执行中：用 ssh_status 查完成状态，再用 ssh_terminal / ssh_read 读取输出。",
+    en: "Command submitted (async). Running in background: check ssh_status for completion, then ssh_read to read output.",
+    zh: "命令已异步提交，后台执行中：用 ssh_status 查完成状态，再用 ssh_read 读取输出。",
   },
   ssh_read: {
-    en: "Read the unconsumed buffered output of the current SSH session (for interactive prompts and polling).",
-    zh: "读取当前 SSH 会话缓冲区的未消费输出（用于交互提示与轮询场景）。",
+    en: "Read output of the current SSH session: buffered (unconsumed, for interactive/polling) or history (completed command+output pairs, first N or last N). Returns browser URL for the full scrollable viewer when the HTTP server is on.",
+    zh: "读取当前 SSH 会话的输出：缓冲（未消费，交互/轮询用）或历史（已完成的命令+输出对，前 N 条或后 N 条）。HTTP 服务开启时返回浏览器查看完整记录的地址。",
   },
   ssh_read_args: {
-    lines: { en: "Max lines to read, all if omitted", zh: "读取行数上限，默认全部" },
-  },
-  ssh_status: {
-    en: "Check whether the current SSH session has a command still running (busy), how much output is pending, and connection health. Use this to poll instead of reading animated output.",
-    zh: "检查当前 SSH 会话是否仍有命令在执行（busy）、未消费输出量及连接状态。用于轮询判断，避免读取动画中间态。",
-  },
-  ssh_server: {
-    en: "Show the local HTTP server status: enabled/disabled, actual URL and port (auto-assigned when 0), and active session count. Use this to get the browser address for viewing terminal records.",
-    zh: "查看本地 HTTP 服务状态：是否启用、实际 URL 与端口（0 时自动分配）、活跃会话数。用于获取浏览器查看终端记录的地址。",
-  },
-  ssh_terminal: {
-    en: "Get recent command+output history pairs (first N or last N) of the current SSH session as text (output only by default), and/or get the browser URL for the scrollable auto-refreshing terminal viewer.",
-    zh: "获取当前 SSH 会话的命令+输出历史对（前 N 条或后 N 条）为文本（默认只返回输出），并可返回浏览器可滚动查看终端记录的地址。",
-  },
-  ssh_terminal_args: {
+    source: {
+      en: "Where to read from: 'buffer' (unconsumed live output) or 'history' (completed pairs, default).",
+      zh: "读取来源：'buffer'（实时未消费输出）或 'history'（已完成消息对，默认）。",
+    },
+    lines: { en: "Max lines to read from buffer, all if omitted", zh: "读取缓冲行数上限，默认全部" },
     direction: {
-      en: "Which end to take: 'tail' (last N, default) or 'head' (first N). At most N pairs, no more than total pairs.",
-      zh: "取哪一端：'tail'（最后 N 条，默认）或 'head'（前 N 条）。最多 N 条，不超过总对数。",
+      en: "Which end to take (history): 'tail' (last N, default) or 'head' (first N). At most N pairs.",
+      zh: "取哪一端（history）：'tail'（最后 N 条，默认）或 'head'（前 N 条）。最多 N 条。",
     },
     limit: {
-      en: "Number of pairs to return (default 10). Capped at total pairs.",
-      zh: "返回的对数（默认 10）。不超过总对数。",
+      en: "Number of pairs to return (history, default 10). Capped at total pairs.",
+      zh: "返回的对数（history，默认 10）。不超过总对数。",
     },
     includeCommand: {
-      en: "Whether to include the command line in the output. Default false (output only).",
-      zh: "是否在结果中包含命令行。默认 false（只返回输出）。",
+      en: "Whether to include the command line in history output. Default false (output only).",
+      zh: "是否在 history 结果中包含命令行。默认 false（只返回输出）。",
     },
+  },
+  ssh_status: {
+    en: "Check SSH session state (busy, pending, connection) and the HTTP server state (URL/port/session count). Use busy to poll completion instead of reading animated output.",
+    zh: "检查 SSH 会话状态（busy、未消费量、连接）及 HTTP 服务状态（URL/端口/会话数）。用 busy 轮询完成情况，避免读取动画中间态。",
   },
   ssh_disconnect: {
     en: "Close the current SSH connection and clean up session state.",
     zh: "关闭当前 SSH 连接并清理会话态。",
-  },
-  server_disabled: {
-    en: "HTTP server is disabled in config (ssh-tool.jsonc).",
-    zh: "HTTP 服务已在配置中关闭（ssh-tool.jsonc）。",
-  },
-  server_failed: {
-    en: "Failed to start HTTP server:",
-    zh: "HTTP 服务启动失败：",
   },
   denied: {
     en: "Denied by user.",

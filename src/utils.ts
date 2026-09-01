@@ -1,4 +1,4 @@
-// 工具函数：哨兵生成、回显剔除、ANSI 清洗、终端记录 HTML 渲染
+// 工具函数：哨兵生成、回显剔除、ANSI 清洗、提示符剥离
 
 import { randomBytes } from "node:crypto"
 
@@ -29,4 +29,15 @@ export function stripEcho(raw: string, cmd: string): string {
 export function cleanAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "")
+}
+
+/**
+ * 剥离尾部 shell 提示符残留（如 "5cb08b77db01:~$ "、"user@host:~/dir$ "、"root@server:/etc#"）
+ * @param s 清洗后文本
+ * @returns 剥离尾部提示符后的文本
+ */
+export function stripPrompt(s: string): string {
+  return s
+    .replace(/(?:^|[\r\n])\s*(?:[\w.-]+@)?[\w.-]+:[^\r\n]*[$#%] ?(?=[\r\n]|$)/g, "")
+    .trim()
 }

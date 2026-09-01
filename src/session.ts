@@ -13,7 +13,7 @@ import {
 } from "./constants.js"
 import { resolveAuth } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
-import { cleanAnsi, genSentinel, stripEcho } from "./utils.js"
+import { cleanAnsi, genSentinel, stripEcho, stripPrompt } from "./utils.js"
 
 const log = createLogger("opencode-ssh-tool", { enabled: true })
 
@@ -297,7 +297,7 @@ export class SshSession {
       this._buffer = ""
     }
 
-    return { ok: true, output: this._truncate(cleanAnsi(out)) }
+    return { ok: true, output: this._truncate(stripPrompt(cleanAnsi(out))) }
   }
 
   /**
@@ -350,11 +350,6 @@ export class SshSession {
     this._remoteBusy = false
     this._history.dispose()
     log.hook("ssh_disconnect", `关闭会话 ${this._host}`)
-  }
-
-  /** 更新最后活动时间（供空闲清扫） */
-  touch(): void {
-    this._lastActive = Date.now()
   }
 
   /**
