@@ -44,13 +44,39 @@ export const T = {
     en: "Check whether the current SSH session has a command still running (busy), how much output is pending, and connection health. Use this to poll instead of reading animated output.",
     zh: "检查当前 SSH 会话是否仍有命令在执行（busy）、未消费输出量及连接状态。用于轮询判断，避免读取动画中间态。",
   },
+  ssh_server: {
+    en: "Show the local HTTP server status: enabled/disabled, actual URL and port (auto-assigned when 0), and active session count. Use this to get the browser address for viewing terminal records.",
+    zh: "查看本地 HTTP 服务状态：是否启用、实际 URL 与端口（0 时自动分配）、活跃会话数。用于获取浏览器查看终端记录的地址。",
+  },
   ssh_terminal: {
-    en: "Open a scrollable viewer of the full terminal transcript/status of the current SSH session as an HTML attachment.",
-    zh: "以 HTML 附件弹窗展示当前 SSH 会话的完整终端记录/状态，支持滚动查看。",
+    en: "Get recent command+output history pairs (first N or last N) of the current SSH session as text (output only by default), and/or get the browser URL for the scrollable auto-refreshing terminal viewer.",
+    zh: "获取当前 SSH 会话的命令+输出历史对（前 N 条或后 N 条）为文本（默认只返回输出），并可返回浏览器可滚动查看终端记录的地址。",
+  },
+  ssh_terminal_args: {
+    direction: {
+      en: "Which end to take: 'tail' (last N, default) or 'head' (first N). At most N pairs, no more than total pairs.",
+      zh: "取哪一端：'tail'（最后 N 条，默认）或 'head'（前 N 条）。最多 N 条，不超过总对数。",
+    },
+    limit: {
+      en: "Number of pairs to return (default 10). Capped at total pairs.",
+      zh: "返回的对数（默认 10）。不超过总对数。",
+    },
+    includeCommand: {
+      en: "Whether to include the command line in the output. Default false (output only).",
+      zh: "是否在结果中包含命令行。默认 false（只返回输出）。",
+    },
   },
   ssh_disconnect: {
     en: "Close the current SSH connection and clean up session state.",
     zh: "关闭当前 SSH 连接并清理会话态。",
+  },
+  server_disabled: {
+    en: "HTTP server is disabled in config (ssh-tool.jsonc).",
+    zh: "HTTP 服务已在配置中关闭（ssh-tool.jsonc）。",
+  },
+  server_failed: {
+    en: "Failed to start HTTP server:",
+    zh: "HTTP 服务启动失败：",
   },
   denied: {
     en: "Denied by user.",

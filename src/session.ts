@@ -12,6 +12,7 @@ import {
   READY_TIMEOUT_MS,
 } from "./constants.js"
 import { resolveAuth } from "./ssh-auth.js"
+import { SessionHistory } from "./history.js"
 import { cleanAnsi, genSentinel, stripEcho } from "./utils.js"
 
 const log = createLogger("opencode-ssh-tool", { enabled: true })
@@ -54,8 +55,8 @@ export interface SessionStatus {
 const INTERACTIVE_RE =
   /(\[sudo\] password for|password for \S+:|Password:|密码:|--More--|\(END\)|\[y\/N\]|\[Y\/n\]|yes\/no|是\/否)/i
 
-/** transcript 最大长度（超长截断防内存膨胀） */
-const MAX_TRANSCRIPT_LEN = 2 * 1024 * 1024
+/** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
+const MAX_BUFFER_LEN = 2 * 1024 * 1024
 
 /** 后台哨兵监听最长存活时间（防泄漏） */
 const MAX_WATCH_LEN = 10 * 60_000
@@ -66,7 +67,6 @@ export class SshSession {
   private _connected = false
   private _remoteBusy = false
   private _buffer = ""
-  private _transcript = ""
   private _host = ""
   private _user = ""
   private _port = 22
@@ -76,8 +76,14 @@ export class SshSession {
   private _runningSentinel = ""
   private _watchTimer: ReturnType<typeof setInterval> | null = null
   private _closed = false
+  private readonly _history: SessionHistory
 
-  constructor(private readonly sessionID: string) {}
+  constructor(
+    private readonly sessionID: string,
+    history: SessionHistory,
+  ) {
+    this._history = history
+  }
 
   /**
    * 建立 SSH 连接并打开 PTY shell
@@ -92,6 +98,7 @@ export class SshSession {
       port,
       username: opts.user,
       readyTimeout: READY_TIMEOUT_MS,
+      debug: (msg: string) => log.info(`[ssh2] ${msg}`),
       ...auth,
     }
 
@@ -129,8 +136,7 @@ export class SshSession {
 
             stream.on("data", (chunk: Buffer) => {
               const text = chunk.toString()
-              this._buffer += text
-              this._transcript = (this._transcript + text).slice(-MAX_TRANSCRIPT_LEN)
+              this._appendBuffer(text)
             })
             stream.on("close", () => {
               this._connected = false
@@ -141,8 +147,15 @@ export class SshSession {
               this._connected = false
             })
 
-            log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID})`)
-            resolve({ ok: true, host: opts.host, user: opts.user, port })
+            // 等待登录 banner / 初始提示符输出稳定后清空 buffer（不算业务输出）
+            ;(async () => {
+              await new Promise((r) => setTimeout(r, 400))
+              this._buffer = ""
+              this._runningStartPos = null
+              this._runningSentinel = ""
+              log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID})`)
+              resolve({ ok: true, host: opts.host, user: opts.user, port })
+            })()
           },
         )
       })
@@ -180,6 +193,7 @@ export class SshSession {
         this._remoteBusy = false
         const out = cleanAnsi(stripEcho(this._buffer.slice(startPos, outcome.idx), combo))
         this._buffer = this._buffer.slice(outcome.afterNewline)
+        this._history.append(command, out)
         return {
           ok: true,
           output: this._truncate(out),
@@ -191,6 +205,7 @@ export class SshSession {
       case "interactive": {
         this._remoteBusy = false
         const out = cleanAnsi(this._buffer.slice(startPos))
+        this._history.append(command, out)
         return {
           ok: true,
           output: this._truncate(out),
@@ -207,6 +222,7 @@ export class SshSession {
         this._remoteBusy = true
         this._startBackgroundWatch(sentinel, startPos)
         const out = cleanAnsi(stripEcho(this._buffer.slice(startPos), combo))
+        this._history.append(command, out)
         return {
           ok: true,
           output: this._truncate(out),
@@ -266,11 +282,11 @@ export class SshSession {
   }
 
   /**
-   * 获取完整终端记录（供 ssh_terminal HTML 渲染）
-   * @returns 终端记录文本
+   * 获取会话消息对记录（供 ssh_terminal / HTTP 页面渲染）
+   * @returns 消息对存储
    */
-  getTranscript(): string {
-    return this._transcript
+  getHistory(): SessionHistory {
+    return this._history
   }
 
   /**
@@ -296,12 +312,30 @@ export class SshSession {
     }
     this._connected = false
     this._remoteBusy = false
+    this._history.dispose()
     log.hook("ssh_disconnect", `关闭会话 ${this._host}`)
   }
 
   /** 更新最后活动时间（供空闲清扫） */
   touch(): void {
     this._lastActive = Date.now()
+  }
+
+  /**
+   * 追加输出到未消费 buffer，超限时截断头部（保留尾部）并修正运行索引
+   * @param text 新增输出文本
+   */
+  private _appendBuffer(text: string): void {
+    this._buffer += text
+    if (this._buffer.length > MAX_BUFFER_LEN) {
+      const trimmed = this._buffer.length - MAX_BUFFER_LEN
+      this._buffer = this._buffer.slice(trimmed)
+      // 同步修正后台运行上下文索引（若存在）
+      if (this._runningStartPos !== null) {
+        this._runningStartPos = Math.max(0, this._runningStartPos - trimmed)
+      }
+      log.info(`buffer 超限截断 ${trimmed} 字符，当前 ${this._buffer.length}`)
+    }
   }
 
   private _waitSentinel(
@@ -375,14 +409,16 @@ export class SshSession {
     }, 200)
   }
 
-  /** 在缓冲中定位哨兵行起始位置（跳过命令回显所在行内的哨兵） */
+  /** 在缓冲中定位哨兵行起始位置（哨兵串开头，容忍行前 ANSI bracketed-paste 序列） */
   private _findSentinel(sentinel: string, fromPos: number): number {
     const esc = sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    const re = new RegExp(`(?:^|\\r?\\n)${esc}`, "g")
+    // 行开始(\r|\n|串首) + 可选 ANSI 序列(如 ESC[?2004l) + 哨兵串
+    const re = new RegExp(`(?:^|[\\r\\n])(?:\\x1b\\[[0-9;?]*[a-zA-Z])*${esc}`, "g")
     re.lastIndex = fromPos
     const m = re.exec(this._buffer)
     if (!m) return -1
-    return m.index + m[0].length
+    // m[0] = 行开始 + ANSI + sentinel，哨兵串开头 = m.index + m[0].length - sentinel.length
+    return m.index + m[0].length - sentinel.length
   }
 
   /** 清理后台运行上下文 */

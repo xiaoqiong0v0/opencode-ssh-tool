@@ -1,18 +1,23 @@
-// 插件入口：导出 6 个 SSH 工具 + 会话生命周期管理
+// 插件入口：导出 7 个 SSH 工具 + 会话生命周期管理 + HTTP 终端记录服务
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
 import { SWEEP_INTERVAL_MS, IDLE_TIMEOUT_MS } from "./constants.js"
+import { loadConfig } from "./config.js"
+import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
 import { decide } from "./permission.js"
 import { SshSession, type SessionStatus } from "./session.js"
-import { buildTerminalHtml, toDataUrl } from "./utils.js"
+import { startServer, type ServerHandle } from "./server.js"
 
-const log = createLogger("opencode-ssh-tool", { enabled: true })
+const log = createLogger("opencode-ssh-tool")
 const lang = getLang()
 
 /** 会话表：key = opencode sessionID */
 export const sshSessions = new Map<string, SshSession>()
+
+/** HTTP 终端记录服务句柄（可能未启用） */
+let httpServer: ServerHandle | null = null
 
 /** 空闲清扫：定期关闭超时未活动的会话 */
 const sweeper = setInterval(() => {
@@ -39,6 +44,21 @@ function getSession(sessionID: string): SshSession | undefined {
 }
 
 export const OpenCodeSshTool: Plugin = async () => {
+  log.loaded()
+
+  // 加载配置并启动 HTTP 终端记录服务（默认开启；端口 0=自动分配）
+  const cfg = loadConfig()
+  if (cfg.server.enabled) {
+    try {
+      httpServer = await startServer(cfg.server.port, () => sshSessions)
+      log.info(`HTTP 服务已启动 ${httpServer.url}`)
+    } catch (e) {
+      log.error("HTTP 服务启动失败", e instanceof Error ? e : String(e))
+    }
+  } else {
+    log.info("HTTP 服务未启用（配置 server.enabled=false）")
+  }
+
   return {
     tool: {
       ssh_connect: tool({
@@ -68,7 +88,7 @@ export const OpenCodeSshTool: Plugin = async () => {
             sshSessions.delete(sessionID)
           }
 
-          const session = new SshSession(sessionID)
+          const session = new SshSession(sessionID, new SessionHistory(cfg.history.maxMessages, cfg.history.spillThreshold))
           const result = await session.connect(args)
           log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22 })
 
@@ -171,21 +191,54 @@ export const OpenCodeSshTool: Plugin = async () => {
         },
       }),
 
+      ssh_server: tool({
+        description: T.ssh_server[lang],
+        args: {},
+        async execute(_args, _context) {
+          if (!httpServer) return tr("server_disabled", lang)
+          const sessions = sshSessions.size
+          return {
+            title: "SSH HTTP 服务",
+            output: `HTTP 服务已启用\nurl: ${httpServer.url}\nport: ${httpServer.port}\n活跃会话: ${sessions}\n浏览器访问 ${httpServer.url} 查看终端记录（可滚动、自动刷新）。`,
+            metadata: { url: httpServer.url, port: httpServer.port, enabled: true },
+          }
+        },
+      }),
+
       ssh_terminal: tool({
         description: T.ssh_terminal[lang],
-        args: {},
-        async execute(_args, context) {
+        args: {
+          direction: tool.schema.enum(["tail", "head"]).optional().describe(T.ssh_terminal_args.direction[lang]),
+          limit: tool.schema.number().optional().describe(T.ssh_terminal_args.limit[lang]),
+          includeCommand: tool.schema.boolean().optional().describe(T.ssh_terminal_args.includeCommand[lang]),
+        },
+        async execute(args, context) {
           const session = getSession(context.sessionID)
-          if (!session) return tr("no_sessions", lang)
-          const st = session.getStatus()
-          const transcript = session.getTranscript()
-          const title = `SSH 终端记录 ${st.host ?? ""}`
-          const html = buildTerminalHtml(transcript, title)
-          const url = toDataUrl(html, "text/html")
+          if (!session) return tr("not_connected", lang)
+          const history = session.getHistory()
+          const all = history.getPairs()
+          const limit = Math.max(1, args.limit ?? 10)
+          const direction = args.direction ?? "tail"
+          const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
+          const total = all.length
+          const includeCommand = args.includeCommand ?? false
+
+          const text = selected
+            .map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p)))
+            .join("\n")
+          const browserLine = httpServer
+            ? `\n浏览器查看完整记录：${httpServer.url}`
+            : `\n（HTTP 服务未启用）`
           return {
-            title,
-            output: `终端记录已生成（${transcript.length} 字符，连接 ${st.host ?? "-"}，busy=${st.busy}）。点击附件在浏览器中滚动查看。`,
-            attachments: [{ type: "file", mime: "text/html", url }],
+            title: `SSH 历史（${direction === "tail" ? "最后" : "前"}${selected.length} 条 / 共 ${total} 条）`,
+            output: text + browserLine,
+            metadata: {
+              direction,
+              returned: selected.length,
+              total,
+              sessionID: context.sessionID,
+              host: session.getStatus().host,
+            },
           }
         },
       }),
