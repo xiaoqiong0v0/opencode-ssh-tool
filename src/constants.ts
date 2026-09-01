@@ -6,7 +6,7 @@ export const ALLOW_READONLY =
 
 /** 高危命令黑名单（命中直接拒绝，不进 ask） */
 export const DENY =
-  /(?:rm\s+-rf|shutdown|reboot|mkfs|dd\s|DROP\s+TABLE|TRUNCATE\s+TABLE|:\(\)\s*\{|>\s*\/etc\/passwd)/
+  /(?:rm\s+(?:-[a-z]*[fr][a-z]*(?:\s+-[a-z]*[fr][a-z]*)?\s+)?(?:\/(?:\s|$)|~|\.(?:\.)?|\/(?:etc|var|usr|boot|bin|sbin|lib|lib64|opt|root)(?:\s|$))|shutdown|reboot|halt|poweroff|mkfs|mkswap|fdisk|parted|dd\s|iptables|ufw|firewall-cmd|systemctl|service\s+\w+\s+(?:stop|restart|kill)|kill(?:all)?\s|pkill\s|passwd\s|useradd|userdel|groupadd|groupdel|chown\s+-R|chmod\s+-R\s+777\s+\/|apt\s+remove|apt-get\s+remove|npm\s+(?:uninstall|rm)\b|DROP\s+TABLE|TRUNCATE\s+TABLE|DROP\s+DATABASE|:\(\)\s*\{|>\s*\/etc\/(?:passwd|shadow|sudoers|fstab)|curl\s+.*\|\s*(?:ba)?sh|wget\s+.*\|\s*(?:ba)?sh|base64\s+-d\s*[|>])/
 
 /** shell 元字符（出现即降级走 ask，防白名单拼接绕过） */
 export const SHELL_META = /[;|&`$()<>]/

@@ -75,7 +75,11 @@ const CONFIG_TEMPLATE = `{
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
-    //   rm\s+-rf | shutdown | reboot | mkfs | dd\s | DROP\s+TABLE | TRUNCATE\s+TABLE | >\s*\/etc\/passwd
+    //   rm 危险目标(/ ~ . /etc /var /usr 等) | shutdown/reboot/halt/poweroff | mkfs/mkswap/fdisk/parted/dd
+    //   iptables/ufw/firewall-cmd | systemctl | service stop/restart/kill | kill/killall/pkill
+    //   passwd/useradd/userdel/groupadd/groupdel | chown -R | chmod -R 777 / | apt remove | npm uninstall
+    //   DROP TABLE/TRUNCATE/DROP DATABASE | fork炸弹 | > /etc/{passwd,shadow,sudoers,fstab}
+    //   curl|sh / wget|sh / base64 -d |
     // 自定义补充示例：["^mkfs\\s", "^dd\\s"]（此数组为空 = 仅使用内置默认）
     "deny": [],
     // 内置默认只读白名单（命中且无 shell 元字符则直接放行）：
