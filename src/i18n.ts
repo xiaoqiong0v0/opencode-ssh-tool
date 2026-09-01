@@ -8,11 +8,15 @@ export type Lang = "en" | "zh"
 type FlatKey = { [K in keyof typeof T]: (typeof T)[K] extends Record<Lang, string> ? K : never }[keyof typeof T]
 
 /**
- * 读取当前语言（环境变量 SSH_TOOL_LANG，默认 en）
+ * 读取当前语言：环境变量 SSH_TOOL_LANG 优先，否则用配置语言（默认 en）
+ * @param configured 配置文件 toolLang 值
  * @returns 语言标识
  */
-export function getLang(): Lang {
-  return process.env[LANG_ENV] === "zh" ? "zh" : "en"
+export function getLang(configured: Lang = "en"): Lang {
+  const env = process.env[LANG_ENV]
+  if (env === "zh") return "zh"
+  if (env === "en") return "en"
+  return configured
 }
 
 /** 工具描述与参数说明字典 */
@@ -32,6 +36,14 @@ export const T = {
   },
   ssh_exec_args: {
     command: { en: "Shell command to execute", zh: "要执行的 shell 命令" },
+    waitResult: {
+      en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via ssh_status / ssh_terminal / ssh_read.",
+      zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 ssh_status / ssh_terminal / ssh_read 读取结果。",
+    },
+  },
+  submitted: {
+    en: "Command submitted (async). Running in background: check ssh_status for completion, then ssh_terminal / ssh_read to read output.",
+    zh: "命令已异步提交，后台执行中：用 ssh_status 查完成状态，再用 ssh_terminal / ssh_read 读取输出。",
   },
   ssh_read: {
     en: "Read the unconsumed buffered output of the current SSH session (for interactive prompts and polling).",
@@ -97,6 +109,98 @@ export const T = {
   no_sessions: {
     en: "No active SSH sessions.",
     zh: "当前没有活动的 SSH 会话。",
+  },
+  connect_title_ok: {
+    en: "SSH connected",
+    zh: "SSH 已连接",
+  },
+  connect_ok: {
+    en: "Connected: {user}@{host}:{port} (session {sid})",
+    zh: "连接成功：{user}@{host}:{port}（session {sid}）",
+  },
+  connect_title_fail: {
+    en: "SSH connection failed",
+    zh: "SSH 连接失败",
+  },
+  unknown_error: {
+    en: "Unknown error",
+    zh: "未知错误",
+  },
+  exec_title: {
+    en: "SSH exec: {cmd}",
+    zh: "SSH 执行: {cmd}",
+  },
+  exec_failed: {
+    en: "Execution failed",
+    zh: "执行失败",
+  },
+  session_output_title: {
+    en: "SSH session output",
+    zh: "SSH 会话输出",
+  },
+  session_disconnected: {
+    en: "SSH session disconnected",
+    zh: "SSH 会话已断开",
+  },
+  status_busy_hint: {
+    en: "\nHint: a command is still running. Wait and retry, or call ssh_read for partial output.",
+    zh: "\n提示：仍有命令在执行，请等待后重试或调用 ssh_read 获取部分输出。",
+  },
+  status_idle_hint: {
+    en: "\nHint: no command running. You can safely execute a new command or call ssh_read for remaining output.",
+    zh: "\n提示：无命令在执行，可安全执行新命令或调用 ssh_read 读取剩余输出。",
+  },
+  status_title: {
+    en: "SSH session status",
+    zh: "SSH 会话状态",
+  },
+  server_title: {
+    en: "SSH HTTP server",
+    zh: "SSH HTTP 服务",
+  },
+  server_info: {
+    en: "HTTP server enabled\nurl: {url}\nport: {port}\nactive sessions: {n}\nOpen {url} in a browser to view terminal records (scrollable, auto-refreshing).",
+    zh: "HTTP 服务已启用\nurl: {url}\nport: {port}\n活跃会话: {n}\n浏览器访问 {url} 查看终端记录（可滚动、自动刷新）。",
+  },
+  browser_full_record: {
+    en: "\nBrowser full record: {url}",
+    zh: "\n浏览器查看完整记录：{url}",
+  },
+  server_not_enabled: {
+    en: "\n(HTTP server not enabled)",
+    zh: "\n（HTTP 服务未启用）",
+  },
+  history_title: {
+    en: "SSH history (last {n} / total {total})",
+    zh: "SSH 历史（最后 {n} 条 / 共 {total} 条）",
+  },
+  history_title_head: {
+    en: "SSH history (first {n} / total {total})",
+    zh: "SSH 历史（前 {n} 条 / 共 {total} 条）",
+  },
+  disconnected_ok: {
+    en: "SSH connection closed ({host}).",
+    zh: "SSH 连接已断开（{host}）。",
+  },
+  err_not_connected: {
+    en: "Not connected",
+    zh: "未连接",
+  },
+  err_busy: {
+    en: "Previous command still running, poll with ssh_status first",
+    zh: "上一条命令仍在执行，请先 ssh_status 轮询",
+  },
+  err_shell_open: {
+    en: "Shell open failed",
+    zh: "shell 打开失败",
+  },
+  err_no_such_session: {
+    en: "Session not found or disconnected",
+    zh: "会话不存在或已断开",
+  },
+  truncated: {
+    en: "... [output truncated, {n} chars total]",
+    zh: "... [输出已截断，共 {n} 字符]",
   },
 } as const
 

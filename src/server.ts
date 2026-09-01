@@ -47,7 +47,7 @@ export function startServer(port: number, getSessions: () => Map<string, SshSess
       const session = getSessions().get(sid)
       if (!session) {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-        res.end("会话不存在或已断开")
+        res.end("Session not found or disconnected")
         return
       }
       // 渲染命令+输出消息对

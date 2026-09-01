@@ -82,7 +82,7 @@ export class SessionHistory {
       try {
         return readFileSync(pair.file, "utf8")
       } catch {
-        return `[无法读取落盘文件: ${pair.file}]`
+        return `[cannot read spill file: ${pair.file}]`
       }
     }
     return ""

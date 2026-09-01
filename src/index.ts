@@ -6,12 +6,11 @@ import { SWEEP_INTERVAL_MS, IDLE_TIMEOUT_MS } from "./constants.js"
 import { loadConfig } from "./config.js"
 import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
-import { decide } from "./permission.js"
+import { createDecider } from "./permission.js"
 import { SshSession, type SessionStatus } from "./session.js"
 import { startServer, type ServerHandle } from "./server.js"
 
 const log = createLogger("opencode-ssh-tool")
-const lang = getLang()
 
 /** 会话表：key = opencode sessionID */
 export const sshSessions = new Map<string, SshSession>()
@@ -48,6 +47,10 @@ export const OpenCodeSshTool: Plugin = async () => {
 
   // 加载配置并启动 HTTP 终端记录服务（默认开启；端口 0=自动分配）
   const cfg = loadConfig()
+  // 语言：环境变量 SSH_TOOL_LANG 优先，否则配置文件 toolLang（默认 en）
+  const lang = getLang(cfg.toolLang)
+  // 权限判定器：内置正则 + 配置自定义 deny/allow 正则
+  const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
   if (cfg.server.enabled) {
     try {
       httpServer = await startServer(cfg.server.port, () => sshSessions)
@@ -75,7 +78,7 @@ export const OpenCodeSshTool: Plugin = async () => {
               permission: "ssh_connect",
               patterns: [`${args.user}@${args.host}:${args.port ?? 22}`],
               always: [`ssh_connect:${args.user}@${args.host}:${args.port ?? 22}`],
-              metadata: { title: `SSH 连接 ${args.user}@${args.host}` },
+              metadata: { title: `${args.user}@${args.host}` },
             })
           } catch {
             return tr("rejected_connect", lang)
@@ -93,13 +96,20 @@ export const OpenCodeSshTool: Plugin = async () => {
           log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22 })
 
           if (!result.ok) {
-            return { title: "SSH 连接失败", output: result.error ?? "未知错误" }
+            return {
+              title: tr("connect_title_fail", lang),
+              output: result.error ?? tr("unknown_error", lang),
+            }
           }
 
           sshSessions.set(sessionID, session)
           return {
-            title: `SSH 已连接 ${args.user}@${args.host}`,
-            output: `连接成功：${args.user}@${args.host}:${args.port ?? 22}（session ${sessionID}）`,
+            title: `${tr("connect_title_ok", lang)} ${args.user}@${args.host}`,
+            output: tr("connect_ok", lang)
+              .replace("{user}", args.user)
+              .replace("{host}", args.host)
+              .replace("{port}", String(args.port ?? 22))
+              .replace("{sid}", sessionID),
             metadata: { host: args.host, user: args.user, port: args.port ?? 22 },
           }
         },
@@ -109,6 +119,7 @@ export const OpenCodeSshTool: Plugin = async () => {
         description: T.ssh_exec[lang],
         args: {
           command: tool.schema.string().describe(T.ssh_exec_args.command[lang]),
+          waitResult: tool.schema.boolean().optional().describe(T.ssh_exec_args.waitResult[lang]),
         },
         async execute(args, context) {
           const { sessionID } = context
@@ -127,28 +138,33 @@ export const OpenCodeSshTool: Plugin = async () => {
                 permission: "ssh_exec",
                 patterns: [args.command],
                 always: [`ssh_exec:${args.command}`],
-                metadata: { title: `SSH 执行: ${args.command.slice(0, 60)}` },
+                metadata: { title: args.command.slice(0, 60) },
               })
             } catch {
               return tr("denied", lang)
             }
           }
 
-          const result = await session.exec(args.command)
+          // 默认异步提交（立即返回，不占上下文）；waitResult=true 同步等结果
+          const result = args.waitResult ? await session.exec(args.command) : await session.submit(args.command)
           session.touch()
-          log.tool("ssh_exec", { command: args.command, ok: result.ok, interactive: result.interactive, running: result.running })
+          log.tool("ssh_exec", { command: args.command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
 
           const meta: Record<string, string | number | boolean | undefined> = {
             host: result.host,
             command: result.command,
             duration: result.duration,
+            submitted: result.submitted,
             interactive: result.interactive,
             running: result.running,
             timeout: result.timeout,
           }
+          if (result.submitted) {
+            return { title: tr("exec_title", lang).replace("{cmd}", args.command.slice(0, 60)), output: tr("submitted", lang), metadata: meta }
+          }
           return {
-            title: `SSH 执行: ${args.command.slice(0, 60)}`,
-            output: result.ok ? result.output : result.error ?? "执行失败",
+            title: tr("exec_title", lang).replace("{cmd}", args.command.slice(0, 60)),
+            output: result.ok ? result.output : result.error ?? tr("exec_failed", lang),
             metadata: meta,
           }
         },
@@ -164,7 +180,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           if (!session) return tr("not_connected", lang)
           const r = await session.readBuffer()
           const out = _args.lines ? r.output.split(/\r?\n/).slice(0, _args.lines).join("\n") : r.output
-          return { title: "SSH 会话输出", output: out }
+          return { title: tr("session_output_title", lang), output: out }
         },
       }),
 
@@ -175,7 +191,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           const session = getSession(context.sessionID)
           if (!session) return tr("no_sessions", lang)
           const st: SessionStatus = session.getStatus()
-          if (!st.connected) return "SSH 会话已断开"
+          if (!st.connected) return tr("session_disconnected", lang)
           const lines = [
             `connected: ${st.connected}`,
             `busy: ${st.busy}`,
@@ -184,10 +200,8 @@ export const OpenCodeSshTool: Plugin = async () => {
             st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
             st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
           ].filter(Boolean)
-          const runningHint = st.busy
-            ? "\n提示：仍有命令在执行，请等待后重试或调用 ssh_read 获取部分输出。"
-            : "\n提示：无命令在执行，可安全执行新命令或调用 ssh_read 读取剩余输出。"
-          return { title: "SSH 会话状态", output: lines.join("\n") + runningHint }
+          const runningHint = st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang)
+          return { title: tr("status_title", lang), output: lines.join("\n") + runningHint }
         },
       }),
 
@@ -198,8 +212,11 @@ export const OpenCodeSshTool: Plugin = async () => {
           if (!httpServer) return tr("server_disabled", lang)
           const sessions = sshSessions.size
           return {
-            title: "SSH HTTP 服务",
-            output: `HTTP 服务已启用\nurl: ${httpServer.url}\nport: ${httpServer.port}\n活跃会话: ${sessions}\n浏览器访问 ${httpServer.url} 查看终端记录（可滚动、自动刷新）。`,
+            title: tr("server_title", lang),
+            output: tr("server_info", lang)
+              .replace("{url}", httpServer.url)
+              .replace("{port}", String(httpServer.port))
+              .replace("{n}", String(sessions)),
             metadata: { url: httpServer.url, port: httpServer.port, enabled: true },
           }
         },
@@ -227,10 +244,11 @@ export const OpenCodeSshTool: Plugin = async () => {
             .map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p)))
             .join("\n")
           const browserLine = httpServer
-            ? `\n浏览器查看完整记录：${httpServer.url}`
-            : `\n（HTTP 服务未启用）`
+            ? tr("browser_full_record", lang).replace("{url}", httpServer.url)
+            : tr("server_not_enabled", lang)
+          const titleKey = direction === "tail" ? "history_title" : "history_title_head"
           return {
-            title: `SSH 历史（${direction === "tail" ? "最后" : "前"}${selected.length} 条 / 共 ${total} 条）`,
+            title: tr(titleKey, lang).replace("{n}", String(selected.length)).replace("{total}", String(total)),
             output: text + browserLine,
             metadata: {
               direction,
@@ -252,7 +270,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           const host = session.getStatus().host
           session.close()
           sshSessions.delete(context.sessionID)
-          return `SSH 连接已断开（${host ?? "-"}）。`
+          return tr("disconnected_ok", lang).replace("{host}", host ?? "-")
         },
       }),
     },

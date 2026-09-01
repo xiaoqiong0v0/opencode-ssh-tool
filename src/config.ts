@@ -1,8 +1,9 @@
-// 配置文件读取：~/.config/opencode/ssh-tool.jsonc（服务/记录管理），首次运行自动生成模板
+// 配置文件读取：~/.config/opencode/ssh-tool.jsonc（服务/记录/语言），首次运行自动生成模板
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import type { Lang } from "./i18n.js"
 
 /** HTTP 服务配置 */
 export interface ServerConfig {
@@ -16,10 +17,21 @@ export interface HistoryConfig {
   spillThreshold: number
 }
 
+/** 权限自定义正则配置（追加到内置默认，控制"拒绝"与"需审批"命令） */
+export interface PermissionConfig {
+  /** 危险命令正则（命中直接拒绝），如 ["^mkfs\\s", "^dd\\s"] */
+  deny: string[]
+  /** 只读白名单正则（命中且无 shell 元字符则直接放行），如 ["^df\\s.*-h$"] */
+  allow: string[]
+}
+
 /** 工具整体配置 */
 export interface ToolConfig {
   server: ServerConfig
   history: HistoryConfig
+  /** 工具描述语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
+  toolLang: Lang
+  permission: PermissionConfig
 }
 
 /** 配置默认值 */
@@ -34,6 +46,11 @@ const DEFAULT_CONFIG: ToolConfig = {
     maxMessages: 100,
     // 单条命令+输出超此字节数写文件（默认 3MB）
     spillThreshold: 3 * 1024 * 1024,
+  },
+  toolLang: "en",
+  permission: {
+    deny: [],
+    allow: [],
   },
 }
 
@@ -57,6 +74,19 @@ const CONFIG_TEMPLATE = `{
     "maxMessages": 100,
     // 单条命令+输出超过此字节数时写入文件（默认 3145728 = 3MB），内存只存引用
     "spillThreshold": 3145728
+  },
+  // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  "toolLang": "en",
+  // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
+  "permission": {
+    // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
+    //   rm\s+-rf | shutdown | reboot | mkfs | dd\s | DROP\s+TABLE | TRUNCATE\s+TABLE | >\s*\/etc\/passwd
+    // 自定义补充示例：["^mkfs\\s", "^dd\\s"]（此数组为空 = 仅使用内置默认）
+    "deny": [],
+    // 内置默认只读白名单（命中且无 shell 元字符则直接放行）：
+    //   ls | cd | cat | grep | tail | head | ps | df | free | pwd | env | echo | curl | wget | git status | whoami | hostname | date | uname | uptime
+    // 自定义补充示例：["^df\\s.*-h$"]（此数组为空 = 仅使用内置默认）
+    "allow": []
   }
 }
 `
@@ -88,6 +118,8 @@ export function loadConfig(): ToolConfig {
     const raw = parseJsonc(readFileSync(path, "utf8"))
     const server = (raw.server ?? {}) as Partial<ServerConfig>
     const history = (raw.history ?? {}) as Partial<HistoryConfig>
+    const permission = (raw.permission ?? {}) as Partial<PermissionConfig>
+    const toolLang = raw.toolLang === "zh" ? "zh" : "en"
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
@@ -96,6 +128,11 @@ export function loadConfig(): ToolConfig {
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
         spillThreshold: history.spillThreshold ?? DEFAULT_CONFIG.history.spillThreshold,
+      },
+      toolLang,
+      permission: {
+        deny: Array.isArray(permission.deny) ? permission.deny : [],
+        allow: Array.isArray(permission.allow) ? permission.allow : [],
       },
     }
   } catch (e) {

@@ -28,7 +28,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
 | 工具 | 入参 | 行为 |
 |---|---|---|
 | `ssh_connect` | `host`, `user`, `port?` | 建立长驻 SSH 连接 + 打开 PTY shell |
-| `ssh_exec` | `command` | 在**同一会话**执行命令，保留 cwd/环境 |
+| `ssh_exec` | `command`, `waitResult?` | 执行命令；默认异步提交立即返回，`waitResult=true` 同步等结果 |
 | `ssh_read` | `lines?` | 读取未消费缓冲输出（交互/轮询场景） |
 | `ssh_status` | — | 检查命令是否仍在执行（busy）、缓冲量、连接状态 |
 | `ssh_server` | — | 查询本地 HTTP 服务地址/端口/会话数 |
@@ -53,9 +53,26 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
     "maxMessages": 100,
     // 单条命令+输出超过此字节数时写入文件（默认 3145728 = 3MB），内存只存引用
     "spillThreshold": 3145728
+  },
+  // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  "toolLang": "en",
+  // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
+  "permission": {
+    // 内置默认危险命令黑名单（命中直接拒绝）：
+    //   rm\s+-rf | shutdown | reboot | mkfs | dd\s | DROP\s+TABLE | TRUNCATE\s+TABLE | >\s*\/etc\/passwd
+    // 自定义补充示例：["^mkfs\\s", "^dd\\s"]（空数组 = 仅使用内置默认）
+    "deny": [],
+    // 内置默认只读白名单（命中且无 shell 元字符则直接放行）：
+    //   ls | cd | cat | grep | tail | head | ps | df | free | pwd | env | echo | curl | wget | git status | whoami | hostname | date | uname | uptime
+    // 自定义补充示例：["^df\\s.*-h$"]（空数组 = 仅使用内置默认）
+    "allow": []
   }
 }
 ```
+
+多语言优先级：环境变量 `SSH_TOOL_LANG` > 配置文件 `toolLang` > 默认 `en`。
+
+权限自定义正则**追加**到内置默认（`DENY` 黑名单 + `ALLOW_READONLY` 白名单），`deny`/`allow` 为空数组时仅用内置默认规则，可自行补充扩展。
 
 ## 认证
 

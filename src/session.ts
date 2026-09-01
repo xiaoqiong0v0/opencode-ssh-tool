@@ -33,6 +33,8 @@ export interface ExecResult {
   interactive?: boolean
   running?: boolean
   timeout?: boolean
+  /** 异步提交成功（命令后台执行中） */
+  submitted?: boolean
   error?: string
   host?: string
   command?: string
@@ -121,8 +123,8 @@ export class SshSession {
           (err: Error | undefined, stream) => {
             if (err || !stream) {
               client.end()
-              fail(err?.message ?? "shell 打开失败")
-              return
+      fail(err?.message ?? "shell open failed")
+      return
             }
             settled = true
             this._client = client
@@ -165,7 +167,41 @@ export class SshSession {
   }
 
   /**
-   * 在当前会话执行命令（哨兵法），保留 cwd/环境
+   * 异步提交命令：立即返回，命令后台执行，输出由后台监听收集进 history
+   * @param command 命令
+   * @returns 提交结果（立即返回，不等待命令完成）
+   */
+  async submit(command: string): Promise<ExecResult> {
+    const startTs = Date.now()
+    if (!this._connected || !this._stream) {
+      return { ok: false, output: "", error: "Not connected" }
+    }
+    if (this._remoteBusy) {
+      return { ok: false, output: "", error: "Previous command still running, poll with ssh_status first" }
+    }
+
+    const sentinel = genSentinel()
+    const combo = `${command}; echo ${sentinel}`
+    const startPos = this._buffer.length
+    this._runningStartPos = startPos
+    this._runningSentinel = sentinel
+    this._remoteBusy = true
+    this._lastActive = startTs
+    this._stream.write(combo + "\r")
+    this._startBackgroundWatch(sentinel, startPos, command)
+
+    return {
+      ok: true,
+      output: "",
+      submitted: true,
+      host: this._host,
+      command,
+      duration: 0,
+    }
+  }
+
+  /**
+   * 在当前会话执行命令（哨兵法，同步等待），保留 cwd/环境
    * @param command 命令
    * @param timeout 超时毫秒，默认 30s
    * @returns 执行结果
@@ -173,10 +209,10 @@ export class SshSession {
   async exec(command: string, timeout: number = EXEC_TIMEOUT_MS): Promise<ExecResult> {
     const startTs = Date.now()
     if (!this._connected || !this._stream) {
-      return { ok: false, output: "", error: "未连接" }
+      return { ok: false, output: "", error: "Not connected" }
     }
     if (this._remoteBusy) {
-      return { ok: false, output: "", error: "上一条命令仍在执行，请先 ssh_status 轮询" }
+      return { ok: false, output: "", error: "Previous command still running, poll with ssh_status first" }
     }
 
     const sentinel = genSentinel()
@@ -220,7 +256,7 @@ export class SshSession {
         this._runningStartPos = startPos
         this._runningSentinel = sentinel
         this._remoteBusy = true
-        this._startBackgroundWatch(sentinel, startPos)
+        this._startBackgroundWatch(sentinel, startPos, command)
         const out = cleanAnsi(stripEcho(this._buffer.slice(startPos), combo))
         this._history.append(command, out)
         return {
@@ -242,7 +278,7 @@ export class SshSession {
    */
   async readBuffer(): Promise<{ ok: boolean; output: string; error?: string }> {
     if (!this._connected) {
-      return { ok: false, output: "", error: "未连接" }
+      return { ok: false, output: "", error: "Not connected" }
     }
     let out: string
 
@@ -390,8 +426,8 @@ export class SshSession {
     })
   }
 
-  /** 后台哨兵监听：轮询到哨兵即翻转 busy=false，供 ssh_status 轮询判定 */
-  private _startBackgroundWatch(sentinel: string, startPos: number): void {
+  /** 后台哨兵监听：轮询到哨兵 → 收集输出进 history + busy=false，供 ssh_status/ssh_terminal 读取 */
+  private _startBackgroundWatch(sentinel: string, startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
     const born = Date.now()
     this._watchTimer = setInterval(() => {
@@ -401,7 +437,14 @@ export class SshSession {
         if (this._watchTimer) clearInterval(this._watchTimer)
         return
       }
-      if (this._findSentinel(sentinel, startPos) >= 0) {
+      const idx = this._findSentinel(sentinel, startPos)
+      if (idx >= 0) {
+        // 命令完成：收集输出（哨兵前内容，剔除回显）进 history
+        const combo = `${command}; echo ${sentinel}`
+        const out = cleanAnsi(stripEcho(this._buffer.slice(startPos, idx), combo))
+        this._history.append(command, out)
+        const nl = this._buffer.indexOf("\n", idx)
+        this._buffer = this._buffer.slice(nl >= 0 ? nl + 1 : idx + sentinel.length)
         this._remoteBusy = false
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
@@ -430,6 +473,6 @@ export class SshSession {
   /** 输出截断保护 */
   private _truncate(s: string): string {
     if (s.length <= MAX_OUTPUT_LEN) return s
-    return `${s.slice(0, MAX_OUTPUT_LEN)}\n... [输出已截断，共 ${s.length} 字符]`
+    return `${s.slice(0, MAX_OUTPUT_LEN)}\n... [output truncated, ${s.length} chars total]`
   }
 }
