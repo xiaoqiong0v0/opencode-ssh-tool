@@ -11,7 +11,8 @@ import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
 import { createDecider } from "./permission.js"
 import { SshSession, type SessionStatus } from "./session.js"
-import { startServer, type ServerHandle, type SessionEntry } from "./server.js"
+import { type ServerHandle, type SessionEntry } from "./server.js"
+import { ensureServer } from "./server-manager.js"
 
 const log = createLogger("opencode-ssh-tool")
 
@@ -38,12 +39,22 @@ const sshSessions = new Map<string, Map<string, SshSession>>()
 /** 会话元信息（标题/目录，供 HTTP 页面显示），key = sessionID */
 const sessionMeta = new Map<string, { title: string; directory: string }>()
 
-/** HTTP 终端记录服务句柄（可能未启用） */
+/** HTTP 终端记录服务句柄（本进程持有，可能为 null） */
 let httpServer: ServerHandle | null = null
 
-/** 进程退出兜底：关闭全部连接 */
+/** HTTP 服务已知地址（本进程启动或复用时记录，供展示） */
+let httpUrl = ""
+
+/** 进程退出兜底：关闭全部连接 + 关闭本进程持有的 HTTP 服务 */
 process.on("exit", () => {
   for (const map of sshSessions.values()) for (const s of map.values()) s.close()
+  if (httpServer) {
+    try {
+      httpServer.close()
+    } catch {
+      /* 忽略 */
+    }
+  }
 })
 
 /** 按 sessionID 取内层终端表（无则返回 undefined） */
@@ -116,8 +127,17 @@ export const OpenCodeSshTool: Plugin = async () => {
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
   if (cfg.server.enabled) {
     try {
-      httpServer = await startServer(cfg.server.port, listSessionEntries)
-      log.info(`HTTP 服务已启动 ${httpServer.url}`)
+      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot())
+      if (sr.server) {
+        httpServer = sr.server
+        httpUrl = sr.url
+        log.info(`HTTP 服务已启动 ${sr.url}`)
+      } else if (sr.reused) {
+        httpUrl = sr.url
+        log.info(`HTTP 服务复用 ${sr.url}`)
+      } else {
+        log.info("HTTP 服务未启动（端口冲突或锁竞争）")
+      }
     } catch (e) {
       log.error("HTTP 服务启动失败", e instanceof Error ? e : String(e))
     }
@@ -298,8 +318,8 @@ export const OpenCodeSshTool: Plugin = async () => {
           const text = selected
             .map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p)))
             .join("\n")
-          const browserLine = httpServer
-            ? tr("browser_full_record", lang).replace("{url}", httpServer.url)
+          const browserLine = httpUrl
+            ? tr("browser_full_record", lang).replace("{url}", httpUrl)
             : tr("server_not_enabled", lang)
           const titleKey = direction === "tail" ? "history_title" : "history_title_head"
           return {
@@ -352,11 +372,10 @@ export const OpenCodeSshTool: Plugin = async () => {
           }
 
           // 并入 HTTP 服务状态
-          const serverLines = httpServer
+          const serverLines = httpUrl
             ? [
                 "",
-                `httpServer: ${httpServer.url}`,
-                `httpPort: ${httpServer.port}`,
+                `httpServer: ${httpUrl}`,
                 `activeSessions: ${listSessionEntries().length}`,
               ]
             : ["", "httpServer: disabled"]
