@@ -7,9 +7,13 @@ import { join } from "node:path"
 export interface SessionState {
   sessionID: string
   name: string
+  /** 会话类型：ssh 远程 / local 本地·容器 */
+  kind?: "ssh" | "local"
   host?: string
   user?: string
   port?: number
+  /** 本地/容器会话的程序（如 pwsh、docker exec ...） */
+  program?: string
   connected: boolean
   busy: boolean
   pending: number

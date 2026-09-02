@@ -38,15 +38,15 @@ export const T = {
       zh: "密码认证密码（可选）。支持明文或 'file:<绝对路径>' 从文件读取（避免暴露在上下文中）。省略时回退到 SSH 私钥 / agent / 环境变量 SSH_PASSWORD。",
     },
   },
-  ssh_exec: {
-    en: "Execute a command in the current SSH session (by terminal name), preserving cwd and environment. Commands outside the read-only allowlist require user approval.",
-    zh: "在当前 SSH 会话（按终端名）执行命令，保留 cwd 与环境变量；白名单外的命令需用户审批。",
+  term_exec: {
+    en: "Execute a command in an SSH, local or container terminal (by terminal name), preserving cwd and environment. Commands outside the read-only allowlist require user approval.",
+    zh: "在 SSH / 本地 / 容器终端（按终端名）执行命令，保留 cwd 与环境变量；白名单外的命令需用户审批。",
   },
-  ssh_exec_args: {
+  term_exec_args: {
     command: { en: "Shell command to execute", zh: "要执行的 shell 命令" },
     waitResult: {
-      en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via ssh_read.",
-      zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 ssh_read 读取结果。",
+      en: "Wait for the command to finish and return its output. Default false: submit async, return immediately; read results later via term_read.",
+      zh: "是否等待命令完成并返回其输出。默认 false：异步提交，立即返回；稍后通过 term_read 读取结果。",
     },
     name: {
       en: "Target terminal name, default 'default'. Must match a name from ssh_connect.",
@@ -54,18 +54,18 @@ export const T = {
     },
   },
   submitted: {
-    en: "Command submitted (async). Running in background: check ssh_status for completion, then ssh_read to read output.",
-    zh: "命令已异步提交，后台执行中：用 ssh_status 查完成状态，再用 ssh_read 读取输出。",
+    en: "Command submitted (async). Running in background: check term_status for completion, then term_read to read output.",
+    zh: "命令已异步提交，后台执行中：用 term_status 查完成状态，再用 term_read 读取输出。",
   },
-  ssh_read: {
-    en: "Read output of the current SSH session: buffered (unconsumed, for interactive/polling) or history (completed command+output pairs, first N or last N). Returns browser URL for the full scrollable viewer when the HTTP server is on.",
-    zh: "读取当前 SSH 会话的输出：缓冲（未消费，交互/轮询用）或历史（已完成的命令+输出对，前 N 条或后 N 条）。HTTP 服务开启时返回浏览器查看完整记录的地址。",
+  term_read: {
+    en: "Read output of an SSH, local or container terminal: buffered (unconsumed, for interactive/polling) or history (completed command+output pairs, first N or last N). Returns browser URL for the full scrollable viewer when the HTTP server is on.",
+    zh: "读取 SSH / 本地 / 容器终端输出：缓冲（未消费，交互/轮询用）或历史（已完成的命令+输出对，前 N 条或后 N 条）。HTTP 服务开启时返回浏览器查看完整记录的地址。",
   },
-  ssh_send: {
-    en: "Send text or keystrokes to the remote shell for interactive prompts (sudo password, confirmations, interrupts). Escapes: \\r or \\n = Enter, \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1a = Ctrl-Z, \\x1b = Esc. After sending, read the result with ssh_read.",
-    zh: "向远程 shell 发送文本或按键，用于交互提示（sudo 密码、确认、中断等）。转义：\\r 或 \\n = 回车，\\x03 = Ctrl-C，\\x04 = Ctrl-D，\\x1a = Ctrl-Z，\\x1b = Esc。发送后用 ssh_read 读取结果。",
+  term_send: {
+    en: "Send text or keystrokes to an SSH, local or container terminal for interactive prompts (sudo password, confirmations, interrupts). Escapes: \\r or \\n = Enter, \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1a = Ctrl-Z, \\x1b = Esc. After sending, read the result with term_read.",
+    zh: "向 SSH / 本地 / 容器终端发送文本或按键，用于交互提示（sudo 密码、确认、中断等）。转义：\\r 或 \\n = 回车，\\x03 = Ctrl-C，\\x04 = Ctrl-D，\\x1a = Ctrl-Z，\\x1b = Esc。发送后用 term_read 读取结果。",
   },
-  ssh_send_args: {
+  term_send_args: {
     text: {
       en: "Text or key sequence to send. Use \\r or \\n for Enter, \\x03 for Ctrl-C, \\x1b for Esc. For sudo password prompts send the password followed by \\r.",
       zh: "要发送的文本或按键序列。回车用 \\r 或 \\n，Ctrl-C 用 \\x03，Esc 用 \\x1b。sudo 密码提示时发送密码后跟 \\r。",
@@ -83,7 +83,7 @@ export const T = {
     en: "SSH send",
     zh: "SSH 发送",
   },
-  ssh_read_args: {
+  term_read_args: {
     source: {
       en: "Where to read from: 'buffer' (unconsumed live output) or 'history' (completed pairs, default).",
       zh: "读取来源：'buffer'（实时未消费输出）或 'history'（已完成消息对，默认）。",
@@ -106,25 +106,55 @@ export const T = {
       zh: "目标终端名，默认 'default'。",
     },
   },
-  ssh_status: {
-    en: "Check SSH session state (busy, pending, connection) by terminal name (all terminals if omitted) and the HTTP server state (URL/port/session count). Use busy to poll completion instead of reading animated output.",
-    zh: "按终端名检查 SSH 会话状态（busy、未消费量、连接；省略则列出全部终端）及 HTTP 服务状态（URL/端口/会话数）。用 busy 轮询完成情况，避免读取动画中间态。",
+  term_status: {
+    en: "Check SSH/local/container terminal state (busy, pending, connection) by terminal name (all terminals if omitted) and the HTTP server state (URL/port/session count). Use busy to poll completion instead of reading animated output.",
+    zh: "按终端名检查 SSH / 本地 / 容器终端状态（busy、未消费量、连接；省略则列出全部终端）及 HTTP 服务状态（URL/端口/会话数）。用 busy 轮询完成情况，避免读取动画中间态。",
   },
-  ssh_status_args: {
+  term_status_args: {
     name: {
       en: "Terminal name to check; omit to list all terminals.",
       zh: "要检查的终端名；省略则列出全部终端。",
     },
   },
-  ssh_disconnect: {
-    en: "Close the SSH connection of a terminal (default 'default'), or all terminals when name is omitted, and clean up session state.",
-    zh: "关闭指定终端（默认 'default'）的 SSH 连接，name 省略则关闭全部终端，并清理会话态。",
+  term_disconnect: {
+    en: "Close the terminal of a name (default 'default') for an SSH, local or container session, or all terminals when name is omitted, and clean up session state.",
+    zh: "关闭指定名称（默认 'default'）的 SSH / 本地 / 容器终端，name 省略则关闭全部终端，并清理会话态。",
   },
-  ssh_disconnect_args: {
+  term_disconnect_args: {
     name: {
       en: "Terminal name to disconnect; omit to disconnect all terminals.",
       zh: "要断开的终端名；省略则断开全部终端。",
     },
+  },
+  local_connect: {
+    en: "Start a local/container PTY terminal (e.g. pwsh, bash, docker exec -it <container> sh) in the current session. Same-session reconnect closes the previous one. Uses Bun.Terminal (runs in the opencode Bun runtime).",
+    zh: "在当前会话启动本地/容器 PTY 终端（如 pwsh、bash、docker exec -it <容器> sh）；同一会话重复启动会先关闭旧的。基于 Bun.Terminal（opencode Bun 运行时内运行）。",
+  },
+  local_connect_args: {
+    command: {
+      en: "Command to launch, e.g. pwsh / bash / docker exec -it <container> sh",
+      zh: "要启动的命令，如 pwsh / bash / docker exec -it <容器> sh",
+    },
+    name: {
+      en: "Terminal name within the session, default 'default'. Creating with an existing name closes the old one first.",
+      zh: "会话内的终端名，默认 'default'。同名创建会先关闭旧终端。",
+    },
+    cwd: {
+      en: "Working directory, defaults to plugin cwd.",
+      zh: "工作目录，默认插件所在目录。",
+    },
+  },
+  local_connect_title_ok: {
+    en: "Local terminal started",
+    zh: "本地终端已启动",
+  },
+  local_connect_ok: {
+    en: "Started: {cmd} (terminal {name})",
+    zh: "已启动：{cmd}（终端 {name}）",
+  },
+  local_connect_title_fail: {
+    en: "Local terminal start failed",
+    zh: "本地终端启动失败",
   },
   denied: {
     en: "Denied by user.",
@@ -183,12 +213,12 @@ export const T = {
     zh: "SSH 会话已断开",
   },
   status_busy_hint: {
-    en: "\nHint: a command is still running. Wait and retry, or call ssh_read for partial output.",
-    zh: "\n提示：仍有命令在执行，请等待后重试或调用 ssh_read 获取部分输出。",
+    en: "\nHint: a command is still running. Wait and retry, or call term_read for partial output.",
+    zh: "\n提示：仍有命令在执行，请等待后重试或调用 term_read 获取部分输出。",
   },
   status_idle_hint: {
-    en: "\nHint: no command running. You can safely execute a new command or call ssh_read for remaining output.",
-    zh: "\n提示：无命令在执行，可安全执行新命令或调用 ssh_read 读取剩余输出。",
+    en: "\nHint: no command running. You can safely execute a new command or call term_read for remaining output.",
+    zh: "\n提示：无命令在执行，可安全执行新命令或调用 term_read 读取剩余输出。",
   },
   status_title: {
     en: "SSH session status",
@@ -231,8 +261,8 @@ export const T = {
     zh: "未连接",
   },
   err_busy: {
-    en: "Previous command still running, poll with ssh_status first",
-    zh: "上一条命令仍在执行，请先 ssh_status 轮询",
+    en: "Previous command still running, poll with term_status first",
+    zh: "上一条命令仍在执行，请先 term_status 轮询",
   },
   err_shell_open: {
     en: "Shell open failed",

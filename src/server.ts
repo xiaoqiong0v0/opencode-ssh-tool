@@ -44,13 +44,13 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
     }
 
     if (path === "/api/status") {
-      // 跨进程聚合：所有 opencode 进程写入的状态文件（含本进程）
+      // 跨进程聚合：所有 opencode 进程写入的状态文件（含本进程，SSH + 本地/容器）
       const states = listAllSessions(dir)
       // 按 sessionID 分组（一个会话下多个终端）
-      const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; host?: string; user?: string; port?: number; connected: boolean; busy: boolean; pending: number }[] }>()
+      const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
       for (const s of states) {
         if (!bySession.has(s.sessionID)) bySession.set(s.sessionID, { title: s.title, directory: s.directory, terminals: [] })
-        bySession.get(s.sessionID)!.terminals.push({ name: s.name, host: s.host, user: s.user, port: s.port, connected: s.connected, busy: s.busy, pending: s.pending })
+        bySession.get(s.sessionID)!.terminals.push({ name: s.name, kind: s.kind, host: s.host, user: s.user, port: s.port, program: s.program, connected: s.connected, busy: s.busy, pending: s.pending })
       }
       const sessions = [...bySession.entries()].map(([sessionID, v]) => ({
         sessionID,
@@ -67,32 +67,30 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
       const sid = url.searchParams.get("session") ?? ""
       const name = url.searchParams.get("name") ?? "default"
       const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
+      let pairs: TranscriptPair[]
       if (!entry) {
         // 本进程无此会话句柄（其他进程的会话/复用服务）→ 从历史文件读取
-        const text = readHistoryFromFile(dir, sid, name)
-        if (text === null) {
+        // 本地/容器会话的历史目录带 local- 前缀，需按状态里的 kind 探测
+        const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
+        const histName = state?.kind === "local" ? `local-${name}` : name
+        pairs = readHistoryFromFile(dir, sid, histName) ?? []
+        if (pairs.length === 0) {
           res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
           res.end("Session not found or disconnected")
           return
         }
-        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
-        res.end(text)
-        return
+      } else {
+        // 命令+输出消息对（保留 ANSI 颜色，前端解析着色）；运行中附加实时进度
+        pairs = []
+        for (const pair of entry.session.getHistory().getPairs()) {
+          pairs.push({ type: "cmd", ts: pair.ts, text: pair.command })
+          pairs.push({ type: "out", text: entry.session.getHistory().readOutput(pair) })
+        }
+        const running = entry.session.getRunningOutput()
+        if (running) pairs.push({ type: "run", text: running })
       }
-      // 渲染命令+输出消息对（保留 ANSI 颜色，前端解析着色）
-      const lines: string[] = []
-      for (const pair of entry.session.getHistory().getPairs()) {
-        lines.push(`$ ${pair.command}`)
-        lines.push(entry.session.getHistory().readOutput(pair))
-      }
-      // 附加运行中命令的实时进度（busy 时）
-      const running = entry.session.getRunningOutput()
-      if (running) {
-        lines.push("")
-        lines.push(`[ 运行中 ] ${running}`)
-      }
-      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
-      res.end(lines.join("\n"))
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ pairs }))
       return
     }
 
@@ -122,14 +120,21 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
   })
 }
 
+/** transcript 消息项：cmd 命令 / out 输出 / run 运行中 */
+interface TranscriptPair {
+  type: "cmd" | "out" | "run"
+  ts?: number
+  text: string
+}
+
 /**
  * 从历史文件读取某终端记录（跨进程场景：本进程无该会话句柄时用）
  * @param dir 插件缓存根目录
  * @param sessionID opencode 会话 ID
- * @param name 终端名
- * @returns 渲染文本（命令+输出，去除 ANSI）；目录不存在返回 null
+ * @param name 终端名（已含 local- 前缀则按本地目录）
+ * @returns 结构化消息对（保留 ANSI）；目录不存在返回 null
  */
-function readHistoryFromFile(dir: string, sessionID: string, name: string): string | null {
+function readHistoryFromFile(dir: string, sessionID: string, name: string): TranscriptPair[] | null {
   const hdir = join(dir, sessionID, name)
   let files: string[]
   try {
@@ -138,17 +143,17 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): stri
     return null
   }
   files.sort()
-  const lines: string[] = []
+  const out: TranscriptPair[] = []
   for (const f of files) {
     try {
-      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string }
-      if (typeof data.command === "string") lines.push(`$ ${data.command}`)
-      if (typeof data.output === "string") lines.push(data.output)
+      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string; ts?: number }
+      if (typeof data.command === "string") out.push({ type: "cmd", ts: data.ts ?? Date.now(), text: data.command })
+      if (typeof data.output === "string") out.push({ type: "out", text: data.output })
     } catch {
       /* 跳过损坏文件 */
     }
   }
-  return lines.join("\n")
+  return out
 }
 
 /** 渲染终端记录页面（黑底绿字等宽，JS 轮询自动刷新） */
@@ -163,7 +168,15 @@ function renderPage(): string {
   header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
   header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
   select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+  /* 两列布局：左侧时间列（开关控制显隐），右侧内容列（命令/输出格式不变） */
+  .row { display: flex; align-items: stretch; }
+  .row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
+  .row .c { flex: 1; padding-left: 12px; white-space: pre; }
+  body:not(.show-time) .row .t { display: none; }
+  /* 命令行：明显区分（背景条 + 左侧蓝条 + 加粗）；用 box-shadow 不占布局，保证时间列/分割线与输出行完全对齐 */
+  .row.cmdline { background: #161b22; box-shadow: inset 3px 0 0 #58a6ff; font-weight: 600; }
+  .tgl { font-size: 12px; color: #8b949e; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
   #meta { font-size: 12px; color: #8b949e; }
   /* 深色细滚动条：匹配暗色主题 */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -184,9 +197,10 @@ function renderPage(): string {
 </head>
 <body>
 <header>
-  <h1>SSH 终端记录</h1>
+  <h1>终端记录</h1>
   <select id="session" onchange="onSessionChange(true)"></select>
   <select id="terminal" onchange="onSessionChange(true)"></select>
+  <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> 时间</label>
   <span id="meta"></span>
 </header>
 <pre id="term">加载中...</pre>
@@ -289,7 +303,7 @@ function renderPage(): string {
     for (const t of (s ? s.terminals : [])) {
       const opt = document.createElement("option");
       opt.value = t.name || "default";
-      opt.textContent = (t.name || "default") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
+      opt.textContent = (t.name || "default") + (t.kind === "local" ? " [本地]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
       tsel.appendChild(opt);
     }
     if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
@@ -308,15 +322,28 @@ function renderPage(): string {
     if (!sid || !name) { pre.textContent = "无会话，请先 ssh_connect"; return; }
     // 更新前判断是否贴底：用户已向上滚动离开底部则不自动下滚，保持当前位置
     if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
+    const showTime = document.getElementById("showTime").checked;
+    document.body.classList.toggle("show-time", showTime);
     const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
-    const text = await r.text();
+    const data = await r.json();
+    const pairs = data.pairs || [];
     // 渲染前旧内容完整高度 = 新消息顶部位置（旧内容不变时高度稳定）
     const prevHeight = pre.scrollHeight;
     // 内容是否有新变化（有新消息才显示悬浮按钮）
-    const changed = text !== lastTranscript;
-    lastTranscript = text;
-    pre.innerHTML = ansiToHtml(text);
-    document.getElementById("meta").textContent = sid + "/" + name + " · " + text.length + " 字符 · 每 2s 自动刷新";
+    const sig = JSON.stringify(pairs);
+    const changed = sig !== lastTranscript;
+    lastTranscript = sig;
+    pre.innerHTML = pairs.map((p) => {
+      if (p.type === "cmd") {
+        const t = showTime ? fmtTime(p.ts) : "";
+        return '<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + ansiToHtml(p.text) + '</span></div>';
+      }
+      // out / run：输出列，保留 ANSI 彩色，时间列留空（不改变输出格式）
+      const label = p.type === "run" ? "[运行中] " : "";
+      return '<div class="row"><span class="t"></span><span class="c">' + label + ansiToHtml(p.text) + '</span></div>';
+    }).join("");
+    const cmdCount = pairs.filter((p) => p.type === "cmd").length;
+    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " 条命令 · 每 2s 自动刷新";
     if (stickToBottom) {
       pre.scrollTop = pre.scrollHeight;
       toBottomBtn.style.display = "none";
@@ -333,6 +360,23 @@ function renderPage(): string {
       }
     }
   }
+
+  // 时间戳格式化 yyyy-MM-dd HH:mm:ss
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  // 时间开关：localStorage 持久化，刷新页面保持状态
+  function onShowTimeChange() {
+    const el = document.getElementById("showTime");
+    localStorage.setItem("showTime", el.checked ? "1" : "0");
+    document.body.classList.toggle("show-time", el.checked);
+    loadTranscript();
+  }
+  document.getElementById("showTime").checked = localStorage.getItem("showTime") === "1";
+  document.body.classList.toggle("show-time", document.getElementById("showTime").checked);
 
   // 用户滚动：贴底 → 恢复跟随并隐藏按钮；离开底部 → 取消自动贴底
   const termPre = document.getElementById("term");

@@ -12,13 +12,15 @@ export function genSentinel(): string {
 
 /**
  * 剔除 PTY 回显的命令行（含提示符前缀，如 "user@host:~$ cmd"），并清理残留 CR
+ * 同时剔除含哨兵标记的行（上次命令在哨兵之后到达的回显残留，避免污染下一条输出）
  * @param raw 原始输出
  * @param cmd 已发送命令（组合串）
  * @returns 剔除回显后的输出
  */
 export function stripEcho(raw: string, cmd: string): string {
+  const SENTINEL_LINE = /__SSH_DONE_[0-9a-f]+__/
   const lines = raw.split(/\r?\n/).map((line) => line.replace(/\r/g, "").trimEnd())
-  return lines.filter((line) => line !== "" && !line.includes(cmd)).join("\n")
+  return lines.filter((line) => line !== "" && !line.includes(cmd) && !SENTINEL_LINE.test(line)).join("\n")
 }
 
 /**
@@ -61,4 +63,15 @@ export function stripPrompt(s: string): string {
   return s
     .replace(/(?:^|[\r\n])\s*(?:[\w.-]+@)?[\w.-]+:[^\r\n]*[$#%] ?(?=[\r\n]|$)/g, "")
     .trim()
+}
+
+/**
+ * 时间戳格式化为 yyyy-MM-dd HH:mm:ss
+ * @param ts 毫秒时间戳
+ * @returns 格式化时间
+ */
+export function fmtTime(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
