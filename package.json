@@ -1,13 +1,28 @@
 {
   "name": "@xiaoqiong0v0/opencode-ssh-tool",
-  "version": "0.2.1",
-  "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
+  "version": "0.2.3",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoqiong0v0/opencode-ssh-tool.git"
+  },
+  "homepage": "https://github.com/xiaoqiong0v0/opencode-ssh-tool#readme",
+  "bugs": {
+    "url": "https://github.com/xiaoqiong0v0/opencode-ssh-tool/issues"
   },
   "keywords": ["opencode", "plugin", "ssh", "sftp", "terminal"],
   "license": "MIT",
