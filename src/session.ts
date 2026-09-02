@@ -238,12 +238,12 @@ export class SshSession {
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos, outcome.idx)), combo))
+        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos, outcome.idx)), combo)
         this._buffer = this._buffer.slice(outcome.afterNewline)
         this._history.append(command, out)
         return {
           ok: true,
-          output: this._truncate(out),
+          output: this._truncate(cleanAnsi(out)),
           host: this._host,
           command,
           duration: Date.now() - startTs,
@@ -251,11 +251,11 @@ export class SshSession {
       }
       case "interactive": {
         this._remoteBusy = false
-        const out = cleanAnsi(collapseCarriage(this._buffer.slice(startPos)))
+        const out = collapseCarriage(this._buffer.slice(startPos))
         this._history.append(command, out)
         return {
           ok: true,
-          output: this._truncate(out),
+          output: this._truncate(cleanAnsi(out)),
           interactive: true,
           host: this._host,
           command,
@@ -269,11 +269,11 @@ export class SshSession {
         this._runningCommand = command
         this._remoteBusy = true
         this._startBackgroundWatch(sentinel, startPos, command)
-        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos)), combo))
+        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos)), combo)
         this._history.append(command, out)
         return {
           ok: true,
-          output: this._truncate(out),
+          output: this._truncate(cleanAnsi(out)),
           running: outcome.kind === "running",
           timeout: outcome.kind === "timeout",
           host: this._host,
@@ -313,6 +313,28 @@ export class SshSession {
   }
 
   /**
+   * 发送文本/按键到远程 shell（交互场景：sudo 密码、确认、中断等）
+   * 转义序列：\r 或 \n = 回车，\x03 = Ctrl-C，\x04 = Ctrl-D，\x1a = Ctrl-Z，\x1b = ESC，其余按字面发送
+   * @param text 要发送的文本或按键序列
+   * @returns 是否发送成功（未连接返回 false + 错误）
+   */
+  send(text: string): { ok: boolean; error?: string } {
+    if (!this._connected || !this._stream) {
+      return { ok: false, error: "Not connected" }
+    }
+    const payload = text
+      .replace(/\\x1b/gi, "\x1b")
+      .replace(/\\x03/gi, "\x03")
+      .replace(/\\x04/gi, "\x04")
+      .replace(/\\x1a/gi, "\x1a")
+      .replace(/\\r/g, "\r")
+      .replace(/\\n/g, "\r")
+    this._stream.write(payload)
+    this._lastActive = Date.now()
+    return { ok: true }
+  }
+
+  /**
    * 获取会话状态（供 ssh_status）
    * @returns 状态对象
    */
@@ -339,14 +361,14 @@ export class SshSession {
   }
 
   /**
-   * 获取当前运行中命令的实时缓冲（合并覆盖后，不消费 buffer）
+   * 获取当前运行中命令的实时缓冲（合并覆盖后，不消费 buffer，保留 ANSI 供 web 着色）
    * @returns 运行中命令的当前进度文本；无运行命令则返回空串
    */
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
     const combo = `${this._runningCommand}; echo ${this._runningSentinel}`
     const raw = this._buffer.slice(this._runningStartPos)
-    return cleanAnsi(stripEcho(collapseCarriage(raw), combo)).trim()
+    return stripEcho(collapseCarriage(raw), combo).trim()
   }
 
   /**
@@ -458,9 +480,9 @@ export class SshSession {
       }
       const idx = this._findSentinel(sentinel, startPos)
       if (idx >= 0) {
-        // 命令完成：收集输出（哨兵前内容，剔除回显）进 history
+        // 命令完成：收集输出（哨兵前内容，剔除回显）进 history（保留 ANSI 供 web 着色）
         const combo = `${command}; echo ${sentinel}`
-        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos, idx)), combo))
+        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos, idx)), combo)
         this._history.append(command, out)
         const nl = this._buffer.indexOf("\n", idx)
         this._buffer = this._buffer.slice(nl >= 0 ? nl + 1 : idx + sentinel.length)

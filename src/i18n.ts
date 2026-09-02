@@ -61,6 +61,28 @@ export const T = {
     en: "Read output of the current SSH session: buffered (unconsumed, for interactive/polling) or history (completed command+output pairs, first N or last N). Returns browser URL for the full scrollable viewer when the HTTP server is on.",
     zh: "读取当前 SSH 会话的输出：缓冲（未消费，交互/轮询用）或历史（已完成的命令+输出对，前 N 条或后 N 条）。HTTP 服务开启时返回浏览器查看完整记录的地址。",
   },
+  ssh_send: {
+    en: "Send text or keystrokes to the remote shell for interactive prompts (sudo password, confirmations, interrupts). Escapes: \\r or \\n = Enter, \\x03 = Ctrl-C, \\x04 = Ctrl-D, \\x1a = Ctrl-Z, \\x1b = Esc. After sending, read the result with ssh_read.",
+    zh: "向远程 shell 发送文本或按键，用于交互提示（sudo 密码、确认、中断等）。转义：\\r 或 \\n = 回车，\\x03 = Ctrl-C，\\x04 = Ctrl-D，\\x1a = Ctrl-Z，\\x1b = Esc。发送后用 ssh_read 读取结果。",
+  },
+  ssh_send_args: {
+    text: {
+      en: "Text or key sequence to send. Use \\r or \\n for Enter, \\x03 for Ctrl-C, \\x1b for Esc. For sudo password prompts send the password followed by \\r.",
+      zh: "要发送的文本或按键序列。回车用 \\r 或 \\n，Ctrl-C 用 \\x03，Esc 用 \\x1b。sudo 密码提示时发送密码后跟 \\r。",
+    },
+    name: {
+      en: "Target terminal name, default 'default'.",
+      zh: "目标终端名，默认 'default'。",
+    },
+  },
+  send_ok: {
+    en: "Sent: {text}",
+    zh: "已发送：{text}",
+  },
+  send_title: {
+    en: "SSH send",
+    zh: "SSH 发送",
+  },
   ssh_read_args: {
     source: {
       en: "Where to read from: 'buffer' (unconsumed live output) or 'history' (completed pairs, default).",

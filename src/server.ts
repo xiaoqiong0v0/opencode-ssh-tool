@@ -5,7 +5,6 @@ import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import type { AddressInfo } from "node:net"
 import type { SshSession } from "./session.js"
-import { cleanAnsi } from "./utils.js"
 import { listAllSessions } from "./session-store.js"
 
 /** 服务实例信息 */
@@ -80,11 +79,11 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
         res.end(text)
         return
       }
-      // 渲染命令+输出消息对
+      // 渲染命令+输出消息对（保留 ANSI 颜色，前端解析着色）
       const lines: string[] = []
       for (const pair of entry.session.getHistory().getPairs()) {
         lines.push(`$ ${pair.command}`)
-        lines.push(cleanAnsi(entry.session.getHistory().readOutput(pair)))
+        lines.push(entry.session.getHistory().readOutput(pair))
       }
       // 附加运行中命令的实时进度（busy 时）
       const running = entry.session.getRunningOutput()
@@ -144,7 +143,7 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): stri
     try {
       const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string }
       if (typeof data.command === "string") lines.push(`$ ${data.command}`)
-      if (typeof data.output === "string") lines.push(cleanAnsi(data.output))
+      if (typeof data.output === "string") lines.push(data.output)
     } catch {
       /* 跳过损坏文件 */
     }
@@ -164,7 +163,7 @@ function renderPage(): string {
   header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
   header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
   select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #2fbf71; }
+  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
   #meta { font-size: 12px; color: #8b949e; }
 </style>
 </head>
@@ -178,6 +177,54 @@ function renderPage(): string {
 <pre id="term">加载中...</pre>
 <script>
   let sessionsData = [];
+  // 是否贴底（用户向上滚动查看历史时不自动下滚，仅贴底时跟随新输出）
+  let stickToBottom = true;
+  // 上次会话列表指纹（无变化则不重建下拉框，避免打断用户选择/焦点）
+  let lastSessionsKey = "";
+
+  // ANSI → 彩色 HTML：消费所有 CSI 序列（颜色/光标/清屏等），SGR 着色、其余丢弃；先 HTML 转义防 XSS
+  const ANSI_BASE = ["#010101","#de382b","#39b54a","#ffc005","#006fb8","#762671","#2cb3e9","#c9d1d9"];
+  const ANSI_BRIGHT = ["#666666","#ff7b72","#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f0f6fc"];
+  function ansiToHtml(s) {
+    const esc = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const re = /\\x1b\\[[0-9;?]*[A-Za-z]/g;
+    let fg = null, bg = null, bold = false, last = 0, m;
+    const parts = [];
+    const flush = (end) => {
+      const text = esc.slice(last, end);
+      last = end;
+      if (!text) return;
+      const style = [];
+      if (bold) style.push("font-weight:bold");
+      if (fg) style.push("color:" + fg);
+      if (bg) style.push("background-color:" + bg);
+      parts.push(style.length ? '<span style="' + style.join(";") + '">' + text + "</span>" : text);
+    };
+    while ((m = re.exec(esc))) {
+      flush(m.index);
+      const seq = m[0];
+      // 仅 SGR（结尾 m）改颜色，其余 CSI（光标/清屏/括号粘贴等）丢弃
+      if (seq.endsWith("m")) {
+        const body = seq.slice(2, -1);
+        const codes = body ? body.split(";").map(x => parseInt(x, 10)) : [0];
+        if (!body || codes.indexOf(0) >= 0) { fg = null; bg = null; bold = false; }
+        for (const c of codes) {
+          if (c === 1) bold = true;
+          else if (c === 22) bold = false;
+          else if (c >= 30 && c <= 37) fg = ANSI_BASE[c - 30];
+          else if (c === 39) fg = null;
+          else if (c >= 90 && c <= 97) fg = ANSI_BRIGHT[c - 90];
+          else if (c >= 40 && c <= 47) bg = ANSI_BASE[c - 40];
+          else if (c === 49) bg = null;
+          else if (c >= 100 && c <= 107) bg = ANSI_BRIGHT[c - 100];
+        }
+      }
+      // 关键：跳过序列本身，避免真实 ESC 残留（浏览器显示为"口"）
+      last = re.lastIndex;
+    }
+    flush(esc.length);
+    return parts.join("");
+  }
 
   function sessionLabel(s) {
     // 优先显示会话标题，其次 host@user，最后短 sessionID
@@ -190,8 +237,13 @@ function renderPage(): string {
   async function loadSessions() {
     const r = await fetch("/api/status");
     const data = await r.json();
-    sessionsData = data.sessions || [];
+    const newSessions = data.sessions || [];
     const sel = document.getElementById("session");
+    // 会话指纹未变化则跳过重建（保留用户选择与焦点）
+    const key = newSessions.map(s => s.sessionID + "|" + s.terminals.length).join(",");
+    if (key === lastSessionsKey) return;
+    lastSessionsKey = key;
+    sessionsData = newSessions;
     const prev = sel.value;
     sel.innerHTML = "";
     for (const s of sessionsData) {
@@ -220,20 +272,25 @@ function renderPage(): string {
     }
     if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
     else tsel.selectedIndex = tsel.options.length ? 0 : -1;
+    // 切换会话/终端：强制回到底部
+    stickToBottom = true;
     loadTranscript();
   }
 
   async function loadTranscript() {
+    const pre = document.getElementById("term");
     const sel = document.getElementById("session");
     const tsel = document.getElementById("terminal");
     const sid = sel.value;
     const name = tsel.value;
-    if (!sid || !name) { document.getElementById("term").textContent = "无会话，请先 ssh_connect"; return; }
+    if (!sid || !name) { pre.textContent = "无会话，请先 ssh_connect"; return; }
+    // 更新前判断是否贴底：用户已向上滚动离开底部则不自动下滚，保持当前位置
+    if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
     const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
     const text = await r.text();
-    document.getElementById("term").textContent = text;
+    pre.innerHTML = ansiToHtml(text);
     document.getElementById("meta").textContent = sid + "/" + name + " · " + text.length + " 字符 · 每 2s 自动刷新";
-    document.getElementById("term").scrollTop = document.getElementById("term").scrollHeight;
+    if (stickToBottom) pre.scrollTop = pre.scrollHeight;
   }
 
   loadSessions();

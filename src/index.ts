@@ -372,6 +372,23 @@ export const OpenCodeSshTool: Plugin = async () => {
         },
       }),
 
+      ssh_send: tool({
+        description: T.ssh_send[lang],
+        args: {
+          text: tool.schema.string().describe(T.ssh_send_args.text[lang]),
+          name: tool.schema.string().optional().describe(T.ssh_send_args.name[lang]),
+        },
+        async execute(args, context) {
+          const session = getSession(context.sessionID, args.name)
+          if (!session) return tr("not_connected", lang)
+          const r = session.send(args.text)
+          if (!r.ok) return tr("err_not_connected", lang)
+          syncSessionState(context.sessionID, args.name ?? DEFAULT_NAME)
+          log.tool("ssh_send", { text: args.text.slice(0, 60), name: args.name ?? DEFAULT_NAME })
+          return { title: tr("send_title", lang), output: tr("send_ok", lang).replace("{text}", args.text.slice(0, 60)) }
+        },
+      }),
+
       ssh_status: tool({
         description: T.ssh_status[lang],
         args: {
