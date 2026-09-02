@@ -16,8 +16,8 @@ export type CommandDecider = (command: string) => Decision
  * @returns 判定函数
  */
 export function createDecider(customDeny: string[] = [], customAllow: string[] = []): CommandDecider {
-  const denyRegexes = [DENY, ...customDeny.map((s) => new RegExp(s))]
-  const allowRegexes = [ALLOW_READONLY, ...customAllow.map((s) => new RegExp(s))]
+  const denyRegexes = [DENY, ...compileAll(customDeny)]
+  const allowRegexes = [ALLOW_READONLY, ...compileAll(customAllow)]
 
   return function decide(command: string): Decision {
     const trimmed = command.trim()
@@ -31,4 +31,17 @@ export function createDecider(customDeny: string[] = [], customAllow: string[] =
 
     return "ask"
   }
+}
+
+/** 编译自定义正则数组，跳过无效表达式（防配置错误导致插件崩溃） */
+function compileAll(patterns: string[]): RegExp[] {
+  const out: RegExp[] = []
+  for (const s of patterns) {
+    try {
+      out.push(new RegExp(s))
+    } catch {
+      /* 无效正则跳过 */
+    }
+  }
+  return out
 }

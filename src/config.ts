@@ -122,7 +122,7 @@ export function loadConfig(): ToolConfig {
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
-        port: server.port ?? DEFAULT_CONFIG.server.port,
+        port: typeof server.port === "number" && Number.isFinite(server.port) ? server.port : DEFAULT_CONFIG.server.port,
       },
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),

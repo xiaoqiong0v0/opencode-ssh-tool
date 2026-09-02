@@ -113,8 +113,12 @@ export const T = {
     zh: "未建立 SSH 会话，请先调用 ssh_connect。",
   },
   rejected_connect: {
-    en: "Connection request denied by user.",
-    zh: "连接请求已被用户拒绝。",
+    en: "Connection rejected.",
+    zh: "连接已被拒绝。",
+  },
+  invalid_name: {
+    en: "Invalid terminal name. Use letters, digits, underscore, hyphen or dot (max 64 chars), no path separators.",
+    zh: "终端名非法。仅允许字母、数字、下划线、中划线、点（最多 64 字符），不得含路径分隔符。",
   },
   no_sessions: {
     en: "No active SSH sessions.",

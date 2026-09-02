@@ -18,6 +18,20 @@ const log = createLogger("opencode-ssh-tool")
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
 
+/** 终端名合法字符（字母/数字/下划线/中划线/点），防止路径穿越 */
+const NAME_RE = /^[A-Za-z0-9_.-]+$/
+
+/**
+ * 校验并规整终端名（防路径穿越：拒绝 ../、绝对路径、路径分隔符）
+ * @param name 原始终端名
+ * @returns 合法则返回本身；非法则返回 null
+ */
+function sanitizeName(name: string): string | null {
+  if (!name || name.length > 64 || !NAME_RE.test(name)) return null
+  if (name === "." || name === "..") return null
+  return name
+}
+
 /** 会话表：key = opencode sessionID → 内层 key = 终端名 → SshSession */
 export const sshSessions = new Map<string, Map<string, SshSession>>()
 
@@ -143,6 +157,9 @@ export const OpenCodeSshTool: Plugin = async () => {
         async execute(args, context) {
           const { sessionID } = context
           const name = args.name ?? DEFAULT_NAME
+          if (sanitizeName(name) === null) {
+            return tr("invalid_name", lang)
+          }
           try {
             await context.ask({
               permission: "ssh_connect",
@@ -167,6 +184,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22, name })
 
           if (!result.ok) {
+            session.close() // 关闭连接 + 清理 history 缓存目录
             return {
               title: tr("connect_title_fail", lang),
               output: result.error ?? tr("unknown_error", lang),
