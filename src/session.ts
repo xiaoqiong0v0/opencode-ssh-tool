@@ -11,7 +11,7 @@ import {
   QUIET_WINDOW_MS,
   READY_TIMEOUT_MS,
 } from "./constants.js"
-import { resolveAuth } from "./ssh-auth.js"
+import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
 import { cleanAnsi, collapseCarriage, genSentinel, stripEcho, stripPrompt } from "./utils.js"
 
@@ -92,12 +92,19 @@ export class SshSession {
 
   /**
    * 建立 SSH 连接并打开 PTY shell
-   * @param opts 连接参数
+   * @param opts 连接参数；显式传 password 时优先用密码认证，否则回退 resolveAuth（私钥/agent/环境变量）
    * @returns 连接结果
    */
-  async connect(opts: { host: string; user: string; port?: number }): Promise<ConnectResult> {
+  async connect(opts: { host: string; user: string; port?: number; password?: string }): Promise<ConnectResult> {
     const port = opts.port ?? 22
-    const auth = resolveAuth(opts.host)
+    // 显式密码（支持 file: 路径读取）> resolveAuth（私钥/agent/环境变量密码）
+    let auth: AuthInfo
+    if (opts.password) {
+      const pw = resolvePassword(opts.password)
+      auth = pw ? { password: pw } : resolveAuth(opts.host)
+    } else {
+      auth = resolveAuth(opts.host)
+    }
     const config: ConnectConfig = {
       host: opts.host,
       port,

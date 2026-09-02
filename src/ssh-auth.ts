@@ -23,6 +23,9 @@ const AGENT_ENV = "SSH_AUTH_SOCK"
 /** 通用密码环境变量 */
 const PASSWORD_ENV = "SSH_PASSWORD"
 
+/** 密码文件路径前缀：password 参数以该前缀开头时按文件读取（避免明文暴露在上下文） */
+const PASSWORD_FILE_PREFIX = "file:"
+
 /**
  * 计算用户 .ssh 目录：Windows 优先 USERPROFILE，其次 HOME，最后 os.homedir()
  * @returns .ssh 目录绝对路径
@@ -63,4 +66,21 @@ export function resolveAuth(host: string): AuthInfo {
   }
 
   return {}
+}
+
+/**
+ * 解析密码参数：明文 或 file:路径（从文件读取，去除末尾换行）
+ * @param password 明文密码 或 "file:<绝对路径>"；为空返回 undefined
+ * @returns 实际密码；文件读取失败返回 undefined（调用方回退 resolveAuth）
+ */
+export function resolvePassword(password?: string): string | undefined {
+  if (!password) return undefined
+  if (!password.startsWith(PASSWORD_FILE_PREFIX)) return password
+  const p = password.slice(PASSWORD_FILE_PREFIX.length)
+  try {
+    return readFileSync(p, "utf8").replace(/\r?\n$/, "")
+  } catch (e) {
+    log.error(`读取密码文件失败 ${p}`, e instanceof Error ? e.message : String(e))
+    return undefined
+  }
 }

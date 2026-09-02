@@ -1,9 +1,12 @@
 // 本地 HTTP 服务：浏览器直接查看可滚动终端记录（默认开启，端口可配，0=随机分配）
 
 import { createServer, type Server } from "node:http"
+import { readdirSync, readFileSync } from "node:fs"
+import { join } from "node:path"
 import type { AddressInfo } from "node:net"
 import type { SshSession } from "./session.js"
 import { cleanAnsi } from "./utils.js"
+import { listAllSessions } from "./session-store.js"
 
 /** 服务实例信息 */
 export interface ServerHandle {
@@ -25,10 +28,11 @@ export interface SessionEntry {
 /**
  * 启动 HTTP 服务（监听 127.0.0.1）
  * @param port 端口，0 或未指定 → 系统随机分配（避免冲突）
- * @param getSessions 获取扁平会话条目列表的函数（供页面展示）
+ * @param getSessions 获取扁平会话条目列表的函数（供本进程页面展示）
+ * @param dir 插件缓存根目录（跨进程状态文件/历史文件所在处）
  * @returns 服务句柄（含实际端口与 URL）
  */
-export function startServer(port: number, getSessions: () => SessionEntry[]): Promise<ServerHandle> {
+export function startServer(port: number, getSessions: () => SessionEntry[], dir: string): Promise<ServerHandle> {
   let actualPort = port
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -41,13 +45,13 @@ export function startServer(port: number, getSessions: () => SessionEntry[]): Pr
     }
 
     if (path === "/api/status") {
-      const entries = getSessions()
+      // 跨进程聚合：所有 opencode 进程写入的状态文件（含本进程）
+      const states = listAllSessions(dir)
       // 按 sessionID 分组（一个会话下多个终端）
       const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; host?: string; user?: string; port?: number; connected: boolean; busy: boolean; pending: number }[] }>()
-      for (const { sessionID, name, session, title, directory } of entries) {
-        const st = session.getStatus()
-        if (!bySession.has(sessionID)) bySession.set(sessionID, { title, directory, terminals: [] })
-        bySession.get(sessionID)!.terminals.push({ name, host: st.host, user: st.user, port: st.port, connected: st.connected, busy: st.busy, pending: st.pending })
+      for (const s of states) {
+        if (!bySession.has(s.sessionID)) bySession.set(s.sessionID, { title: s.title, directory: s.directory, terminals: [] })
+        bySession.get(s.sessionID)!.terminals.push({ name: s.name, host: s.host, user: s.user, port: s.port, connected: s.connected, busy: s.busy, pending: s.pending })
       }
       const sessions = [...bySession.entries()].map(([sessionID, v]) => ({
         sessionID,
@@ -65,8 +69,15 @@ export function startServer(port: number, getSessions: () => SessionEntry[]): Pr
       const name = url.searchParams.get("name") ?? "default"
       const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
       if (!entry) {
-        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-        res.end("Session not found or disconnected")
+        // 本进程无此会话句柄（其他进程的会话/复用服务）→ 从历史文件读取
+        const text = readHistoryFromFile(dir, sid, name)
+        if (text === null) {
+          res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
+          res.end("Session not found or disconnected")
+          return
+        }
+        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
+        res.end(text)
         return
       }
       // 渲染命令+输出消息对
@@ -110,6 +121,35 @@ export function startServer(port: number, getSessions: () => SessionEntry[]): Pr
       })
     })
   })
+}
+
+/**
+ * 从历史文件读取某终端记录（跨进程场景：本进程无该会话句柄时用）
+ * @param dir 插件缓存根目录
+ * @param sessionID opencode 会话 ID
+ * @param name 终端名
+ * @returns 渲染文本（命令+输出，去除 ANSI）；目录不存在返回 null
+ */
+function readHistoryFromFile(dir: string, sessionID: string, name: string): string | null {
+  const hdir = join(dir, sessionID, name)
+  let files: string[]
+  try {
+    files = readdirSync(hdir).filter((f) => f.endsWith(".json"))
+  } catch {
+    return null
+  }
+  files.sort()
+  const lines: string[] = []
+  for (const f of files) {
+    try {
+      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string }
+      if (typeof data.command === "string") lines.push(`$ ${data.command}`)
+      if (typeof data.output === "string") lines.push(cleanAnsi(data.output))
+    } catch {
+      /* 跳过损坏文件 */
+    }
+  }
+  return lines.join("\n")
 }
 
 /** 渲染终端记录页面（黑底绿字等宽，JS 轮询自动刷新） */

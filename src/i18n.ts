@@ -33,6 +33,10 @@ export const T = {
       en: "Terminal name within the session, default 'default'. Creating with an existing name closes the old one first. Use distinct names to keep multiple terminals.",
       zh: "会话内的终端名，默认 'default'。同名创建会先关闭旧终端。用不同名称可保持多个终端。",
     },
+    password: {
+      en: "Password for password auth (optional). Supports plain text or 'file:<abs path>' to read from a file (avoids exposing it in context). If omitted, falls back to SSH key / agent / SSH_PASSWORD env.",
+      zh: "密码认证密码（可选）。支持明文或 'file:<绝对路径>' 从文件读取（避免暴露在上下文中）。省略时回退到 SSH 私钥 / agent / 环境变量 SSH_PASSWORD。",
+    },
   },
   ssh_exec: {
     en: "Execute a command in the current SSH session (by terminal name), preserving cwd and environment. Commands outside the read-only allowlist require user approval.",

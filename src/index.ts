@@ -13,6 +13,7 @@ import { createDecider } from "./permission.js"
 import { SshSession, type SessionStatus } from "./session.js"
 import { type ServerHandle, type SessionEntry } from "./server.js"
 import { ensureServer } from "./server-manager.js"
+import { writeSessionState, removeSessionState } from "./session-store.js"
 
 const log = createLogger("opencode-ssh-tool")
 
@@ -77,6 +78,33 @@ function listSessionEntries(): SessionEntry[] {
   return entries
 }
 
+/**
+ * 同步某终端状态到共享文件（跨进程聚合展示用）
+ * @param sessionID opencode 会话 ID
+ * @param name 终端名（默认 default）
+ */
+function syncSessionState(sessionID: string, name = DEFAULT_NAME): void {
+  const session = getSession(sessionID, name)
+  if (!session) return
+  const st = session.getStatus()
+  const meta = sessionMeta.get(sessionID)
+  writeSessionState(cacheRoot(), {
+    sessionID,
+    name,
+    host: st.host,
+    user: st.user,
+    port: st.port,
+    connected: st.connected,
+    busy: st.busy,
+    pending: st.pending,
+    lastActive: st.lastActive,
+    connectedAt: st.connectedAt,
+    title: meta?.title,
+    directory: meta?.directory,
+    updatedAt: Date.now(),
+  })
+}
+
 /** 插件缓存根目录（历史消息对存文件，随会话清理） */
 function cacheRoot(): string {
   const home = process.env.USERPROFILE || process.env.HOME || homedir()
@@ -99,6 +127,7 @@ function cleanupSession(sessionID: string, name = DEFAULT_NAME): void {
       /* 忽略 */
     }
   }
+  removeSessionState(cacheRoot(), sessionID, name)
 }
 
 /** 清理一个 sessionID 下全部终端 */
@@ -106,6 +135,7 @@ function cleanupAllSessions(sessionID: string): void {
   const map = getSessionMap(sessionID)
   if (map) {
     for (const s of map.values()) s.close()
+    for (const name of map.keys()) removeSessionState(cacheRoot(), sessionID, name)
     sshSessions.delete(sessionID)
   } else {
     try {
@@ -152,6 +182,9 @@ export const OpenCodeSshTool: Plugin = async () => {
         const info = (event as { properties?: { info?: { id?: string; title?: string; directory?: string } } }).properties?.info
         if (info?.id) {
           sessionMeta.set(info.id, { title: info.title ?? "", directory: info.directory ?? "" })
+          // 有活动终端时同步标题/目录到状态文件（供跨进程聚合）
+          const map = getSessionMap(info.id)
+          if (map) for (const name of map.keys()) syncSessionState(info.id, name)
         }
       }
       // 会话删除时清理：关闭全部终端连接 + 删缓存目录 + 删元信息
@@ -173,6 +206,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           user: tool.schema.string().describe(T.ssh_connect_args.user[lang]),
           port: tool.schema.number().optional().describe(T.ssh_connect_args.port[lang]),
           name: tool.schema.string().optional().describe(T.ssh_connect_args.name[lang]),
+          password: tool.schema.string().optional().describe(T.ssh_connect_args.password[lang]),
         },
         async execute(args, context) {
           const { sessionID } = context
@@ -200,7 +234,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           }
 
           const session = new SshSession(sessionID, new SessionHistory(join(cacheRoot(), sessionID), name, cfg.history.maxMessages), name)
-          const result = await session.connect(args)
+          const result = await session.connect({ host: args.host, user: args.user, port: args.port, password: args.password })
           log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22, name })
 
           if (!result.ok) {
@@ -213,6 +247,7 @@ export const OpenCodeSshTool: Plugin = async () => {
 
           if (!map) sshSessions.set(sessionID, new Map())
           sshSessions.get(sessionID)!.set(name, session)
+          syncSessionState(sessionID, name)
           return {
             title: `${tr("connect_title_ok", lang)} ${args.user}@${args.host}`,
             output: tr("connect_ok", lang)
@@ -262,6 +297,7 @@ export const OpenCodeSshTool: Plugin = async () => {
 
           // 默认异步提交（立即返回，不占上下文）；waitResult=true 同步等结果
           const result = args.waitResult ? await session.exec(args.command) : await session.submit(args.command)
+          syncSessionState(sessionID, args.name ?? DEFAULT_NAME)
           log.tool("ssh_exec", { command: args.command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
 
           const meta: Record<string, string | number | boolean | undefined> = {

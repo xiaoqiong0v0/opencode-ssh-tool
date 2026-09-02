@@ -94,7 +94,7 @@ export async function ensureServer(
 
   try {
     // 3. 拿锁成功：启动服务
-    const handle = await startServer(port, getSessions)
+    const handle = await startServer(port, getSessions, dir)
     // 写服务信息（供其他进程探测复用）
     writeFileSync(
       join(dir, INFO_FILE),
