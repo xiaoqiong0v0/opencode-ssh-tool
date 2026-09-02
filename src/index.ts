@@ -32,8 +32,8 @@ function sanitizeName(name: string): string | null {
   return name
 }
 
-/** 会话表：key = opencode sessionID → 内层 key = 终端名 → SshSession */
-export const sshSessions = new Map<string, Map<string, SshSession>>()
+/** 会话表：key = opencode sessionID → 内层 key = 终端名 → SshSession（内部状态，不导出） */
+const sshSessions = new Map<string, Map<string, SshSession>>()
 
 /** 会话元信息（标题/目录，供 HTTP 页面显示），key = sessionID */
 const sessionMeta = new Map<string, { title: string; directory: string }>()
