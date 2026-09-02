@@ -165,22 +165,42 @@ function renderPage(): string {
   select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
   pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
   #meta { font-size: 12px; color: #8b949e; }
+  /* 深色细滚动条：匹配暗色主题 */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #161b22; }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; border: 2px solid #161b22; }
+  ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+  ::-webkit-scrollbar-corner { background: #161b22; }
+  * { scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
+  /* 回到底部悬浮按钮：离开底部且有新消息时显示 */
+  .to-bottom-btn {
+    position: fixed; right: 24px; bottom: 24px; display: none;
+    background: #238636; color: #fff; border: none; border-radius: 20px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer; z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,.4);
+  }
+  .to-bottom-btn:hover { background: #2ea043; }
 </style>
 </head>
 <body>
 <header>
   <h1>SSH 终端记录</h1>
-  <select id="session" onchange="onSessionChange()"></select>
-  <select id="terminal" onchange="loadTranscript()"></select>
+  <select id="session" onchange="onSessionChange(true)"></select>
+  <select id="terminal" onchange="onSessionChange(true)"></select>
   <span id="meta"></span>
 </header>
 <pre id="term">加载中...</pre>
+<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">↓ 新消息</button>
 <script>
   let sessionsData = [];
   // 是否贴底（用户向上滚动查看历史时不自动下滚，仅贴底时跟随新输出）
   let stickToBottom = true;
   // 上次会话列表指纹（无变化则不重建下拉框，避免打断用户选择/焦点）
   let lastSessionsKey = "";
+  // 上次渲染的 transcript 文本（判断是否真有新消息才显示悬浮按钮）
+  let lastTranscript = "";
+  // 新消息顶部位置（点击悬浮按钮时滚动到此处，而非底部）
+  let pendingTop = 0;
 
   // ANSI → 彩色 HTML：消费所有 CSI 序列（颜色/光标/清屏等），SGR 着色、其余丢弃；先 HTML 转义防 XSS
   const ANSI_BASE = ["#010101","#de382b","#39b54a","#ffc005","#006fb8","#762671","#2cb3e9","#c9d1d9"];
@@ -254,10 +274,12 @@ function renderPage(): string {
     }
     if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
     else sel.selectedIndex = sessionsData.length ? 0 : -1;
-    onSessionChange();
+    onSessionChange(false);
   }
 
-  function onSessionChange() {
+  function onSessionChange(forceStick) {
+    lastTranscript = "";
+    pendingTop = 0;
     const sel = document.getElementById("session");
     const sid = sel.value;
     const tsel = document.getElementById("terminal");
@@ -272,8 +294,8 @@ function renderPage(): string {
     }
     if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
     else tsel.selectedIndex = tsel.options.length ? 0 : -1;
-    // 切换会话/终端：强制回到底部
-    stickToBottom = true;
+    // 仅用户主动切换会话/终端时强制回到底部；自动轮询重建不打扰当前滚动位置
+    if (forceStick) stickToBottom = true;
     loadTranscript();
   }
 
@@ -288,9 +310,47 @@ function renderPage(): string {
     if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
     const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
     const text = await r.text();
+    // 渲染前旧内容完整高度 = 新消息顶部位置（旧内容不变时高度稳定）
+    const prevHeight = pre.scrollHeight;
+    // 内容是否有新变化（有新消息才显示悬浮按钮）
+    const changed = text !== lastTranscript;
+    lastTranscript = text;
     pre.innerHTML = ansiToHtml(text);
     document.getElementById("meta").textContent = sid + "/" + name + " · " + text.length + " 字符 · 每 2s 自动刷新";
-    if (stickToBottom) pre.scrollTop = pre.scrollHeight;
+    if (stickToBottom) {
+      pre.scrollTop = pre.scrollHeight;
+      toBottomBtn.style.display = "none";
+    } else if (pendingTop > 0) {
+      // 离开底部且有未读新消息 → 显示悬浮按钮（pendingTop 为跳转位置）
+      toBottomBtn.style.display = "block";
+    }
+    // 无论贴底与否，有内容变化都记录新消息顶部（供用户滚上去后跳转）
+    if (changed && pre.scrollHeight > pre.clientHeight) {
+      pendingTop = prevHeight;
+      if (stickToBottom) {
+        // 贴底跟随 = 已读到最新，清除未读标记（用户滚上去才重新提示）
+        pendingTop = 0;
+      }
+    }
+  }
+
+  // 用户滚动：贴底 → 恢复跟随并隐藏按钮；离开底部 → 取消自动贴底
+  const termPre = document.getElementById("term");
+  const toBottomBtn = document.getElementById("toBottom");
+  termPre.addEventListener("scroll", () => {
+    if (termPre.scrollTop + termPre.clientHeight >= termPre.scrollHeight - 30) {
+      stickToBottom = true;
+      toBottomBtn.style.display = "none";
+      pendingTop = 0; // 贴底 = 已读到最新，清除未读标记
+    } else {
+      stickToBottom = false;
+    }
+  });
+  // 点击悬浮按钮：滚动到新消息顶部（阅读未读内容），不强制回到底部
+  function scrollToNewest() {
+    termPre.scrollTop = pendingTop > 0 ? pendingTop : termPre.scrollHeight;
+    pendingTop = 0;
+    toBottomBtn.style.display = "none";
   }
 
   loadSessions();

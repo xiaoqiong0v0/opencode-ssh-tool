@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-ssh-tool",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "type": "module",
   "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
   "files": [

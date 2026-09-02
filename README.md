@@ -84,6 +84,13 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式 SSH 会话**�
 2. **SSH agent**：agent socket / Windows OpenSSH agent
 3. **环境变量密码**：`SSH_PASS_<HOST大写>` 优先，回退 `SSH_PASSWORD`
 
+> [!WARNING] 风险警告
+> `ssh_connect` 的 `password` 参数（明文或 `file:` 路径）允许模型直接凭密码建立连接，**绕过密钥认证，一旦建立便无法像正常会话那样可靠授权与撤销**——远程主机上的命令操作难以被 opencode 权限系统有效管控。
+>
+> **最佳用途**：仅用于一次性**辅助安装 opencode 到远程目标**（bootstrap），或完全可信的临时环境。
+>
+> **请谨慎使用**：生产 / 重要主机请使用 SSH key + 正常审批流程，不要暴露密码直连。
+
 ## 权限管控
 
 ```text
