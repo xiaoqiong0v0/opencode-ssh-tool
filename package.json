@@ -1,5 +1,5 @@
 {
-  "name": "opencode-ssh-tool",
+  "name": "@xiaoqiong0v0/opencode-ssh-tool",
   "version": "0.2.1",
   "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
   "type": "module",
@@ -11,6 +11,9 @@
   },
   "keywords": ["opencode", "plugin", "ssh", "sftp", "terminal"],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.2",
     "ssh2": "^1.16.0"
