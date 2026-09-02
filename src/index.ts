@@ -391,3 +391,6 @@ export const OpenCodeSshTool: Plugin = async () => {
     },
   }
 }
+
+// 默认导出：opencode 加载插件优先取 mod.default（V1 格式），具名导出不一定被识别
+export default OpenCodeSshTool
