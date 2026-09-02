@@ -75,6 +75,12 @@ export function startServer(port: number, getSessions: () => SessionEntry[]): Pr
         lines.push(`$ ${pair.command}`)
         lines.push(cleanAnsi(entry.session.getHistory().readOutput(pair)))
       }
+      // 附加运行中命令的实时进度（busy 时）
+      const running = entry.session.getRunningOutput()
+      if (running) {
+        lines.push("")
+        lines.push(`[ 运行中 ] ${running}`)
+      }
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
       res.end(lines.join("\n"))
       return

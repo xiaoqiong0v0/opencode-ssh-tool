@@ -13,7 +13,7 @@ import {
 } from "./constants.js"
 import { resolveAuth } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
-import { cleanAnsi, genSentinel, stripEcho, stripPrompt } from "./utils.js"
+import { cleanAnsi, collapseCarriage, genSentinel, stripEcho, stripPrompt } from "./utils.js"
 
 const log = createLogger("opencode-ssh-tool", { enabled: true })
 
@@ -77,6 +77,7 @@ export class SshSession {
   private _lastActive = 0
   private _runningStartPos: number | null = null
   private _runningSentinel = ""
+  private _runningCommand = ""
   private _watchTimer: ReturnType<typeof setInterval> | null = null
   private _closed = false
   private readonly _history: SessionHistory
@@ -187,6 +188,7 @@ export class SshSession {
     const startPos = this._buffer.length
     this._runningStartPos = startPos
     this._runningSentinel = sentinel
+    this._runningCommand = command
     this._remoteBusy = true
     this._lastActive = startTs
     this._stream.write(combo + "\r")
@@ -229,7 +231,7 @@ export class SshSession {
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const out = cleanAnsi(stripEcho(this._buffer.slice(startPos, outcome.idx), combo))
+        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos, outcome.idx)), combo))
         this._buffer = this._buffer.slice(outcome.afterNewline)
         this._history.append(command, out)
         return {
@@ -242,7 +244,7 @@ export class SshSession {
       }
       case "interactive": {
         this._remoteBusy = false
-        const out = cleanAnsi(this._buffer.slice(startPos))
+        const out = cleanAnsi(collapseCarriage(this._buffer.slice(startPos)))
         this._history.append(command, out)
         return {
           ok: true,
@@ -257,9 +259,10 @@ export class SshSession {
       case "timeout": {
         this._runningStartPos = startPos
         this._runningSentinel = sentinel
+        this._runningCommand = command
         this._remoteBusy = true
         this._startBackgroundWatch(sentinel, startPos, command)
-        const out = cleanAnsi(stripEcho(this._buffer.slice(startPos), combo))
+        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos)), combo))
         this._history.append(command, out)
         return {
           ok: true,
@@ -299,7 +302,7 @@ export class SshSession {
       this._buffer = ""
     }
 
-    return { ok: true, output: this._truncate(stripPrompt(cleanAnsi(out))) }
+    return { ok: true, output: this._truncate(stripPrompt(cleanAnsi(collapseCarriage(out)))) }
   }
 
   /**
@@ -326,6 +329,17 @@ export class SshSession {
    */
   getHistory(): SessionHistory {
     return this._history
+  }
+
+  /**
+   * 获取当前运行中命令的实时缓冲（合并覆盖后，不消费 buffer）
+   * @returns 运行中命令的当前进度文本；无运行命令则返回空串
+   */
+  getRunningOutput(): string {
+    if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
+    const combo = `${this._runningCommand}; echo ${this._runningSentinel}`
+    const raw = this._buffer.slice(this._runningStartPos)
+    return cleanAnsi(stripEcho(collapseCarriage(raw), combo)).trim()
   }
 
   /**
@@ -439,7 +453,7 @@ export class SshSession {
       if (idx >= 0) {
         // 命令完成：收集输出（哨兵前内容，剔除回显）进 history
         const combo = `${command}; echo ${sentinel}`
-        const out = cleanAnsi(stripEcho(this._buffer.slice(startPos, idx), combo))
+        const out = cleanAnsi(stripEcho(collapseCarriage(this._buffer.slice(startPos, idx)), combo))
         this._history.append(command, out)
         const nl = this._buffer.indexOf("\n", idx)
         this._buffer = this._buffer.slice(nl >= 0 ? nl + 1 : idx + sentinel.length)
@@ -466,6 +480,7 @@ export class SshSession {
   private _clearRunningContext(): void {
     this._runningStartPos = null
     this._runningSentinel = ""
+    this._runningCommand = ""
   }
 
   /** 输出截断保护 */

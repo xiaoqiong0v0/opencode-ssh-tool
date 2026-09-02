@@ -1,4 +1,4 @@
-// 工具函数：哨兵生成、回显剔除、ANSI 清洗、提示符剥离
+// 工具函数：哨兵生成、回显剔除、ANSI 清洗、CR 覆盖合并、提示符剥离
 
 import { randomBytes } from "node:crypto"
 
@@ -29,6 +29,27 @@ export function stripEcho(raw: string, cmd: string): string {
 export function cleanAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "")
+}
+
+/**
+ * 合并同一行内的 \r / ANSI 清行覆盖（进度条/旋转动画）：保留每行最后一次刷新状态，
+ * 避免 "下载 1%\r下载 2%\r...\r下载 100%" 累积成巨量碎片输出
+ * 识别 \r 与 ANSI 清行（ESC[2K / ESC[K）+ 光标归位（ESC[G）作为行覆盖分隔符
+ * @param s 原始输出（含 ANSI 或已清洗均可）
+ * @returns 合并覆盖后的文本（\r\n 正常换行保留）
+ */
+export function collapseCarriage(s: string): string {
+  // 覆盖分隔符：裸 \r 或 ANSI 清行/光标归位序列（ESC[2K、ESC[K、ESC[G）
+  const OVERWRITE = /\r|\x1b\[[0-9]*[KG]/
+  // 按 \r\n 拆成行（保留正常 CRLF 换行），行内按覆盖分隔符拆分取最后一段
+  return s
+    .split(/\r\n/)
+    .map((line) => {
+      const segs = line.split(OVERWRITE).filter((seg) => seg !== "")
+      if (segs.length <= 1) return line
+      return segs[segs.length - 1]
+    })
+    .join("\n")
 }
 
 /**
