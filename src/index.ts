@@ -235,10 +235,10 @@ export const OpenCodeSshTool: Plugin = async () => {
   }
 
 
-  // ===== CLI 风格单工具（ssh_cli）子命令实现 =====
+  // ===== CLI 风格单工具（term_cli）子命令实现 =====
 
   /** 完整用法（模型自学手册） */
-  const HELP_TEXT = tr("ssh_cli_help", lang)
+  const HELP_TEXT = tr("term_cli_help", lang)
 
   /** connect：SSH 连接（target=user@host[:port]） */
   async function doConnect(args: string[], ctx: CliCtx): Promise<string> {
@@ -480,13 +480,13 @@ export const OpenCodeSshTool: Plugin = async () => {
       }
     },
     tool: {
-      ssh_cli: tool({
-        description: T.ssh_cli[lang],
+      term_cli: tool({
+        description: T.term_cli[lang],
         args: {
-          args: tool.schema.string().optional().describe(T.ssh_cli_args[lang]),
+          args: tool.schema.string().optional().describe(T.term_cli_args[lang]),
         },
         async execute(args, context) {
-          return { title: "ssh_cli", output: await handleCliCommand(args.args ?? "help", context) }
+          return { title: "term_cli", output: await handleCliCommand(args.args ?? "help", context) }
         },
       }),
     },
