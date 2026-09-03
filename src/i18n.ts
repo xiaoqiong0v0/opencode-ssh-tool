@@ -156,10 +156,137 @@ export const T = {
     en: "Local terminal start failed",
     zh: "本地终端启动失败",
   },
+  ssh_cli: {
+    en: "Unified CLI tool (CLI style): SSH / local / container terminal sessions. Subcommands: connect / local / exec / read / send / status / disconnect / help. Use 'help' for full usage.",
+    zh: "统一命令行工具（CLI 风格）：SSH/本地/容器终端会话。子命令: connect / local / exec / read / send / status / disconnect / help。用 'help' 查看完整用法。",
+  },
+  ssh_cli_args: {
+    en: "Full command line string, e.g. 'exec \"ls -la\" -w' or 'connect user@host'; defaults to 'help' when empty.",
+    zh: "完整命令行字符串，如 'exec \"ls -la\" -w' 或 'connect user@host'；空时默认 'help'。",
+  },
+  ssh_cli_help: {
+    en: `ssh_cli unified CLI tool: manage SSH / local / container terminal sessions.
+
+Usage: ssh_cli <subcommand> [args]
+
+Subcommands:
+  connect <target> [-u user] [-n name] [-p password|file:path]
+      target = user@host[:port] (e.g. root@server.local:22); open a long-lived SSH session
+      -p accepts plain text or file:<path> (read password from file, avoids exposure)
+  local "<command>" [-n name] [-c cwd]
+      start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
+  exec "<command>" [-n name] [-w]
+      run a command in the terminal (default: submit async and return immediately; -w waits for result)
+  read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
+      read terminal output: buffer (live) / history (default tail last N)
+  send "<text>" [-n name]
+      send text/keystrokes (\\r Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
+  status [-n name]
+      terminal state (busy/pending/connection); omit name to list all
+  disconnect [-n name]
+      close terminal; omit name to close all
+  help
+      show this help
+
+Examples:
+  ssh_cli connect root@192.168.1.10
+  ssh_cli connect user@host -p file:C:\\secrets\\pw.txt
+  ssh_cli local "docker exec -it myctr bash" -n db
+  ssh_cli exec "ls -la" -w
+  ssh_cli exec "cd /var/log && tail -50 syslog"
+  ssh_cli send "mypass\\r" -n default
+  ssh_cli read -n db -s buffer
+  ssh_cli status
+  ssh_cli disconnect -n db
+`,
+    zh: `ssh_cli 统一命令行工具：管理 SSH / 本地 / 容器终端会话。
+
+用法: ssh_cli <子命令> [参数]
+
+子命令:
+  connect <target> [-u user] [-n name] [-p password|file:path]
+      target = user@host[:port]（如 root@server.local:22）；建立 SSH 长驻会话
+      -p 支持明文或 file:<路径>（从文件读密码，避免暴露）
+  local "<command>" [-n name] [-c cwd]
+      启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
+  exec "<command>" [-n name] [-w]
+      在指定终端执行命令（默认异步提交立即返回；-w 同步等待结果）
+  read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
+      读终端输出：buffer 实时 / history 历史（默认 tail 后 N 条）
+  send "<text>" [-n name]
+      发送文本/按键（\\r 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
+  status [-n name]
+      终端状态（busy/pending/连接）；省略 name 列出全部
+  disconnect [-n name]
+      断开终端；省略 name 断开全部
+  help
+      显示本帮助
+
+示例:
+  ssh_cli connect root@192.168.1.10
+  ssh_cli connect user@host -p file:C:\\secrets\\pw.txt
+  ssh_cli local "docker exec -it myctr bash" -n db
+  ssh_cli exec "ls -la" -w
+  ssh_cli exec "cd /var/log && tail -50 syslog"
+  ssh_cli send "mypass\\r" -n default
+  ssh_cli read -n db -s buffer
+  ssh_cli status
+  ssh_cli disconnect -n db
+`,
+  },
   denied: {
     en: "Denied by user.",
     zh: "用户已拒绝。",
   },
+  cli_bad_target: {
+    en: "Bad target: \"{target}\"",
+    zh: "目标格式错误: \"{target}\"",
+  },
+  cli_connect_usage: {
+    en: "Usage: connect user@host[:port] [-u user] [-n name] [-p password]",
+    zh: "用法: connect user@host[:port] [-u user] [-n name] [-p password]",
+  },
+  cli_need_user_host: {
+    en: "Need user and host",
+    zh: "需要 user 和 host",
+  },
+  cli_local_usage: {
+    en: "Usage: local \"<command>\" [-n name] [-c cwd]",
+    zh: "用法: local \"<command>\" [-n name] [-c cwd]",
+  },
+  cli_exec_usage: {
+    en: "Usage: exec \"<command>\" [-n name] [-w]",
+    zh: "用法: exec \"<command>\" [-n name] [-w]",
+  },
+  cli_send_usage: {
+    en: "Usage: send \"<text>\" [-n name]",
+    zh: "用法: send \"<text>\" [-n name]",
+  },
+  cli_need_command: {
+    en: "Need a command",
+    zh: "需要命令",
+  },
+  cli_need_text: {
+    en: "Need text to send",
+    zh: "需要发送内容",
+  },
+  cli_unknown: {
+    en: "Unknown command: {cmd}",
+    zh: "未知命令: {cmd}",
+  },
+  st_name: { en: "name", zh: "名称" },
+  st_type: { en: "type", zh: "类型" },
+  st_connected: { en: "connected", zh: "已连接" },
+  st_busy: { en: "busy", zh: "忙碌" },
+  st_pending: { en: "pending", zh: "待消费" },
+  st_bytes: { en: "bytes", zh: "字节" },
+  st_host: { en: "host", zh: "主机" },
+  st_program: { en: "program", zh: "程序" },
+  st_last_active: { en: "lastActive", zh: "最后活动" },
+  st_connected_at: { en: "connectedAt", zh: "连接时间" },
+  st_http_server: { en: "httpServer", zh: "HTTP 服务" },
+  st_active_sessions: { en: "activeSessions", zh: "活跃会话" },
+  st_disabled: { en: "disabled", zh: "已禁用" },
   denied_danger: {
     en: "Dangerous command, execution rejected.",
     zh: "危险命令，已拒绝执行。",

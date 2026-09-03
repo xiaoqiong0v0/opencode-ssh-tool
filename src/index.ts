@@ -1,6 +1,8 @@
 // 插件入口：导出 5 个 SSH 工具 + 会话生命周期管理 + HTTP 终端记录服务
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
+import stringArgv from "string-argv"
+import { parseArgs } from "node:util"
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
@@ -20,6 +22,12 @@ const log = createLogger("opencode-ssh-tool")
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
+
+/** CLI 执行上下文（tool.execute 的 context 最小子集） */
+type CliCtx = {
+  sessionID: string
+  ask: (input: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown> }) => Promise<void>
+}
 
 /** 终端名合法字符（字母/数字/下划线/中划线/点），防止路径穿越 */
 const NAME_RE = /^[A-Za-z0-9_.-]+$/
@@ -220,6 +228,226 @@ export const OpenCodeSshTool: Plugin = async () => {
     log.info("HTTP 服务未启用（配置 server.enabled=false）")
   }
 
+
+  // ===== CLI 风格单工具（ssh_cli）子命令实现 =====
+
+  /** 完整用法（模型自学手册） */
+  const HELP_TEXT = tr("ssh_cli_help", lang)
+
+  /** connect：SSH 连接（target=user@host[:port]） */
+  async function doConnect(args: string[], ctx: CliCtx): Promise<string> {
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, password: { type: "string", short: "p" }, user: { type: "string", short: "u" } }, allowPositionals: true })
+    const target = positionals[0] ?? ""
+    const m = target.match(/^(?:([^@]+)@)?([^:]+)(?::(\d+))?$/)
+    if (!m || !m[2]) return `${tr("cli_bad_target", lang).replace("{target}", target)}\n${tr("cli_connect_usage", lang)}\n\n${HELP_TEXT}`
+    const user = m[1] ?? values.user
+    const host = m[2]
+    const port = m[3] ? parseInt(m[3], 10) : undefined
+    if (!user || !host) return `${tr("cli_need_user_host", lang)}\n${tr("cli_connect_usage", lang)}\n\n${HELP_TEXT}`
+    const name = values.name ?? DEFAULT_NAME
+    if (sanitizeName(name) === null) return tr("invalid_name", lang)
+    try {
+      await ctx.ask({
+        permission: "ssh_connect",
+        patterns: [`${user}@${host}:${port ?? 22}`],
+        always: [`ssh_connect:${user}@${host}:${port ?? 22}`],
+        metadata: { title: `${user}@${host}` },
+      })
+    } catch {
+      return tr("rejected_connect", lang)
+    }
+    const map = getSessionMap(ctx.sessionID)
+    const old = map?.get(name)
+    if (old) {
+      old.close()
+      map!.delete(name)
+    }
+    const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name)
+    const result = await session.connect({ host, user, port, password: values.password })
+    log.tool("ssh_connect", { host, user, port: port ?? 22, name })
+    if (!result.ok) {
+      session.close()
+      return `${tr("connect_title_fail", lang)}: ${result.error ?? tr("unknown_error", lang)}`
+    }
+    if (!map) sshSessions.set(ctx.sessionID, new Map())
+    sshSessions.get(ctx.sessionID)!.set(name, session)
+    syncSessionState(ctx.sessionID, name)
+    return tr("connect_ok", lang).replace("{user}", user).replace("{host}", host).replace("{port}", String(port ?? 22)).replace("{sid}", ctx.sessionID).replace("{name}", name)
+  }
+
+  /** local：本地/容器终端连接 */
+  async function doLocal(args: string[], ctx: CliCtx): Promise<string> {
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, cwd: { type: "string", short: "c" } }, allowPositionals: true })
+    const command = positionals.join(" ")
+    if (!command) return `${tr("cli_need_command", lang)}\n${tr("cli_local_usage", lang)}\n\n${HELP_TEXT}`
+    const name = values.name ?? DEFAULT_NAME
+    if (sanitizeName(name) === null) return tr("invalid_name", lang)
+    const map = getLocalSessionMap(ctx.sessionID)
+    const old = map?.get(name)
+    if (old) {
+      old.close()
+      map!.delete(name)
+    }
+    const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name)
+    const result = await session.connect({ command, cwd: values.cwd })
+    log.tool("local_connect", { command, name })
+    if (!result.ok) {
+      session.close()
+      return `${tr("local_connect_title_fail", lang)}: ${result.error ?? tr("unknown_error", lang)}`
+    }
+    if (!map) localSessions.set(ctx.sessionID, new Map())
+    localSessions.get(ctx.sessionID)!.set(name, session)
+    syncSessionState(ctx.sessionID, name)
+    return tr("local_connect_ok", lang).replace("{cmd}", command).replace("{name}", name)
+  }
+
+  /** exec：在指定终端执行命令 */
+  async function doExec(args: string[], ctx: CliCtx): Promise<string> {
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, waitResult: { type: "boolean", short: "w" } }, allowPositionals: true })
+    const command = positionals.join(" ")
+    if (!command) return `${tr("cli_need_command", lang)}\n${tr("cli_exec_usage", lang)}\n\n${HELP_TEXT}`
+    const session = resolveSession(ctx.sessionID, values.name)
+    if (!session) return tr("not_connected", lang)
+    const decision = decide(command)
+    if (decision === "deny") {
+      log.tool("term_exec_denied", { command })
+      return tr("denied_danger", lang)
+    }
+    if (decision === "ask") {
+      try {
+        await ctx.ask({ permission: "term_exec", patterns: [command], always: [`term_exec:${command}`], metadata: { title: command.slice(0, 60) } })
+      } catch {
+        return tr("denied", lang)
+      }
+    }
+    const result = values.waitResult ? await session.exec(command) : await session.submit(command)
+    syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME)
+    log.tool("term_exec", { command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
+    if (result.submitted) return tr("submitted", lang)
+    return result.ok ? result.output : result.error ?? tr("exec_failed", lang)
+  }
+
+  /** read：读取终端输出 */
+  async function doRead(args: string[], ctx: CliCtx): Promise<string> {
+    const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" }, source: { type: "string", short: "s" }, limit: { type: "string", short: "l" }, head: { type: "boolean" }, includeCommand: { type: "boolean" } }, allowPositionals: true })
+    const session = resolveSession(ctx.sessionID, values.name)
+    if (!session) return tr("not_connected", lang)
+    const source = values.source ?? "history"
+    if (source === "buffer") {
+      const r = await session.readBuffer()
+      return r.output
+    }
+    const history = session.getHistory()
+    const all = history.getPairs()
+    const limit = Math.max(1, parseInt(values.limit ?? "10", 10) || 10)
+    const direction = values.head ? "head" : "tail"
+    const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
+    const includeCommand = values.includeCommand ?? false
+    const text = selected.map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p))).join("\n")
+    const browserLine = httpUrl ? tr("browser_full_record", lang).replace("{url}", httpUrl) : tr("server_not_enabled", lang)
+    return `${tr(direction === "tail" ? "history_title" : "history_title_head", lang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
+  }
+
+  /** send：发送文本/按键到终端 */
+  async function doSend(args: string[], ctx: CliCtx): Promise<string> {
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" } }, allowPositionals: true })
+    const text = positionals.join(" ")
+    if (!text) return `${tr("cli_need_text", lang)}\n${tr("cli_send_usage", lang)}\n\n${HELP_TEXT}`
+    const session = resolveSession(ctx.sessionID, values.name)
+    if (!session) return tr("not_connected", lang)
+    const r = session.send(text)
+    if (!r.ok) return tr("err_not_connected", lang)
+    syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME)
+    log.tool("term_send", { text: text.slice(0, 60), name: values.name ?? DEFAULT_NAME })
+    return tr("send_ok", lang).replace("{text}", text.slice(0, 60))
+  }
+
+  /** status：终端状态 */
+  async function doStatus(args: string[], ctx: CliCtx): Promise<string> {
+    const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" } }, allowPositionals: true })
+    const smap = getSessionMap(ctx.sessionID)
+    const lmap = getLocalSessionMap(ctx.sessionID)
+    if ((!smap || smap.size === 0) && (!lmap || lmap.size === 0)) return tr("no_sessions", lang)
+    let sessions: (SshSession | LocalSession)[]
+    if (values.name) {
+      const s = resolveSession(ctx.sessionID, values.name)
+      if (!s) return tr("no_sessions", lang)
+      sessions = [s]
+    } else {
+      sessions = [...(smap?.values() ?? []) as SshSession[], ...(lmap?.values() ?? []) as LocalSession[]]
+    }
+    const parts: string[] = []
+    for (const s of sessions) {
+      const st = s.getStatus()
+      if (!st.connected) {
+        parts.push(tr("session_disconnected", lang))
+        continue
+      }
+      const connLine = "host" in st && st.host
+        ? `${tr("st_host", lang)}: ${st.host}@${st.user}:${st.port}`
+        : `${tr("st_program", lang)}: ${(st as { program?: string }).program ?? "-"}`
+      parts.push([
+        `${tr("st_name", lang)}: ${st.name ?? "default"}`,
+        `${tr("st_type", lang)}: ${"host" in st ? "ssh" : "local"}`,
+        `${tr("st_connected", lang)}: ${st.connected}`,
+        `${tr("st_busy", lang)}: ${st.busy}`,
+        `${tr("st_pending", lang)}: ${st.pending} ${tr("st_bytes", lang)}`,
+        connLine,
+        st.lastActive ? `${tr("st_last_active", lang)}: ${new Date(st.lastActive).toISOString()}` : null,
+        st.connectedAt ? `${tr("st_connected_at", lang)}: ${new Date(st.connectedAt).toISOString()}` : null,
+      ].filter(Boolean).join("\n"))
+      parts.push(st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang))
+    }
+    const serverLines = httpUrl
+      ? ["", `${tr("st_http_server", lang)}: ${httpUrl}`, `${tr("st_active_sessions", lang)}: ${listSessionEntries().length}`]
+      : ["", `${tr("st_http_server", lang)}: ${tr("st_disabled", lang)}`]
+    return parts.join("\n\n") + serverLines.join("\n")
+  }
+
+  /** disconnect：断开终端 */
+  async function doDisconnect(args: string[], ctx: CliCtx): Promise<string> {
+    const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" } }, allowPositionals: true })
+    const smap = getSessionMap(ctx.sessionID)
+    const lmap = getLocalSessionMap(ctx.sessionID)
+    if ((!smap || smap.size === 0) && (!lmap || lmap.size === 0)) return tr("no_sessions", lang)
+    if (!values.name) {
+      const firstHost = [...(smap?.values() ?? [])][0]?.getStatus().host
+      cleanupAllSessions(ctx.sessionID)
+      cleanupAllLocalSessions(ctx.sessionID)
+      return tr("disconnected_all_ok", lang).replace("{host}", firstHost ?? "-")
+    }
+    const ssh = getSession(ctx.sessionID, values.name)
+    if (ssh) {
+      const host = ssh.getStatus().host
+      cleanupSession(ctx.sessionID, values.name)
+      return tr("disconnected_ok", lang).replace("{host}", host ?? "-")
+    }
+    const local = getLocalSession(ctx.sessionID, values.name)
+    if (local) {
+      const program = local.getStatus().program
+      cleanupLocalSession(ctx.sessionID, values.name)
+      return tr("disconnected_ok", lang).replace("{host}", program ?? "-")
+    }
+    return tr("no_sessions", lang)
+  }
+
+  /** CLI 入口：解析命令行字符串并分发子命令 */
+  async function handleCliCommand(raw: string, ctx: CliCtx): Promise<string> {
+    const tokens = stringArgv(raw)
+    const [cmd, ...rest] = tokens
+    if (!cmd || cmd === "help") return HELP_TEXT
+    switch (cmd) {
+      case "connect": return doConnect(rest, ctx)
+      case "local": return doLocal(rest, ctx)
+      case "exec": return doExec(rest, ctx)
+      case "read": return doRead(rest, ctx)
+      case "send": return doSend(rest, ctx)
+      case "status": return doStatus(rest, ctx)
+      case "disconnect": return doDisconnect(rest, ctx)
+      default: return `${tr("cli_unknown", lang).replace("{cmd}", cmd)}\n\n${HELP_TEXT}`
+    }
+  }
+
   return {
     event: async ({ event }) => {
       // 会话创建/更新时记录标题与目录（供 HTTP 页面显示会话名称）
@@ -245,336 +473,18 @@ export const OpenCodeSshTool: Plugin = async () => {
       }
     },
     tool: {
-      ssh_connect: tool({
-        description: T.ssh_connect[lang],
+      ssh_cli: tool({
+        description: T.ssh_cli[lang],
         args: {
-          host: tool.schema.string().describe(T.ssh_connect_args.host[lang]),
-          user: tool.schema.string().describe(T.ssh_connect_args.user[lang]),
-          port: tool.schema.number().optional().describe(T.ssh_connect_args.port[lang]),
-          name: tool.schema.string().optional().describe(T.ssh_connect_args.name[lang]),
-          password: tool.schema.string().optional().describe(T.ssh_connect_args.password[lang]),
+          args: tool.schema.string().optional().describe(T.ssh_cli_args[lang]),
         },
         async execute(args, context) {
-          const { sessionID } = context
-          const name = args.name ?? DEFAULT_NAME
-          if (sanitizeName(name) === null) {
-            return tr("invalid_name", lang)
-          }
-          try {
-            await context.ask({
-              permission: "ssh_connect",
-              patterns: [`${args.user}@${args.host}:${args.port ?? 22}`],
-              always: [`ssh_connect:${args.user}@${args.host}:${args.port ?? 22}`],
-              metadata: { title: `${args.user}@${args.host}` },
-            })
-          } catch {
-            return tr("rejected_connect", lang)
-          }
-
-          // 同名终端已有连接 → 先关旧的
-          const map = getSessionMap(sessionID)
-          const old = map?.get(name)
-          if (old) {
-            old.close()
-            map!.delete(name)
-          }
-
-          const session = new SshSession(sessionID, new SessionHistory(join(cacheRoot(), sessionID), name, cfg.history.maxMessages), name)
-          const result = await session.connect({ host: args.host, user: args.user, port: args.port, password: args.password })
-          log.tool("ssh_connect", { host: args.host, user: args.user, port: args.port ?? 22, name })
-
-          if (!result.ok) {
-            session.close() // 关闭连接 + 清理 history 缓存目录
-            return {
-              title: tr("connect_title_fail", lang),
-              output: result.error ?? tr("unknown_error", lang),
-            }
-          }
-
-          if (!map) sshSessions.set(sessionID, new Map())
-          sshSessions.get(sessionID)!.set(name, session)
-          syncSessionState(sessionID, name)
-          return {
-            title: `${tr("connect_title_ok", lang)} ${args.user}@${args.host}`,
-            output: tr("connect_ok", lang)
-              .replace("{user}", args.user)
-              .replace("{host}", args.host)
-              .replace("{port}", String(args.port ?? 22))
-              .replace("{sid}", sessionID)
-              .replace("{name}", name),
-            metadata: { host: args.host, user: args.user, port: args.port ?? 22, name },
-          }
+          return { title: "ssh_cli", output: await handleCliCommand(args.args ?? "help", context) }
         },
       }),
-
-      term_exec: tool({
-        description: T.term_exec[lang],
-        args: {
-          command: tool.schema.string().describe(T.term_exec_args.command[lang]),
-          waitResult: tool.schema.boolean().optional().describe(T.term_exec_args.waitResult[lang]),
-          name: tool.schema.string().optional().describe(T.term_exec_args.name[lang]),
-        },
-        async execute(args, context) {
-          const { sessionID } = context
-          const session = resolveSession(sessionID, args.name)
-          if (!session) return tr("not_connected", lang)
-
-          // 权限判定：先黑后白再问（SSH 与本地/容器一致）
-          const decision = decide(args.command)
-          if (decision === "deny") {
-            log.tool("term_exec_denied", { command: args.command })
-            return tr("denied_danger", lang)
-          }
-          if (decision === "ask") {
-            log.info(`[ask] 命令需审批，调用 context.ask: ${args.command.slice(0, 60)}`)
-            try {
-              await context.ask({
-                permission: "term_exec",
-                patterns: [args.command],
-                always: [`term_exec:${args.command}`],
-                metadata: { title: args.command.slice(0, 60) },
-              })
-              log.info(`[ask] context.ask 返回（已允许）: ${args.command.slice(0, 60)}`)
-            } catch {
-              log.info(`[ask] context.ask 抛异常（已拒绝）: ${args.command.slice(0, 60)}`)
-              return tr("denied", lang)
-            }
-          }
-
-          // 默认异步提交（立即返回，不占上下文）；waitResult=true 同步等结果
-          const result = args.waitResult ? await session.exec(args.command) : await session.submit(args.command)
-          syncSessionState(sessionID, args.name ?? DEFAULT_NAME)
-          log.tool("term_exec", { command: args.command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
-
-          const meta: Record<string, string | number | boolean | undefined> = {
-            host: ("host" in result ? result.host : undefined) as string | undefined,
-            command: result.command,
-            duration: result.duration,
-            submitted: result.submitted,
-            interactive: result.interactive,
-            running: result.running,
-            timeout: result.timeout,
-          }
-          if (result.submitted) {
-            return { title: tr("exec_title", lang).replace("{cmd}", args.command.slice(0, 60)), output: tr("submitted", lang), metadata: meta }
-          }
-          return {
-            title: tr("exec_title", lang).replace("{cmd}", args.command.slice(0, 60)),
-            output: result.ok ? result.output : result.error ?? tr("exec_failed", lang),
-            metadata: meta,
-          }
-        },
-      }),
-
-      term_read: tool({
-        description: T.term_read[lang],
-        args: {
-          source: tool.schema.enum(["buffer", "history"]).optional().describe(T.term_read_args.source[lang]),
-          lines: tool.schema.number().optional().describe(T.term_read_args.lines[lang]),
-          direction: tool.schema.enum(["tail", "head"]).optional().describe(T.term_read_args.direction[lang]),
-          limit: tool.schema.number().optional().describe(T.term_read_args.limit[lang]),
-          includeCommand: tool.schema.boolean().optional().describe(T.term_read_args.includeCommand[lang]),
-          name: tool.schema.string().optional().describe(T.term_read_args.name[lang]),
-        },
-        async execute(args, context) {
-          const session = resolveSession(context.sessionID, args.name)
-          if (!session) return tr("not_connected", lang)
-          const source = args.source ?? "history"
-
-          if (source === "buffer") {
-            // 实时未消费缓冲
-            const r = await session.readBuffer()
-            const out = args.lines ? r.output.split(/\r?\n/).slice(0, args.lines).join("\n") : r.output
-            return { title: tr("session_output_title", lang), output: out }
-          }
-
-          // history：已完成命令+输出对（前 N / 后 N）
-          const history = session.getHistory()
-          const all = history.getPairs()
-          const limit = Math.max(1, args.limit ?? 10)
-          const direction = args.direction ?? "tail"
-          const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
-          const total = all.length
-          const includeCommand = args.includeCommand ?? false
-
-          const text = selected
-            .map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p)))
-            .join("\n")
-          const browserLine = httpUrl
-            ? tr("browser_full_record", lang).replace("{url}", httpUrl)
-            : tr("server_not_enabled", lang)
-          const titleKey = direction === "tail" ? "history_title" : "history_title_head"
-          const st = session.getStatus()
-          return {
-            title: tr(titleKey, lang).replace("{n}", String(selected.length)).replace("{total}", String(total)),
-            output: text + browserLine,
-            metadata: {
-              direction,
-              returned: selected.length,
-              total,
-              sessionID: context.sessionID,
-              host: "host" in st ? st.host : undefined,
-            },
-          }
-        },
-      }),
-
-      term_send: tool({
-        description: T.term_send[lang],
-        args: {
-          text: tool.schema.string().describe(T.term_send_args.text[lang]),
-          name: tool.schema.string().optional().describe(T.term_send_args.name[lang]),
-        },
-        async execute(args, context) {
-          const session = resolveSession(context.sessionID, args.name)
-          if (!session) return tr("not_connected", lang)
-          const r = session.send(args.text)
-          if (!r.ok) return tr("err_not_connected", lang)
-          syncSessionState(context.sessionID, args.name ?? DEFAULT_NAME)
-          log.tool("term_send", { text: args.text.slice(0, 60), name: args.name ?? DEFAULT_NAME })
-          return { title: tr("send_title", lang), output: tr("send_ok", lang).replace("{text}", args.text.slice(0, 60)) }
-        },
-      }),
-
-      term_status: tool({
-        description: T.term_status[lang],
-        args: {
-          name: tool.schema.string().optional().describe(T.term_status_args.name[lang]),
-        },
-        async execute(args, context) {
-          // 合并 SSH 与本地/容器会话状态
-          const smap = getSessionMap(context.sessionID)
-          const lmap = getLocalSessionMap(context.sessionID)
-          if ((!smap || smap.size === 0) && (!lmap || lmap.size === 0)) return tr("no_sessions", lang)
-
-          let sessions: (SshSession | LocalSession)[]
-          if (args.name) {
-            const s = resolveSession(context.sessionID, args.name)
-            if (!s) return tr("no_sessions", lang)
-            sessions = [s]
-          } else {
-            sessions = [...(smap?.values() ?? []) as SshSession[], ...(lmap?.values() ?? []) as LocalSession[]]
-          }
-
-          const parts: string[] = []
-          for (const s of sessions) {
-            const st = s.getStatus()
-            if (!st.connected) {
-              parts.push(tr("session_disconnected", lang))
-              continue
-            }
-            // SSH 显示 host@user:port；本地/容器显示 program
-            const connLine = "host" in st && st.host
-              ? `host: ${st.host}@${st.user}:${st.port}`
-              : `program: ${(st as { program?: string }).program ?? "-"}`
-            parts.push(
-              [
-                `name: ${st.name ?? "default"}`,
-                `type: ${"host" in st ? "ssh" : "local"}`,
-                `connected: ${st.connected}`,
-                `busy: ${st.busy}`,
-                `pending: ${st.pending} bytes`,
-                connLine,
-                st.lastActive ? `lastActive: ${new Date(st.lastActive).toISOString()}` : null,
-                st.connectedAt ? `connectedAt: ${new Date(st.connectedAt).toISOString()}` : null,
-              ].filter(Boolean).join("\n")
-            )
-            parts.push(st.busy ? tr("status_busy_hint", lang) : tr("status_idle_hint", lang))
-          }
-
-          // 并入 HTTP 服务状态
-          const serverLines = httpUrl
-            ? [
-                "",
-                `httpServer: ${httpUrl}`,
-                `activeSessions: ${listSessionEntries().length}`,
-              ]
-            : ["", "httpServer: disabled"]
-
-          return { title: tr("status_title", lang), output: parts.join("\n\n") + serverLines.join("\n") }
-        },
-      }),
-
-      term_disconnect: tool({
-        description: T.term_disconnect[lang],
-        args: {
-          name: tool.schema.string().optional().describe(T.term_disconnect_args.name[lang]),
-        },
-        async execute(args, context) {
-          const { sessionID } = context
-          const smap = getSessionMap(sessionID)
-          const lmap = getLocalSessionMap(sessionID)
-          if ((!smap || smap.size === 0) && (!lmap || lmap.size === 0)) return tr("no_sessions", lang)
-
-          // 未指定 name → 断开全部终端（SSH + 本地）；否则断开指定终端（自动识别类型）
-          if (!args.name) {
-            const firstHost = [...(smap?.values() ?? [])][0]?.getStatus().host
-            cleanupAllSessions(sessionID)
-            cleanupAllLocalSessions(sessionID)
-            return tr("disconnected_all_ok", lang).replace("{host}", firstHost ?? "-")
-          }
-          const ssh = getSession(sessionID, args.name)
-          if (ssh) {
-            const host = ssh.getStatus().host
-            cleanupSession(sessionID, args.name)
-            return tr("disconnected_ok", lang).replace("{host}", host ?? "-")
-          }
-          const local = getLocalSession(sessionID, args.name)
-          if (local) {
-            const program = local.getStatus().program
-            cleanupLocalSession(sessionID, args.name)
-            return tr("disconnected_ok", lang).replace("{host}", program ?? "-")
-          }
-          return tr("no_sessions", lang)
-        },
-      }),
-
-      local_connect: tool({
-        description: T.local_connect[lang],
-        args: {
-          command: tool.schema.string().describe(T.local_connect_args.command[lang]),
-          name: tool.schema.string().optional().describe(T.local_connect_args.name[lang]),
-          cwd: tool.schema.string().optional().describe(T.local_connect_args.cwd[lang]),
-        },
-        async execute(args, context) {
-          const { sessionID } = context
-          const name = args.name ?? DEFAULT_NAME
-          if (sanitizeName(name) === null) {
-            return tr("invalid_name", lang)
-          }
-          // 同名终端已有 → 先关旧的
-          const map = getLocalSessionMap(sessionID)
-          const old = map?.get(name)
-          if (old) {
-            old.close()
-            map!.delete(name)
-          }
-          const session = new LocalSession(
-            sessionID,
-            new SessionHistory(join(cacheRoot(), sessionID), `local-${name}`, cfg.history.maxMessages),
-            name,
-          )
-          const result = await session.connect({ command: args.command, cwd: args.cwd })
-          log.tool("local_connect", { command: args.command, name })
-          if (!result.ok) {
-            session.close()
-            return { title: tr("local_connect_title_fail", lang), output: result.error ?? tr("unknown_error", lang) }
-          }
-          if (!map) localSessions.set(sessionID, new Map())
-          localSessions.get(sessionID)!.set(name, session)
-          syncSessionState(sessionID, name)
-          return {
-            title: tr("local_connect_title_ok", lang),
-            output: tr("local_connect_ok", lang).replace("{cmd}", args.command).replace("{name}", name),
-            metadata: { command: args.command, name },
-          }
-        },
-      }),
-
     },
   }
 }
 
 // 默认导出：opencode 加载插件优先取 mod.default（V1 格式），具名导出不一定被识别
 export default OpenCodeSshTool
-

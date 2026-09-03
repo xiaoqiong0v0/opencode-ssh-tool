@@ -4,7 +4,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 
 ## 特性
 
-- **长驻会话**：`ssh_connect` 建立连接后，`term_exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
+- **长驻会话**：`ssh_cli connect` 建立连接后，`ssh_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
 - **命令完成判定**：哨兵标记 + 静默窗口 + 超时三重兜底，动画输出（进度条等）自动识别
@@ -27,15 +27,20 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 
 | 工具 | 入参 | 行为 |
 |---|---|---|
-| `ssh_connect` | `host`, `user`, `port?`, `name?`, `password?` | 建立长驻 SSH 连接 + 打开 PTY shell；`name` 指定终端名（默认 `default`），同名先关旧终端；`password` 支持明文或 `file:<路径>` |
-| `local_connect` | `command`, `name?`, `cwd?` | 启动本地/容器 PTY 终端（如 `pwsh` / `bash` / `docker exec -it <容器> sh`），基于 Bun.Terminal |
-| `term_exec` | `command`, `waitResult?`, `name?` | 在指定终端（SSH/本地/容器）执行命令；默认异步提交立即返回，`waitResult=true` 同步等结果 |
-| `term_read` | `source?`, `lines?`, `direction?`, `limit?`, `includeCommand?`, `name?` | 读指定终端输出：`buffer` 实时未消费 / `history` 已完成对（前/后 N 条） |
-| `term_send` | `text`, `name?` | 发送文本/按键到终端（sudo 密码、确认、Ctrl-C 等交互）；转义 `\r` 回车、`\x03` Ctrl-C |
-| `term_status` | `name?` | 指定终端状态（busy/pending/连接）；省略则列出全部终端 + HTTP 服务状态 |
-| `term_disconnect` | `name?` | 断开指定终端（默认 `default`）；省略则断开全部终端（SSH + 本地） |
+| `ssh_cli` | `args`（完整命令行字符串） | **CLI 风格单工具**：SSH / 本地 / 容器终端会话。子命令：`connect` / `local` / `exec` / `read` / `send` / `status` / `disconnect` / `help`；用 `help` 查看完整用法 |
 
-> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。
+```text
+ssh_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
+ssh_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
+ssh_cli exec "<command>" [-n name] [-w]                          # 执行命令
+ssh_cli read [-n name] [-s buffer|history] [-l limit] [--head]   # 读输出
+ssh_cli send "<text>" [-n name]                                  # 发送按键（sudo 密码等）
+ssh_cli status [-n name]                                         # 状态
+ssh_cli disconnect [-n name]                                     # 断开
+ssh_cli help                                                     # 完整用法
+```
+
+> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
 ## 配置
 
@@ -87,7 +92,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 3. **环境变量密码**：`SSH_PASS_<HOST大写>` 优先，回退 `SSH_PASSWORD`
 
 > [!WARNING] 风险警告
-> `ssh_connect` 的 `password` 参数（明文或 `file:` 路径）允许模型直接凭密码建立连接，**绕过密钥认证，一旦建立便无法像正常会话那样可靠授权与撤销**——远程主机上的命令操作难以被 opencode 权限系统有效管控。
+> `ssh_cli connect` 的 `password` 参数（明文或 `file:` 路径）允许模型直接凭密码建立连接，**绕过密钥认证，一旦建立便无法像正常会话那样可靠授权与撤销**——远程主机上的命令操作难以被 opencode 权限系统有效管控。
 >
 > **最佳用途**：仅用于一次性**辅助安装 opencode 到远程目标**（bootstrap），或完全可信的临时环境。
 >
@@ -96,7 +101,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ## 权限管控
 
 ```text
-term_exec(command)
+ssh_cli exec(command)
   ├─ 命中 DENY 黑名单（rm -rf / shutdown reboot mkfs 等） → 直接拒绝
   ├─ 命中只读白名单 且 无 shell 元字符 → 直接放行
   └─ 其他 → context.ask() 用户审批（:allow / :deny / :always）
@@ -104,11 +109,11 @@ term_exec(command)
 
 - 只读白名单：`ls|cd|cat|grep|tail|head|ps|df|free|pwd|env|echo|curl|wget|git status|whoami|hostname|date|uname|uptime`
 - 命令含 `;` `&&` `|` `$()` 等 shell 元字符 → 降级走 ask（防拼接绕过）
-- 高危命令不进 ask 直接拒，`ssh_connect` 也走审批
+- 高危命令不进 ask 直接拒，`ssh_cli connect` 也走审批
 
 ## HTTP 终端查看
 
-服务默认开启（配置 `server.enabled`）。`term_status` / `term_read`（history 模式）会返回实际地址（端口 0 时自动分配，避免冲突）：
+服务默认开启（配置 `server.enabled`）。`ssh_cli status` / `ssh_cli read`（history 模式）会返回实际地址（端口 0 时自动分配，避免冲突）：
 
 ```
 浏览器访问 http://127.0.0.1:<port> 查看可滚动、每 2s 自动刷新的终端记录
@@ -150,20 +155,21 @@ npm publish      # 只发布 dist/
 
 需真实 SSH 主机（可用 Docker 测试环境，见 `.tmp/ssh-test-docker.ps1`）：
 
-- [ ] `ssh_connect` → 登录成功，cwd 为登录目录
-- [ ] `term_exec("ls")` 连续多次，确认永不重连（同一会话）
-- [ ] `term_exec("cd /var/log && pwd")` 后 `term_exec("pwd")` = `/var/log`（目录保持）
-- [ ] 交互场景：`term_exec("sudo ...")` 触发密码提示 → `term_read` 配合
+- [ ] `ssh_cli connect` → 登录成功，cwd 为登录目录
+- [ ] `ssh_cli exec("ls")` 连续多次，确认永不重连（同一会话）
+- [ ] `ssh_cli exec("cd /var/log && pwd")` 后 `ssh_cli exec("pwd")` = `/var/log`（目录保持）
+- [ ] 交互场景：`ssh_cli exec("sudo ...")` 触发密码提示 → `ssh_cli read` 配合
 - [ ] 白名单命令不弹审批直接执行；`rm -rf` 被拒绝
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
-- [ ] 长命令超时：`term_exec("sleep 60")` 30s 超时返回，不挂死会话
-- [ ] `term_read` 取前/后 N 条历史输出（含 `includeCommand`、`source=buffer`）
-- [ ] `term_status` / HTTP 页面浏览器可访问
-- [ ] `term_disconnect` 后连接释放
+- [ ] 长命令超时：`ssh_cli exec("sleep 60")` 30s 超时返回，不挂死会话
+- [ ] `ssh_cli read` 取前/后 N 条历史输出（含 `includeCommand`、`source=buffer`）
+- [ ] `ssh_cli status` / HTTP 页面浏览器可访问
+- [ ] `ssh_cli disconnect` 后连接释放
 
 ## 文档
 
 - `docs/requirements/需求说明.md` — 原始需求
 - `docs/design/方案分析.md` — 技术分析、决策、风险
 - `docs/design/结构设计.md` — 编码依据
+
 
