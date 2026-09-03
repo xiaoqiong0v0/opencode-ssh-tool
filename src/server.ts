@@ -6,6 +6,7 @@ import { join } from "node:path"
 import type { AddressInfo } from "node:net"
 import type { SshSession } from "./session.js"
 import { listAllSessions } from "./session-store.js"
+import { tr, type FlatKey, type Lang } from "./i18n.js"
 
 /** 服务实例信息 */
 export interface ServerHandle {
@@ -29,9 +30,10 @@ export interface SessionEntry {
  * @param port 端口，0 或未指定 → 系统随机分配（避免冲突）
  * @param getSessions 获取扁平会话条目列表的函数（供本进程页面展示）
  * @param dir 插件缓存根目录（跨进程状态文件/历史文件所在处）
+ * @param lang Web 界面语言（默认 en）
  * @returns 服务句柄（含实际端口与 URL）
  */
-export function startServer(port: number, getSessions: () => SessionEntry[], dir: string): Promise<ServerHandle> {
+export function startServer(port: number, getSessions: () => SessionEntry[], dir: string, lang: Lang = "en"): Promise<ServerHandle> {
   let actualPort = port
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -74,9 +76,10 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
         const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
         const histName = state?.kind === "local" ? `local-${name}` : name
         pairs = readHistoryFromFile(dir, sid, histName) ?? []
-        if (pairs.length === 0) {
-          res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
-          res.end("Session not found or disconnected")
+        if (pairs.length === 0 && !state) {
+          // 状态文件与历史都消失 = 会话真正删除，前端剔除该幽灵终端
+          res.writeHead(200, { "Content-Type": "application/json" })
+          res.end(JSON.stringify({ pairs: [], notFound: true }))
           return
         }
       } else {
@@ -96,7 +99,7 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
 
     if (path === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
-      res.end(renderPage())
+      res.end(renderPage(lang))
       return
     }
 
@@ -156,13 +159,14 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
   return out
 }
 
-/** 渲染终端记录页面（黑底绿字等宽，JS 轮询自动刷新） */
-function renderPage(): string {
+/** 渲染终端记录页面（黑底绿字等宽，JS 轮询自动刷新），语言由配置 webLang 决定 */
+function renderPage(lang: Lang): string {
+  const w = (key: FlatKey) => tr(key, lang)
   return `<!DOCTYPE html>
-<html lang="zh">
+<html lang="${lang}">
 <head>
 <meta charset="utf-8">
-<title>SSH 终端记录</title>
+<title>${w("web_title")}</title>
 <style>
   html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; }
   header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
@@ -197,14 +201,14 @@ function renderPage(): string {
 </head>
 <body>
 <header>
-  <h1>终端记录</h1>
+  <h1>${w("web_title")}</h1>
   <select id="session" onchange="onSessionChange(true)"></select>
   <select id="terminal" onchange="onSessionChange(true)"></select>
-  <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> 时间</label>
+  <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> ${w("web_time")}</label>
   <span id="meta"></span>
 </header>
-<pre id="term">加载中...</pre>
-<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">↓ 新消息</button>
+<pre id="term">${w("web_loading")}</pre>
+<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">${w("web_new_messages")}</button>
 <script>
   let sessionsData = [];
   // 是否贴底（用户向上滚动查看历史时不自动下滚，仅贴底时跟随新输出）
@@ -269,8 +273,13 @@ function renderPage(): string {
   }
 
   async function loadSessions() {
-    const r = await fetch("/api/status");
-    const data = await r.json();
+    let data;
+    try {
+      const r = await fetch("/api/status");
+      data = await r.json();
+    } catch (e) {
+      return;
+    }
     const newSessions = data.sessions || [];
     const sel = document.getElementById("session");
     // 会话指纹未变化则跳过重建（保留用户选择与焦点）
@@ -283,7 +292,29 @@ function renderPage(): string {
     for (const s of sessionsData) {
       const opt = document.createElement("option");
       opt.value = s.sessionID;
-      opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " 终端)";
+      opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " ${w("web_terminals")})";
+      sel.appendChild(opt);
+    }
+    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+    else sel.selectedIndex = sessionsData.length ? 0 : -1;
+    onSessionChange(false);
+  }
+
+  // 剔除失效终端/会话（transcript notFound 时），自动重建下拉框并切到下一个可用项
+  function dropDeadTerminal(sid, name) {
+    const s = sessionsData.find(x => x.sessionID === sid);
+    if (s) {
+      s.terminals = s.terminals.filter(t => (t.name || "default") !== name);
+      if (s.terminals.length === 0) sessionsData = sessionsData.filter(x => x.sessionID !== sid);
+    }
+    lastSessionsKey = "";
+    const sel = document.getElementById("session");
+    const prev = sel.value;
+    sel.innerHTML = "";
+    for (const s2 of sessionsData) {
+      const opt = document.createElement("option");
+      opt.value = s2.sessionID;
+      opt.textContent = sessionLabel(s2) + "  (" + s2.terminals.length + " ${w("web_terminals")})";
       sel.appendChild(opt);
     }
     if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
@@ -303,7 +334,7 @@ function renderPage(): string {
     for (const t of (s ? s.terminals : [])) {
       const opt = document.createElement("option");
       opt.value = t.name || "default";
-      opt.textContent = (t.name || "default") + (t.kind === "local" ? " [本地]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
+      opt.textContent = (t.name || "default") + (t.kind === "local" ? " [${w("web_local")}]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
       tsel.appendChild(opt);
     }
     if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
@@ -319,14 +350,30 @@ function renderPage(): string {
     const tsel = document.getElementById("terminal");
     const sid = sel.value;
     const name = tsel.value;
-    if (!sid || !name) { pre.textContent = "无会话，请先 ssh_connect"; return; }
+    if (!sid || !name) { pre.textContent = "${w("web_no_session")}"; return; }
     // 更新前判断是否贴底：用户已向上滚动离开底部则不自动下滚，保持当前位置
     if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
     const showTime = document.getElementById("showTime").checked;
     document.body.classList.toggle("show-time", showTime);
-    const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
-    const data = await r.json();
+    let data;
+    try {
+      const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      data = await r.json();
+    } catch (e) {
+      pre.textContent = "${w("web_load_failed")}";
+      return;
+    }
     const pairs = data.pairs || [];
+    // 会话已不存在（残留状态文件但记录已清）：提示并自动剔除该终端/会话
+    if (data.notFound) {
+      lastTranscript = "";
+      pendingTop = 0;
+      pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + "${w("web_session_gone")}" + '</span></div>';
+      document.getElementById("meta").textContent = "";
+      dropDeadTerminal(sid, name);
+      return;
+    }
     // 渲染前旧内容完整高度 = 新消息顶部位置（旧内容不变时高度稳定）
     const prevHeight = pre.scrollHeight;
     // 内容是否有新变化（有新消息才显示悬浮按钮）
@@ -339,11 +386,11 @@ function renderPage(): string {
         return '<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + ansiToHtml(p.text) + '</span></div>';
       }
       // out / run：输出列，保留 ANSI 彩色，时间列留空（不改变输出格式）
-      const label = p.type === "run" ? "[运行中] " : "";
+      const label = p.type === "run" ? "${w("web_running")}" : "";
       return '<div class="row"><span class="t"></span><span class="c">' + label + ansiToHtml(p.text) + '</span></div>';
     }).join("");
     const cmdCount = pairs.filter((p) => p.type === "cmd").length;
-    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " 条命令 · 每 2s 自动刷新";
+    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " ${w("web_commands")} · ${w("web_auto_refresh")}";
     if (stickToBottom) {
       pre.scrollTop = pre.scrollHeight;
       toBottomBtn.style.display = "none";

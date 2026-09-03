@@ -30,6 +30,8 @@ export interface ToolConfig {
   history: HistoryConfig
   /** 工具描述语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
   toolLang: Lang
+  /** Web 界面语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
+  webLang: Lang
   permission: PermissionConfig
 }
 
@@ -45,6 +47,7 @@ const DEFAULT_CONFIG: ToolConfig = {
     maxMessages: 100,
   },
   toolLang: "en",
+  webLang: "en",
   permission: {
     deny: [],
     allow: [],
@@ -72,6 +75,8 @@ const CONFIG_TEMPLATE = `{
   },
   // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
+  // Web 界面语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  "webLang": "en",
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
@@ -119,6 +124,7 @@ export function loadConfig(): ToolConfig {
     const history = (raw.history ?? {}) as Partial<HistoryConfig>
     const permission = (raw.permission ?? {}) as Partial<PermissionConfig>
     const toolLang = raw.toolLang === "zh" ? "zh" : "en"
+    const webLang = raw.webLang === "zh" ? "zh" : "en"
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
@@ -128,6 +134,7 @@ export function loadConfig(): ToolConfig {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
       },
       toolLang,
+      webLang,
       permission: {
         deny: Array.isArray(permission.deny) ? permission.deny : [],
         allow: Array.isArray(permission.allow) ? permission.allow : [],

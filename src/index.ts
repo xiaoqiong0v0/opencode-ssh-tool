@@ -16,7 +16,7 @@ import { SshSession } from "./session.js"
 import { LocalSession } from "./local-session.js"
 import { type ServerHandle, type SessionEntry } from "./server.js"
 import { ensureServer } from "./server-manager.js"
-import { writeSessionState, removeSessionState } from "./session-store.js"
+import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
 
 const log = createLogger("opencode-ssh-tool")
 
@@ -153,8 +153,14 @@ function cleanupAllLocalSessions(sessionID: string): void {
   const map = getLocalSessionMap(sessionID)
   if (map) {
     for (const s of map.values()) s.close()
-    for (const name of map.keys()) removeSessionState(cacheRoot(), sessionID, name)
     localSessions.delete(sessionID)
+  }
+  // 无论内存是否有句柄都清残留：状态文件 + 历史目录（含其他进程建的会话）
+  removeAllSessionStates(cacheRoot(), sessionID)
+  try {
+    rmSync(join(cacheRoot(), sessionID), { recursive: true, force: true })
+  } catch {
+    /* 忽略 */
   }
 }
 
@@ -188,14 +194,14 @@ function cleanupAllSessions(sessionID: string): void {
   const map = getSessionMap(sessionID)
   if (map) {
     for (const s of map.values()) s.close()
-    for (const name of map.keys()) removeSessionState(cacheRoot(), sessionID, name)
     sshSessions.delete(sessionID)
-  } else {
-    try {
-      rmSync(join(cacheRoot(), sessionID), { recursive: true, force: true })
-    } catch {
-      /* 忽略 */
-    }
+  }
+  // 无论内存是否有句柄都清残留：状态文件 + 历史目录（含其他进程建的会话）
+  removeAllSessionStates(cacheRoot(), sessionID)
+  try {
+    rmSync(join(cacheRoot(), sessionID), { recursive: true, force: true })
+  } catch {
+    /* 忽略 */
   }
 }
 
@@ -210,7 +216,7 @@ export const OpenCodeSshTool: Plugin = async () => {
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
   if (cfg.server.enabled) {
     try {
-      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot())
+      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), getLang(cfg.webLang))
       if (sr.server) {
         httpServer = sr.server
         httpUrl = sr.url
@@ -462,8 +468,9 @@ export const OpenCodeSshTool: Plugin = async () => {
       }
       // 会话删除时清理：关闭全部终端连接 + 删缓存目录 + 删元信息
       if (event.type === "session.deleted") {
-        const info = (event as { properties?: { info?: { id?: string } } }).properties?.info
-        const sid = info?.id
+        const props = (event as { properties?: { sessionID?: string; info?: { id?: string } } }).properties
+        // sessionID 直接挂在 properties 层（完整事件）；info.id 为兜底
+        const sid = props?.sessionID ?? props?.info?.id
         if (sid) {
           cleanupAllSessions(sid)
           cleanupAllLocalSessions(sid)

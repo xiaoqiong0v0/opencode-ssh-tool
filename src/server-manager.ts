@@ -3,6 +3,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { startServer, type ServerHandle, type SessionEntry } from "./server.js"
+import type { Lang } from "./i18n.js"
 
 /** 服务句柄（含是否复用既有服务） */
 export interface ServerResult {
@@ -58,12 +59,14 @@ function readInfo(dir: string): ServerInfo | null {
  * @param port 期望端口（0=随机，但随机端口无法跨进程复用，故随机时总是新启）
  * @param getSessions 会话列表函数
  * @param dir 缓存目录（锁与信息文件存放处）
+ * @param lang Web 界面语言（默认 en）
  * @returns 服务结果
  */
 export async function ensureServer(
   port: number,
   getSessions: () => SessionEntry[],
   dir: string,
+  lang: Lang = "en",
 ): Promise<ServerResult> {
   mkdirSync(dir, { recursive: true })
 
@@ -94,7 +97,7 @@ export async function ensureServer(
 
   try {
     // 3. 拿锁成功：启动服务
-    const handle = await startServer(port, getSessions, dir)
+    const handle = await startServer(port, getSessions, dir, lang)
     // 写服务信息（供其他进程探测复用）
     writeFileSync(
       join(dir, INFO_FILE),

@@ -5,7 +5,7 @@ import { LANG_ENV } from "./constants.js"
 export type Lang = "en" | "zh"
 
 /** 平铺文案键：值为 en/zh 字符串对的字典键（排除嵌套 args 对象） */
-type FlatKey = { [K in keyof typeof T]: (typeof T)[K] extends Record<Lang, string> ? K : never }[keyof typeof T]
+export type FlatKey = { [K in keyof typeof T]: (typeof T)[K] extends Record<Lang, string> ? K : never }[keyof typeof T]
 
 /**
  * 读取当前语言：环境变量 SSH_TOOL_LANG 优先，否则用配置语言（默认 en）
@@ -375,6 +375,18 @@ Examples:
     en: "SSH history (first {n} / total {total})",
     zh: "SSH 历史（前 {n} 条 / 共 {total} 条）",
   },
+  web_title: { en: "Terminal Records", zh: "终端记录" },
+  web_loading: { en: "Loading...", zh: "加载中..." },
+  web_load_failed: { en: "Failed to load records", zh: "记录加载失败" },
+  web_session_gone: { en: "Session not found or disconnected", zh: "会话不存在或已断开" },
+  web_time: { en: "Time", zh: "时间" },
+  web_terminals: { en: "terminals", zh: "终端" },
+  web_local: { en: "local", zh: "本地" },
+  web_commands: { en: "commands", zh: "条命令" },
+  web_auto_refresh: { en: "auto-refresh every 2s", zh: "每 2s 自动刷新" },
+  web_no_session: { en: "No session. Use ssh_cli connect first.", zh: "无会话，请先用 ssh_cli connect 建立连接。" },
+  web_running: { en: "[running] ", zh: "[运行中] " },
+  web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   disconnected_ok: {
     en: "SSH connection closed ({host}).",
     zh: "SSH 连接已断开（{host}）。",

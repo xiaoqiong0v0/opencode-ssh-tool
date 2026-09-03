@@ -52,6 +52,21 @@ export function removeSessionState(cacheRoot: string, sessionID: string, name: s
   }
 }
 
+/** 删除某会话全部终端的状态文件（会话删除时调用，防残留） */
+export function removeAllSessionStates(cacheRoot: string, sessionID: string): void {
+  try {
+    const dir = join(cacheRoot, SESSIONS_DIR)
+    const prefix = `${sessionID}-`
+    for (const f of readdirSync(dir)) {
+      if (f.startsWith(prefix) && f.endsWith(".json")) {
+        rmSync(join(dir, f), { force: true })
+      }
+    }
+  } catch {
+    /* 忽略 */
+  }
+}
+
 /** 聚合所有进程的会话状态（web 服务展示用），含标题/目录 */
 export function listAllSessions(cacheRoot: string): SessionState[] {
   const dir = join(cacheRoot, SESSIONS_DIR)
