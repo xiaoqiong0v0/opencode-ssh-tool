@@ -46,8 +46,9 @@ export function stripSentinel(raw: string, sentinel: string): string {
  */
 export function toModelText(raw: string): string {
   const screen = simulateScreen(raw)
-  // 移除残留哨兵十六进制碎片（PSReadLine 光标重绘后可能残留在未覆盖区域）
-  const noSentinel = screen.replace(/__SSH_DONE_[0-9a-f]+/gi, "")
+  // 移除残留哨兵注入痕迹（PSReadLine 光标重绘后可能残留在未覆盖区域）：
+  // `; echo __SSH_DONE_xxx` 或裸 `__SSH_DONE_xxx` 一并清除
+  const noSentinel = screen.replace(/(?:;\s*echo\s+)?__SSH_DONE_[0-9a-f]*/gi, "")
   return noSentinel
     .split(/\r?\n/)
     .map((l) => l.replace(/\r/g, "").trimEnd())
