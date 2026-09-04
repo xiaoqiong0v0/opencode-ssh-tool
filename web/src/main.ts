@@ -238,8 +238,11 @@ function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
   }
   const rows = screen.render()
   const timeByRow = new Map<number, Mark>()
-  for (const m of marks) {
-    const hit = rows.find((r) => r.row >= m.row)
+  for (let i = 0; i < marks.length; i++) {
+    const m = marks[i]
+    const nextRow = marks[i + 1]?.row ?? Infinity
+    // 找第一个在当前命令行范围内且非空的渲染行
+    const hit = rows.find((r) => r.row >= m.row && r.row < nextRow)
     if (hit && !timeByRow.has(hit.row)) timeByRow.set(hit.row, m)
   }
   return rows

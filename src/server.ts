@@ -188,7 +188,7 @@ function renderPage(lang: Lang, template: string): string {
   }
   out = out.replaceAll("__I18N_JSON__", JSON.stringify(i18nObj))
   // PTY 列宽注入（前端 TermScreen 按此列宽渲染，与后端生成 ANSI 的列宽一致，避免错行）
-  out = out.replaceAll("__PTY_COLS__", String(PTY_COLS))
+  out = out.replaceAll("__PTY_COLS_VAL__", String(PTY_COLS))
   return out
 }
 
