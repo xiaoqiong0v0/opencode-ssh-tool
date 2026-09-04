@@ -167,12 +167,13 @@ function renderPage(lang: Lang): string {
 <head>
 <meta charset="utf-8">
 <title>${w("web_title")}</title>
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600&display=swap" rel="stylesheet">
 <style>
   html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; }
   header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
   header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
   select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
   /* 两列布局：左侧时间列（开关控制显隐），右侧内容列（命令/输出格式不变） */
   .row { display: flex; align-items: stretch; }
   .row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
