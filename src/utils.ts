@@ -38,13 +38,17 @@ export function stripSentinel(raw: string, sentinel: string): string {
 }
 
 /**
- * 把原始终端流转为给模型看的干净文本：合并 \r/ANSI 行内覆盖（进度条取末帧）、剥离 ANSI 控制序列、
- * 逐行去尾空白并剔除空行。仅做无损化简，不删除任何命令/程序实质输出内容。
+ * 把原始终端流转为给模型看的干净文本：模拟终端屏幕（处理光标移动/清行/覆盖/退格/SGR/OSC），
+ * 输出最终屏幕各行文本，再逐行去尾空白并剔除空行。比纯文本正则更鲁棒地处理 PSReadLine
+ * 行内重绘、进度条 \r 覆盖等场景。
  * @param raw 已剔除哨兵的原始字节流（stripSentinel 输出）
  * @returns 纯文本输出（供模型消费 / exec 返回值 / read 命令）
  */
 export function toModelText(raw: string): string {
-  return cleanAnsi(collapseCarriage(raw))
+  const screen = simulateScreen(raw)
+  // 移除残留哨兵十六进制碎片（PSReadLine 光标重绘后可能残留在未覆盖区域）
+  const noSentinel = screen.replace(/__SSH_DONE_[0-9a-f]+/gi, "")
+  return noSentinel
     .split(/\r?\n/)
     .map((l) => l.replace(/\r/g, "").trimEnd())
     .filter((l) => l !== "")
@@ -52,34 +56,120 @@ export function toModelText(raw: string): string {
 }
 
 /**
- * 剥离 ANSI 转义序列（颜色、光标控制等）
- * @param s 原始字符串
- * @returns 清洗后的纯文本
+ * 模拟终端屏幕渲染：处理 ANSI 光标/清行/清屏/退格/覆盖，输出最终各行的文本。
+ * 不保留颜色/SGR，仅提取各行已写字符的最右列，确保最终屏幕文本与真实终端显示一致。
+ * @param s 原始字节流（含 ANSI、\b、\r 等）
+ * @returns 按行拼接的纯文本（行间 \n 分隔，行内保留空格）
  */
-export function cleanAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "")
-}
+function simulateScreen(s: string): string {
+  // 网格：每行 { maxCol: 已写最右列, cols: Map<col, char> }
+  const rows: { maxCol: number; cols: Map<number, string> }[] = []
+  let r = 0   // 当前行
+  let c = 0   // 当前列
+  const COLS = 240 // 足够宽
 
-/**
- * 合并同一行内的 \r / ANSI 清行覆盖（进度条/旋转动画）：保留每行最后一次刷新状态，
- * 避免 "下载 1%\r下载 2%\r...\r下载 100%" 累积成巨量碎片输出
- * 识别 \r 与 ANSI 清行（ESC[2K / ESC[K）+ 光标归位（ESC[G）作为行覆盖分隔符
- * @param s 原始输出（含 ANSI 或已清洗均可）
- * @returns 合并覆盖后的文本（\r\n 正常换行保留）
- */
-export function collapseCarriage(s: string): string {
-  // 覆盖分隔符：裸 \r 或 ANSI 清行/光标归位序列（ESC[2K、ESC[K、ESC[G）
-  const OVERWRITE = /\r|\x1b\[[0-9]*[KG]/
-  // 按 \r\n 拆成行（保留正常 CRLF 换行），行内按覆盖分隔符拆分取最后一段
-  return s
-    .split(/\r\n/)
-    .map((line) => {
-      const segs = line.split(OVERWRITE).filter((seg) => seg !== "")
-      if (segs.length <= 1) return line
-      return segs[segs.length - 1]
-    })
-    .join("\n")
+  const row = (i: number) => {
+    while (rows.length <= i) rows.push({ maxCol: 0, cols: new Map() })
+    return rows[i]
+  }
+  const put = (ch: string) => {
+    const cur = row(r)
+    if (c < COLS) {
+      cur.cols.set(c, ch)
+      if (c >= cur.maxCol) cur.maxCol = c + 1
+    }
+    c++
+  }
+
+  let i = 0
+  const n = s.length
+  while (i < n) {
+    const ch = s[i]
+    if (ch === "\x1b") {
+      // OSC: ESC ] ... BEL/ESC\ — 整段丢弃
+      if (i + 1 < n && s[i + 1] === "]") {
+        let j = i + 2
+        while (j < n && s[j] !== "\x07" && !(s[j] === "\x1b" && j + 1 < n && s[j + 1] === "\\")) j++
+        if (j >= n) break
+        i = s[j] === "\x07" ? j + 1 : j + 2
+        continue
+      }
+      // CSI: ESC [ params... final
+      if (i + 1 < n && s[i + 1] === "[") {
+        let j = i + 2
+        const start = j
+        while (j < n && !/[A-Za-z@]/.test(s[j])) j++
+        if (j >= n) break
+        const body = s.slice(start, j)
+        const final = s[j]
+        const p = (d: string) => { const v = parseInt(d, 10); return Number.isFinite(v) && v > 0 ? v : 1 }
+        const va = (d: string) => { const v = parseInt(d, 10); return Number.isFinite(v) && v >= 0 ? v : 0 }
+        if (final === "m") {
+          // SGR：忽略颜色
+        } else if (final === "A") { r = Math.max(0, r - p(body)) }
+        else if (final === "B") { r += p(body) }
+        else if (final === "C") { c = Math.min(COLS - 1, c + p(body)) }
+        else if (final === "D") { c = Math.max(0, c - p(body)) }
+        else if (final === "H" || final === "f") {
+          const m = body.split(";")
+          r = Math.max(0, (p(m[0]) - 1))
+          c = Math.max(0, (p(m[1]) - 1))
+        }
+        else if (final === "G" || final.charCodeAt(0) === 96) { c = Math.max(0, p(body) - 1) }
+        else if (final === "d") { r = Math.max(0, p(body) - 1) }
+        else if (final === "K") {
+          const mode = va(body)
+          const curRow = row(r)
+          if (mode === 2) { curRow.cols.clear(); curRow.maxCol = 0 }
+          else if (mode === 1) { for (let ci = 0; ci <= c; ci++) { curRow.cols.delete(ci) }; curRow.maxCol = 0 }
+          else { for (let ci = c; ci < COLS; ci++) { curRow.cols.delete(ci) }; curRow.maxCol = Math.min(curRow.maxCol, c) }
+        }
+        else if (final === "J") {
+          const mode = va(body)
+          if (mode === 2 || mode === 3) { rows.length = 0; r = 0; c = 0 }
+          else if (mode === 1) { rows.length = 0; r = 0; c = 0 }
+          else {
+            const cur = row(r)
+            for (let ci = c; ci < COLS; ci++) cur.cols.delete(ci)
+            cur.maxCol = Math.min(cur.maxCol, c)
+            rows.length = r + 1
+          }
+        }
+        // 其余 CSI（滚动/插入/删除等）忽略
+        i = j + 1
+        continue
+      }
+      // 其他 ESC 序列（如 ESC 7/8 保存/恢复光标）：忽略
+      i += 2
+      continue
+    }
+    if (ch === "\r") { c = 0; i++; continue }
+    if (ch === "\n") { r++; c = 0; i++; continue }
+    if (ch === "\b") { if (c > 0) c--; i++; continue }
+    if (ch === "\t") {
+      const next = (Math.floor(c / 8) + 1) * 8
+      if (next >= COLS) { r++; c = 0 }
+      else c = next
+      i++; continue
+    }
+    // 其他控制字符（\x07 BEL 等）跳过
+    if (ch.charCodeAt(0) < 32) { i++; continue }
+    put(ch)
+    i++
+  }
+
+  // 构建输出行
+  const lines: string[] = []
+  for (let ri = 0; ri < rows.length; ri++) {
+    const cur = rows[ri]
+    if (cur.maxCol === 0) { lines.push(""); continue }
+    let line = ""
+    for (let ci = 0; ci < cur.maxCol; ci++) {
+      line += cur.cols.get(ci) ?? " "
+    }
+    lines.push(line)
+  }
+  return lines.join("\n")
 }
 
 /**
