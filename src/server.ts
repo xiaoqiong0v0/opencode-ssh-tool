@@ -220,48 +220,211 @@ function renderPage(lang: Lang): string {
   // 新消息顶部位置（点击悬浮按钮时滚动到此处，而非底部）
   let pendingTop = 0;
 
-  // ANSI → 彩色 HTML：消费所有 CSI 序列（颜色/光标/清屏等），SGR 着色、其余丢弃；先 HTML 转义防 XSS
+  // 模板内嵌翻译值：预取为 JS 变量，避免字符串内插值引号冲突
+  const L = {
+    run: ${JSON.stringify(w("web_running"))},
+    commands: ${JSON.stringify(w("web_commands"))},
+    autoRefresh: ${JSON.stringify(w("web_auto_refresh"))},
+    sessionGone: ${JSON.stringify(w("web_session_gone"))},
+    noSession: ${JSON.stringify(w("web_no_session"))},
+    loadFailed: ${JSON.stringify(w("web_load_failed"))},
+  };
+
+  // 轻量终端模拟：按真实终端语义渲染 ANSI 流（光标移动/清屏/颜色/制表符），原样还原屏幕画面
   const ANSI_BASE = ["#010101","#de382b","#39b54a","#ffc005","#006fb8","#762671","#2cb3e9","#c9d1d9"];
   const ANSI_BRIGHT = ["#666666","#ff7b72","#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f0f6fc"];
-  function ansiToHtml(s) {
-    const esc = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const re = /\\x1b\\[[0-9;?]*[A-Za-z]/g;
-    let fg = null, bg = null, bold = false, last = 0, m;
-    const parts = [];
-    const flush = (end) => {
-      const text = esc.slice(last, end);
-      last = end;
-      if (!text) return;
-      const style = [];
-      if (bold) style.push("font-weight:bold");
-      if (fg) style.push("color:" + fg);
-      if (bg) style.push("background-color:" + bg);
-      parts.push(style.length ? '<span style="' + style.join(";") + '">' + text + "</span>" : text);
-    };
-    while ((m = re.exec(esc))) {
-      flush(m.index);
-      const seq = m[0];
-      // 仅 SGR（结尾 m）改颜色，其余 CSI（光标/清屏/括号粘贴等）丢弃
-      if (seq.endsWith("m")) {
-        const body = seq.slice(2, -1);
-        const codes = body ? body.split(";").map(x => parseInt(x, 10)) : [0];
-        if (!body || codes.indexOf(0) >= 0) { fg = null; bg = null; bold = false; }
-        for (const c of codes) {
-          if (c === 1) bold = true;
-          else if (c === 22) bold = false;
-          else if (c >= 30 && c <= 37) fg = ANSI_BASE[c - 30];
-          else if (c === 39) fg = null;
-          else if (c >= 90 && c <= 97) fg = ANSI_BRIGHT[c - 90];
-          else if (c >= 40 && c <= 47) bg = ANSI_BASE[c - 40];
-          else if (c === 49) bg = null;
-          else if (c >= 100 && c <= 107) bg = ANSI_BRIGHT[c - 100];
-        }
-      }
-      // 关键：跳过序列本身，避免真实 ESC 残留（浏览器显示为"口"）
-      last = re.lastIndex;
+  class TermScreen {
+    constructor(cols) {
+      this.cols = cols;               // 列数（超出自动折行，模拟终端 wrap）
+      this.grid = [];                 // 每行: 数组(cols) of {ch, fg, bg, bold}
+      this.r = 0;                     // 当前光标行
+      this.c = 0;                     // 当前光标列
+      this.fg = null; this.bg = null; this.bold = false;   // 当前 SGR 样式
     }
-    flush(esc.length);
-    return parts.join("");
+    // 确保某行存在
+    _row(r) {
+      while (this.grid.length <= r) {
+        const row = [];
+        for (let i = 0; i < this.cols; i++) row.push({ ch: " ", fg: null, bg: null, bold: false });
+        this.grid.push(row);
+      }
+      return this.grid[r];
+    }
+    // 写一个字符到光标处（自动折行到下一行）
+    _put(ch) {
+      let row = this._row(this.r);
+      row[this.c] = { ch, fg: this.fg, bg: this.bg, bold: this.bold };
+      this.c++;
+      if (this.c >= this.cols) { this.c = 0; this.r++; }
+    }
+    // 处理一段 ANSI 文本（增量喂入）
+    write(text) {
+      let i = 0;
+      const n = text.length;
+      while (i < n) {
+        const ch = text[i];
+        if (ch === "\\x1b") {
+          // OSC: ESC ] ... BEL(0x07) 或 ESC \ —— 设置窗口标题等，不渲染，整段丢弃
+          if (i + 1 < n && text[i + 1] === "]") {
+            let j = i + 2;
+            while (j < n && text[j] !== "\\x07" && !(text[j] === "\\x1b" && text[j + 1] === "\\\\")) j++;
+            if (j >= n) break;
+            i = text[j] === "\\x07" ? j + 1 : j + 2;
+            continue;
+          }
+          // CSI: ESC [ params... final
+          if (i + 1 < n && text[i + 1] === "[") {
+            let j = i + 2;
+            const start = j;
+            while (j < n && !/[A-Za-z@]/.test(text[j])) j++;
+            if (j >= n) break; // 不完整序列，忽略
+            const body = text.slice(start, j);
+            const final = text[j];
+            this._csi(body, final);
+            i = j + 1;
+            continue;
+          }
+          // 其他 ESC 序列（如 ESC 7/8 保存恢复光标）直接忽略
+          i += 2;
+          continue;
+        }
+        if (ch === "\\r") { this.c = 0; i++; continue; }
+        // ONLCR：数据层换行符不带回车，渲染时按终端默认行为归零列（否则出现递进缩进）
+        if (ch === "\\n") { this.r++; this.c = 0; i++; continue; }
+        if (ch === "\\b") { if (this.c > 0) this.c--; i++; continue; }
+        if (ch === "\\t") { this.c = (Math.floor(this.c / 8) + 1) * 8; if (this.c >= this.cols) { this.c = 0; this.r++; } i++; continue; }
+        // 控制字符（如 0x07 BEL）跳过
+        if (ch.charCodeAt(0) < 32) { i++; continue; }
+        this._put(ch);
+        i++;
+      }
+    }
+    // CSI 指令处理（含中间参数）
+    _csi(body, final) {
+      // 分离中参数（如 ？）：光标移动常用；这里简化为忽略问号开头
+      const b = body.replace(/^[?]/ , "");
+      // SGR: 颜色/样式
+      if (final === "m") {
+        const codes = b ? b.split(";").map(x => parseInt(x, 10)) : [0];
+        if (!b || codes.indexOf(0) >= 0) { this.fg = null; this.bg = null; this.bold = false; }
+        for (const c of codes) {
+          if (c === 1) this.bold = true;
+          else if (c === 22) this.bold = false;
+          else if (c >= 30 && c <= 37) this.fg = ANSI_BASE[c - 30];
+          else if (c === 39) this.fg = null;
+          else if (c >= 90 && c <= 97) this.fg = ANSI_BRIGHT[c - 90];
+          else if (c >= 40 && c <= 47) this.bg = ANSI_BASE[c - 40];
+          else if (c === 49) this.bg = null;
+          else if (c >= 100 && c <= 107) this.bg = ANSI_BRIGHT[c - 100];
+        }
+        return;
+      }
+      // 光标移动 / 定位
+      const p = (d) => { const v = parseInt(d, 10); return (Number.isFinite(v) && v > 0) ? v : 1; };
+      const va = (d) => { const v = parseInt(d, 10); return (Number.isFinite(v) && v >= 0) ? v : 0; };
+      if (final === "A") this.r = Math.max(0, this.r - p(b));
+      else if (final === "B") this.r += p(b);
+      else if (final === "C") this.c = Math.min(this.cols - 1, this.c + p(b));
+      else if (final === "D") this.c = Math.max(0, this.c - p(b));
+      else if (final === "H" || final === "f") { const m = b.split(";"); this.r = p(m[0]) - 1; this.c = p(m[1]) - 1; }
+      else if (final === "G" || final.charCodeAt(0) === 96) { this.c = Math.max(0, p(b) - 1); }
+      else if (final === "d") { this.r = Math.max(0, p(b) - 1); }
+      // 清屏/擦除
+      else if (final === "J") {
+        const mode = va(b);
+        if (mode === 2 || mode === 3) { // 全清：所有行置空格
+          for (let ri = 0; ri < this.grid.length; ri++) {
+            const row = this._row(ri);
+            for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
+          }
+          this.r = 0; this.c = 0;
+        } else if (mode === 1) { // 从屏首清到光标
+          for (let ri = 0; ri <= this.r; ri++) {
+            const row = this._row(ri);
+            const end = (ri === this.r) ? this.c : this.cols;
+            for (let ci = 0; ci < end; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
+          }
+        } else { // mode 0: 光标到屏末
+          for (let ri = this.r; ri < this.grid.length; ri++) {
+            const row = this._row(ri);
+            const start = (ri === this.r) ? this.c : 0;
+            for (let ci = start; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
+          }
+        }
+      } else if (final === "K") {
+        const mode = va(b);
+        const row = this._row(this.r);
+        if (mode === 2) { for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
+        else if (mode === 1) { for (let ci = 0; ci <= this.c; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
+        else { for (let ci = this.c; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
+      }
+      // 其余 CSI（滚动/插入/删除/光标保存等）暂忽略，不影响内容显示
+    }
+    // 渲染为 HTML 行数组（尾部全空格行裁剪；跳过全空行以减小体积）
+    // 返回 [ { row, html } ]：row 为网格行号，便于外部对特定行打标记（时间列）
+    render() {
+      const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const out = [];
+      for (let ri = 0; ri < this.grid.length; ri++) {
+        const row = this.grid[ri];
+        let last = this.cols;
+        while (last > 0 && row[last - 1].ch === " ") last--;
+        if (last === 0) continue; // 空行跳过
+        let html = "";
+        let cur = null; // 当前样式段
+        for (let ci = 0; ci < last; ci++) {
+          const cell = row[ci];
+          const style = [];
+          if (cell.bold) style.push("font-weight:bold");
+          if (cell.fg) style.push("color:" + cell.fg);
+          if (cell.bg) style.push("background-color:" + cell.bg);
+          const key = style.join(";");
+          if (key !== cur) {
+            if (cur) html += "</span>";
+            cur = key;
+            if (key) html += '<span style="' + key + '">';
+          }
+          html += esc(cell.ch);
+        }
+        if (cur) html += "</span>";
+        out.push({ row: ri, html });
+      }
+      return out;
+    }
+  }
+
+  // 将 transcript 命令/输出流渲染为连续终端画面（共享一个 TermScreen，保持光标/清屏状态连续），
+  // 命令与输出合并为一块：命令回显（含提示符）+ 输出按真实终端顺序排列，不再分栏
+  function renderTranscript(pairs, showTime) {
+    const screen = new TermScreen(120);
+    const marks = []; // { row, ts, run }：每个命令块起始行
+    let lastEndNL = true; // 上一段文本末尾是否以 \\n 结尾（默认 true，第一段前不需要补）
+    for (const p of pairs) {
+      if (p.type === "cmd") {
+        marks.push({ row: screen.r, ts: p.ts, run: false });
+        continue;
+      }
+      if (p.type === "run") marks.push({ row: screen.r, ts: null, run: true });
+      // 上一段不以 \\n 结尾时补换行，防止命令段间因缺换行拼接在同一网格行
+      if (!lastEndNL && !p.text.startsWith("\\n")) screen.write("\\n");
+      screen.write(p.text);
+      lastEndNL = p.text.endsWith("\\n");
+    }
+    const rows = screen.render();
+    // 按网格行号把标记映射到渲染行（命令块起始 → 该行时间列）
+    const timeByRow = new Map();
+    for (const m of marks) {
+      const hit = rows.find((r) => r.row >= m.row);
+      if (hit && !timeByRow.has(hit.row)) timeByRow.set(hit.row, m);
+    }
+    return rows
+      .map((r) => {
+        const m = timeByRow.get(r.row);
+        const t = m && !m.run && showTime && m.ts ? fmtTime(m.ts) : "";
+        const label = m && m.run ? L.run : "";
+        return '<div class="row"><span class="t">' + t + '</span><span class="c">' + label + r.html + '</span></div>';
+      })
+      .join("");
   }
 
   function sessionLabel(s) {
@@ -350,7 +513,7 @@ function renderPage(lang: Lang): string {
     const tsel = document.getElementById("terminal");
     const sid = sel.value;
     const name = tsel.value;
-    if (!sid || !name) { pre.textContent = "${w("web_no_session")}"; return; }
+    if (!sid || !name) { pre.textContent = L.noSession; return; }
     // 更新前判断是否贴底：用户已向上滚动离开底部则不自动下滚，保持当前位置
     if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
     const showTime = document.getElementById("showTime").checked;
@@ -361,7 +524,7 @@ function renderPage(lang: Lang): string {
       if (!r.ok) throw new Error("HTTP " + r.status);
       data = await r.json();
     } catch (e) {
-      pre.textContent = "${w("web_load_failed")}";
+      pre.textContent = L.loadFailed;
       return;
     }
     const pairs = data.pairs || [];
@@ -369,7 +532,7 @@ function renderPage(lang: Lang): string {
     if (data.notFound) {
       lastTranscript = "";
       pendingTop = 0;
-      pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + "${w("web_session_gone")}" + '</span></div>';
+      pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + L.sessionGone + '</span></div>';
       document.getElementById("meta").textContent = "";
       dropDeadTerminal(sid, name);
       return;
@@ -380,17 +543,10 @@ function renderPage(lang: Lang): string {
     const sig = JSON.stringify(pairs);
     const changed = sig !== lastTranscript;
     lastTranscript = sig;
-    pre.innerHTML = pairs.map((p) => {
-      if (p.type === "cmd") {
-        const t = showTime ? fmtTime(p.ts) : "";
-        return '<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + ansiToHtml(p.text) + '</span></div>';
-      }
-      // out / run：输出列，保留 ANSI 彩色，时间列留空（不改变输出格式）
-      const label = p.type === "run" ? "${w("web_running")}" : "";
-      return '<div class="row"><span class="t"></span><span class="c">' + label + ansiToHtml(p.text) + '</span></div>';
-    }).join("");
+    // 命令/输出合并为连续终端画面：共享 TermScreen 保持状态连续，时间戳标在命令块首行
+    pre.innerHTML = renderTranscript(pairs, showTime);
     const cmdCount = pairs.filter((p) => p.type === "cmd").length;
-    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " ${w("web_commands")} · ${w("web_auto_refresh")}";
+    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " " + L.commands + " · " + L.autoRefresh;
     if (stickToBottom) {
       pre.scrollTop = pre.scrollHeight;
       toBottomBtn.style.display = "none";

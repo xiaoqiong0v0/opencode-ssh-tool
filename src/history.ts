@@ -64,9 +64,9 @@ export class SessionHistory {
   }
 
   /**
-   * 追加一条命令+输出对（写文件），超对数移除最旧
+   * 追加一条命令+原始流输出对（写文件），超对数移除最旧
    * @param command 命令
-   * @param output 输出
+   * @param output 原始终端流（已去哨兵注入，未做其他清理），供 web 忠实渲染、模型按需 toModelText
    */
   append(command: string, output: string): void {
     const ts = Date.now()
@@ -100,9 +100,9 @@ export class SessionHistory {
   }
 
   /**
-   * 读取某对输出（从文件）
+   * 读取某对输出（从文件，返回原始流，已去哨兵注入）
    * @param pair 消息对
-   * @returns 输出文本
+   * @returns 原始终端流（含 ANSI 颜色，不含哨兵注入）
    */
   readOutput(pair: HistoryPair): string {
     try {

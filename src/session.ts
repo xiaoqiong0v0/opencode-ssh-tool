@@ -13,7 +13,7 @@ import {
 } from "./constants.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
-import { cleanAnsi, collapseCarriage, genSentinel, stripEcho, stripPrompt } from "./utils.js"
+import { genSentinel, stripPrompt, stripSentinel, toModelText } from "./utils.js"
 
 const log = createLogger("opencode-ssh-tool", { enabled: true })
 
@@ -79,6 +79,8 @@ export class SshSession {
   private _runningSentinel = ""
   private _runningCommand = ""
   private _watchTimer: ReturnType<typeof setInterval> | null = null
+  /** 下次捕获窗口起点（相对当前 buffer）：前一条命令结束后，shell 新打印的提示符/残留从此处开始 */
+  private _cursor = 0
   private _closed = false
   private readonly _history: SessionHistory
 
@@ -160,13 +162,14 @@ export class SshSession {
             })
 
             // 等待登录 banner / 初始提示符输出稳定后清空 buffer（不算业务输出）
-            ;(async () => {
+;(async () => {
               await new Promise((r) => setTimeout(r, 400))
               this._buffer = ""
+              this._cursor = 0
               this._runningStartPos = null
               this._runningSentinel = ""
               log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID})`)
-              resolve({ ok: true, host: opts.host, user: opts.user, port })
+              resolve({ ok: true, host: opts.user, user: opts.user, port })
             })()
           },
         )
@@ -192,7 +195,9 @@ export class SshSession {
 
     const sentinel = genSentinel()
     const combo = `${command}; echo ${sentinel}`
-    const startPos = this._buffer.length
+    // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
+    this._buffer = this._buffer.slice(this._cursor)
+    const startPos = 0
     this._runningStartPos = startPos
     this._runningSentinel = sentinel
     this._runningCommand = command
@@ -228,7 +233,9 @@ export class SshSession {
 
     const sentinel = genSentinel()
     const combo = `${command}; echo ${sentinel}`
-    const startPos = this._buffer.length
+    // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
+    this._buffer = this._buffer.slice(this._cursor)
+    const startPos = 0
     this._remoteBusy = true
     this._lastActive = startTs
     this._stream.write(combo + "\r")
@@ -238,12 +245,13 @@ export class SshSession {
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos, outcome.idx)), combo)
-        this._buffer = this._buffer.slice(outcome.afterNewline)
-        this._history.append(command, out)
+        const raw = stripSentinel(this._buffer.slice(startPos, outcome.idx), sentinel)
+        // 不裁 buffer：shell 随后打印的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
+        this._cursor = Math.max(startPos, outcome.afterNewline ?? 0)
+        this._history.append(command, raw)
         return {
           ok: true,
-          output: this._truncate(cleanAnsi(out)),
+          output: this._truncate(toModelText(raw)),
           host: this._host,
           command,
           duration: Date.now() - startTs,
@@ -251,11 +259,12 @@ export class SshSession {
       }
       case "interactive": {
         this._remoteBusy = false
-        const out = collapseCarriage(this._buffer.slice(startPos))
-        this._history.append(command, out)
+        const raw = stripSentinel(this._buffer.slice(startPos), sentinel)
+        this._cursor = this._buffer.length
+        this._history.append(command, raw)
         return {
           ok: true,
-          output: this._truncate(cleanAnsi(out)),
+          output: this._truncate(toModelText(raw)),
           interactive: true,
           host: this._host,
           command,
@@ -269,11 +278,11 @@ export class SshSession {
         this._runningCommand = command
         this._remoteBusy = true
         this._startBackgroundWatch(sentinel, startPos, command)
-        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos)), combo)
-        this._history.append(command, out)
+        const raw = stripSentinel(this._buffer.slice(startPos), sentinel)
+        // running/timeout 不写入 history（后台 watch 在哨兵到达后统一写入，避免重复）
         return {
           ok: true,
-          output: this._truncate(cleanAnsi(out)),
+          output: this._truncate(toModelText(raw)),
           running: outcome.kind === "running",
           timeout: outcome.kind === "timeout",
           host: this._host,
@@ -298,18 +307,21 @@ export class SshSession {
       // 有后台运行上下文：输出从运行起点取到哨兵为止
       const idx = this._findSentinel(this._runningSentinel, this._runningStartPos)
       if (idx >= 0) {
-        out = this._buffer.slice(this._runningStartPos, idx)
+        const raw = stripSentinel(this._buffer.slice(this._runningStartPos, idx), this._runningSentinel)
         this._buffer = this._buffer.slice(idx)
+        this._cursor = 0
         this._clearRunningContext()
+        out = raw
       } else {
-        out = this._buffer.slice(this._runningStartPos)
+        out = stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel)
       }
     } else {
       out = this._buffer
       this._buffer = ""
+      this._cursor = 0
     }
 
-    return { ok: true, output: this._truncate(stripPrompt(cleanAnsi(collapseCarriage(out)))) }
+    return { ok: true, output: this._truncate(stripPrompt(toModelText(out))) }
   }
 
   /**
@@ -366,9 +378,8 @@ export class SshSession {
    */
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
-    const combo = `${this._runningCommand}; echo ${this._runningSentinel}`
-    const raw = this._buffer.slice(this._runningStartPos)
-    return stripEcho(collapseCarriage(raw), combo).trim()
+    const raw = stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel)
+    return raw.trim()
   }
 
   /**
@@ -407,10 +418,11 @@ export class SshSession {
     if (this._buffer.length > MAX_BUFFER_LEN) {
       const trimmed = this._buffer.length - MAX_BUFFER_LEN
       this._buffer = this._buffer.slice(trimmed)
-      // 同步修正后台运行上下文索引（若存在）
+      // 同步修正后台运行上下文索引与窗口起点（若存在）
       if (this._runningStartPos !== null) {
         this._runningStartPos = Math.max(0, this._runningStartPos - trimmed)
       }
+      this._cursor = Math.max(0, this._cursor - trimmed)
       log.info(`buffer 超限截断 ${trimmed} 字符，当前 ${this._buffer.length}`)
     }
   }
@@ -480,12 +492,12 @@ export class SshSession {
       }
       const idx = this._findSentinel(sentinel, startPos)
       if (idx >= 0) {
-        // 命令完成：收集输出（哨兵前内容，剔除回显）进 history（保留 ANSI 供 web 着色）
-        const combo = `${command}; echo ${sentinel}`
-        const out = stripEcho(collapseCarriage(this._buffer.slice(startPos, idx)), combo)
-        this._history.append(command, out)
+        // 命令完成：收集原始输出（去哨兵注入，未做清理）进 history，web 端按真实终端渲染
+        const raw = stripSentinel(this._buffer.slice(startPos, idx), sentinel)
+        this._history.append(command, raw)
+        // 不裁 buffer：shell 随后的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
         const nl = this._buffer.indexOf("\n", idx)
-        this._buffer = this._buffer.slice(nl >= 0 ? nl + 1 : idx + sentinel.length)
+        this._cursor = Math.max(startPos, nl >= 0 ? nl + 1 : idx + sentinel.length)
         this._remoteBusy = false
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
@@ -493,16 +505,18 @@ export class SshSession {
     }, 200)
   }
 
-  /** 在缓冲中定位哨兵行起始位置（哨兵串开头，容忍行前 ANSI bracketed-paste 序列） */
+  /** 在缓冲中定位哨兵行起始位置（哨兵串开头，容忍行前与哨兵字符间隙的 ANSI bracketed-paste 序列） */
   private _findSentinel(sentinel: string, fromPos: number): number {
+    const ANSI = "(?:\\x1b\\[[0-9;?]*[a-zA-Z])*"
     const esc = sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    // 行开始(\r|\n|串首) + 可选 ANSI 序列(如 ESC[?2004l) + 哨兵串
-    const re = new RegExp(`(?:^|[\\r\\n])(?:\\x1b\\[[0-9;?]*[a-zA-Z])*${esc}`, "g")
+    // 哨兵逐字符间隙容忍 ANSI（bash 回显时会在哨兵中插入 ESC[?2004h 等序列）
+    // 捕获组 1 = 哨兵文本本体，可直接换算原索引
+    const interleaved = [...esc].join(ANSI)
+    const re = new RegExp(`(?:^|[\\r\\n])${ANSI}(${interleaved})${ANSI}`, "g")
     re.lastIndex = fromPos
     const m = re.exec(this._buffer)
-    if (!m) return -1
-    // m[0] = 行开始 + ANSI + sentinel，哨兵串开头 = m.index + m[0].length - sentinel.length
-    return m.index + m[0].length - sentinel.length
+    if (!m || !m[1] || m[1].length <= 0) return -1
+    return m.index + m[0].indexOf(m[1])
   }
 
   /** 清理后台运行上下文 */

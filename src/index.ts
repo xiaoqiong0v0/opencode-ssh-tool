@@ -11,6 +11,7 @@ import { rmSync } from "node:fs"
 import { loadConfig } from "./config.js"
 import { SessionHistory } from "./history.js"
 import { T, getLang, tr } from "./i18n.js"
+import { toModelText } from "./utils.js"
 import { createDecider } from "./permission.js"
 import { SshSession } from "./session.js"
 import { LocalSession } from "./local-session.js"
@@ -349,7 +350,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     const direction = values.head ? "head" : "tail"
     const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
     const includeCommand = values.includeCommand ?? false
-    const text = selected.map((p) => (includeCommand ? `$ ${p.command}\n${history.readOutput(p)}` : history.readOutput(p))).join("\n")
+    const text = selected.map((p) => (includeCommand ? `$ ${p.command}\n` : "") + toModelText(history.readOutput(p))).join("\n")
     const browserLine = httpUrl ? tr("browser_full_record", lang).replace("{url}", httpUrl) : tr("server_not_enabled", lang)
     return `${tr(direction === "tail" ? "history_title" : "history_title_head", lang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
   }
