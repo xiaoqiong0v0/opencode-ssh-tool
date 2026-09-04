@@ -216,43 +216,33 @@ class TermScreen {
   }
 }
 
-interface Mark {
-  row: number
-  ts?: number
-  run: boolean
-}
-
 function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
-  const screen = new TermScreen(PTY_COLS)
-  const marks: Mark[] = []
-  let lastEndNL = true
+  // 结构化渲染：命令文本单独成行（时间戳标在此），每条输出用独立 TermScreen 渲染其 ANSI 颜色。
+  // 输出流已是剥离提示符/回显后的纯程序输出（服务端 extractOutput），故不依赖 zsh 提示符
+  // 渲染状态，任何 shell/主题都能稳定对齐。
+  const out: string[] = []
   for (const p of pairs) {
     if (p.type === "cmd") {
-      marks.push({ row: screen.r, ts: p.ts, run: false })
-      continue
+      const t = showTime && p.ts ? fmtTime(p.ts) : ""
+      out.push('<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + escHtml(p.text) + '</span></div>')
+    } else if (p.type === "run") {
+      const t = showTime && p.ts ? fmtTime(p.ts) : ""
+      out.push('<div class="row"><span class="t">' + t + '</span><span class="c">' + I18N.run + escHtml(p.text) + '</span></div>')
+    } else {
+      // out：纯程序输出，TermScreen 逐字渲染（含 ANSI 颜色），输出 HTML 行
+      const screen = new TermScreen(PTY_COLS)
+      screen.write(p.text)
+      for (const r of screen.render()) {
+        out.push('<div class="row"><span class="t"></span><span class="c">' + r.html + '</span></div>')
+      }
     }
-    if (p.type === "run") marks.push({ row: screen.r, run: true })
-    if (!lastEndNL && !p.text.startsWith("\n")) screen.write("\n")
-    screen.write(p.text)
-    lastEndNL = p.text.endsWith("\n")
   }
-  const rows = screen.render()
-  const timeByRow = new Map<number, Mark>()
-  for (let i = 0; i < marks.length; i++) {
-    const m = marks[i]
-    const nextRow = marks[i + 1]?.row ?? Infinity
-    // 找第一个在当前命令行范围内且非空的渲染行
-    const hit = rows.find((r) => r.row >= m.row && r.row < nextRow)
-    if (hit && !timeByRow.has(hit.row)) timeByRow.set(hit.row, m)
-  }
-  return rows
-    .map((r) => {
-      const m = timeByRow.get(r.row)
-      const t = m && !m.run && showTime && m.ts ? fmtTime(m.ts) : ""
-      const label = m && m.run ? I18N.run : ""
-      return '<div class="row"><span class="t">' + t + '</span><span class="c">' + label + r.html + '</span></div>'
-    })
-    .join("")
+  return out.join("")
+}
+
+/** HTML 转义（命令文本、纯文本运行态标签等，避免 XSS/格式破坏） */
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
 function sessionLabel(s: SessionStatus): string {

@@ -13,7 +13,7 @@ import {
 } from "./constants.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
-import { genSentinel, stripPrompt, stripSentinel, toModelText } from "./utils.js"
+import { extractOutput, genSentinel, stripPrompt, stripSentinel, toModelText } from "./utils.js"
 
 const log = createLogger("opencode-ssh-tool", { enabled: true })
 
@@ -194,7 +194,7 @@ export class SshSession {
     }
 
     const sentinel = genSentinel()
-    const combo = `${command}; echo ${sentinel}`
+    const combo = `${command}; printf '\\n${sentinel}\\n'`
     // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
     this._buffer = this._buffer.slice(this._cursor)
     const startPos = 0
@@ -232,7 +232,7 @@ export class SshSession {
     }
 
     const sentinel = genSentinel()
-    const combo = `${command}; echo ${sentinel}`
+    const combo = `${command}; printf '\\n${sentinel}\\n'`
     // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
     this._buffer = this._buffer.slice(this._cursor)
     const startPos = 0
@@ -245,7 +245,7 @@ export class SshSession {
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const raw = stripSentinel(this._buffer.slice(startPos, outcome.idx), sentinel)
+        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos, outcome.idx), sentinel), command)
         // 不裁 buffer：shell 随后打印的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
         this._cursor = Math.max(startPos, outcome.afterNewline ?? 0)
         this._history.append(command, raw)
@@ -259,7 +259,7 @@ export class SshSession {
       }
       case "interactive": {
         this._remoteBusy = false
-        const raw = stripSentinel(this._buffer.slice(startPos), sentinel)
+        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos), sentinel), command)
         this._cursor = this._buffer.length
         this._history.append(command, raw)
         return {
@@ -278,7 +278,7 @@ export class SshSession {
         this._runningCommand = command
         this._remoteBusy = true
         this._startBackgroundWatch(sentinel, startPos, command)
-        const raw = stripSentinel(this._buffer.slice(startPos), sentinel)
+        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos), sentinel), command)
         // running/timeout 不写入 history（后台 watch 在哨兵到达后统一写入，避免重复）
         return {
           ok: true,
@@ -307,13 +307,13 @@ export class SshSession {
       // 有后台运行上下文：输出从运行起点取到哨兵为止
       const idx = this._findSentinel(this._runningSentinel, this._runningStartPos)
       if (idx >= 0) {
-        const raw = stripSentinel(this._buffer.slice(this._runningStartPos, idx), this._runningSentinel)
+        const raw = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos, idx), this._runningSentinel), this._runningCommand)
         this._buffer = this._buffer.slice(idx)
         this._cursor = 0
         this._clearRunningContext()
         out = raw
       } else {
-        out = stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel)
+        out = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel), this._runningCommand)
       }
     } else {
       out = this._buffer
@@ -378,7 +378,7 @@ export class SshSession {
    */
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
-    const raw = stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel)
+    const raw = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel), this._runningCommand)
     return raw.trim()
   }
 
@@ -492,8 +492,8 @@ export class SshSession {
       }
       const idx = this._findSentinel(sentinel, startPos)
       if (idx >= 0) {
-        // 命令完成：收集原始输出（去哨兵注入，未做清理）进 history，web 端按真实终端渲染
-        const raw = stripSentinel(this._buffer.slice(startPos, idx), sentinel)
+        // 命令完成：收集输出（去哨兵注入 + 剥离提示符/回显）进 history
+        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos, idx), sentinel), command)
         this._history.append(command, raw)
         // 不裁 buffer：shell 随后的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
         const nl = this._buffer.indexOf("\n", idx)
@@ -512,7 +512,9 @@ export class SshSession {
     // 哨兵逐字符间隙容忍 ANSI（bash 回显时会在哨兵中插入 ESC[?2004h 等序列）
     // 捕获组 1 = 哨兵文本本体，可直接换算原索引
     const interleaved = [...esc].join(ANSI)
-    const re = new RegExp(`(?:^|[\\r\\n])${ANSI}(${interleaved})${ANSI}`, "g")
+    // 行首匹配：换行符 或 CSI 序列（zsh prompt 重绘可能用 CSI 光标定位代替换行）
+    const LEAD = "(?:^|[\\r\\n]|(?:\\x1b\\[[0-9;?]*[a-zA-Z])+)"
+    const re = new RegExp(`${LEAD}${ANSI}(${interleaved})${ANSI}`, "g")
     re.lastIndex = fromPos
     const m = re.exec(this._buffer)
     if (!m || !m[1] || m[1].length <= 0) return -1
