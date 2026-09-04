@@ -1,0 +1,31 @@
+@font-face {
+  font-family: "CaskaydiaCove Nerd Font Mono";
+  src: url("/web/fonts/CaskaydiaCoveNerdFontMono-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+
+html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; }
+header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
+header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
+select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
+pre { margin: 0; padding: 16px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+.row { display: flex; align-items: stretch; }
+.row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
+.row .c { flex: 1; padding-left: 12px; white-space: pre; }
+body:not(.show-time) .row .t { display: none; }
+.row.cmdline { background: #161b22; box-shadow: inset 3px 0 0 #58a6ff; font-weight: 600; }
+.tgl { font-size: 12px; color: #8b949e; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+#meta { font-size: 12px; color: #8b949e; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #161b22; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; border: 2px solid #161b22; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+::-webkit-scrollbar-corner { background: #161b22; }
+* { scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
+.to-bottom-btn {
+  position: fixed; right: 24px; bottom: 24px; display: none;
+  background: #238636; color: #fff; border: none; border-radius: 20px;
+  padding: 8px 16px; font-size: 13px; cursor: pointer; z-index: 10;
+  box-shadow: 0 4px 12px rgba(0,0,0,.4);
+}
+.to-bottom-btn:hover { background: #2ea043; }

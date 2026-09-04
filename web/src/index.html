@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="{{lang}}">
+<head>
+<meta charset="utf-8">
+<title>{{web_title}}</title>
+<link rel="stylesheet" href="/web/app.css">
+</head>
+<body>
+<header>
+  <h1>{{web_title}}</h1>
+  <select id="session" onchange="onSessionChange(true)"></select>
+  <select id="terminal" onchange="onSessionChange(true)"></select>
+  <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> {{web_time}}</label>
+  <span id="meta"></span>
+</header>
+<pre id="term">{{web_loading}}</pre>
+<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
+<script>window.__I18N__ = __I18N_JSON__;</script>
+<script src="/web/app.js"></script>
+</body>
+</html>

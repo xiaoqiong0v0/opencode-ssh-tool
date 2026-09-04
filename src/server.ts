@@ -1,8 +1,10 @@
 // 本地 HTTP 服务：浏览器直接查看可滚动终端记录（默认开启，端口可配，0=随机分配）
+// 前端页面为独立 web/ 工程（esbuild 打包到 dist/web/），本文件仅负责：i18n 占位替换 + 静态资源分发 + JSON API
 
 import { createServer, type Server } from "node:http"
-import { readdirSync, readFileSync } from "node:fs"
-import { join } from "node:path"
+import { readFileSync, readdirSync, existsSync } from "node:fs"
+import { join, dirname, extname, normalize } from "node:path"
+import { fileURLToPath } from "node:url"
 import type { AddressInfo } from "node:net"
 import type { SshSession } from "./session.js"
 import { listAllSessions } from "./session-store.js"
@@ -25,6 +27,28 @@ export interface SessionEntry {
   directory?: string
 }
 
+/** 前端模板中需要替换的 i18n 占位键 */
+const PAGE_KEYS: FlatKey[] = [
+  "web_title",
+  "web_loading",
+  "web_time",
+  "web_new_messages",
+  "web_terminals",
+  "web_local",
+]
+
+/** 前端 JS 内 I18N 对象键 → i18n key */
+const JS_I18N_KEYS: Record<string, FlatKey> = {
+  run: "web_running",
+  commands: "web_commands",
+  autoRefresh: "web_auto_refresh",
+  sessionGone: "web_session_gone",
+  noSession: "web_no_session",
+  loadFailed: "web_load_failed",
+  terminals: "web_terminals",
+  local: "web_local",
+}
+
 /**
  * 启动 HTTP 服务（监听 127.0.0.1）
  * @param port 端口，0 或未指定 → 系统随机分配（避免冲突）
@@ -35,6 +59,11 @@ export interface SessionEntry {
  */
 export function startServer(port: number, getSessions: () => SessionEntry[], dir: string, lang: Lang = "en"): Promise<ServerHandle> {
   let actualPort = port
+  // 前端产物目录：dist/web（相对本模块 dist/server.js 的上一级）
+  const webDir = join(dirname(fileURLToPath(import.meta.url)), "web")
+  // 模板只读一次（dist/web/index.html），每次请求做 i18n 占位替换
+  const pageTemplate = readTemplate(webDir)
+
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
     const path = url.pathname
@@ -83,7 +112,7 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
           return
         }
       } else {
-        // 命令+输出消息对（保留 ANSI 颜色，前端解析着色）；运行中附加实时进度
+        // 命令+输出消息对（原始字节流，保留 ANSI，前端 TermScreen 忠实渲染）；运行中附加实时进度
         pairs = []
         for (const pair of entry.session.getHistory().getPairs()) {
           pairs.push({ type: "cmd", ts: pair.ts, text: pair.command })
@@ -98,8 +127,15 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
     }
 
     if (path === "/") {
+      const html = renderPage(lang, pageTemplate)
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
-      res.end(renderPage(lang))
+      res.end(html)
+      return
+    }
+
+    // 静态资源：/web/* → dist/web/*（JS/CSS/字体）
+    if (path.startsWith("/web/")) {
+      serveStatic(res, webDir, decodeURIComponent(path.slice("/web/".length)))
       return
     }
 
@@ -131,6 +167,79 @@ interface TranscriptPair {
 }
 
 /**
+ * 渲染终端记录页面：读取编译后的 index.html，替换 i18n 占位符与前端 I18N 对象
+ * @param lang 界面语言
+ * @param template index.html 模板文本（启动时已读）
+ * @returns 最终 HTML 文本
+ */
+function renderPage(lang: Lang, template: string): string {
+  let out = template
+  // 语言占位
+  out = out.replaceAll("{{lang}}", lang)
+  // 文本占位（{{web_xxx}}）
+  for (const key of PAGE_KEYS) {
+    out = out.replaceAll(`{{${key}}}`, tr(key, lang))
+  }
+  // 前端 JS I18N 对象（window.__I18N__ = ...）
+  const i18nObj: Record<string, string> = {}
+  for (const [jsKey, i18nKey] of Object.entries(JS_I18N_KEYS)) {
+    i18nObj[jsKey] = tr(i18nKey, lang)
+  }
+  out = out.replaceAll("__I18N_JSON__", JSON.stringify(i18nObj))
+  return out
+}
+
+/** 读取前端模板（dist/web/index.html）；缺失时返回引导构建的提示页 */
+function readTemplate(webDir: string): string {
+  const file = join(webDir, "index.html")
+  if (!existsSync(file)) {
+    return `<!DOCTYPE html><html><body><h1>Web assets not built</h1><p>Run <code>npm run build</code> to build the web frontend.</p></body></html>`
+  }
+  return readFileSync(file, "utf8")
+}
+
+/** 静态文件类型映射 */
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".ttf": "font/ttf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+}
+
+/**
+ * 分发静态资源（防目录穿越：归一化后校验目标在 webDir 内）
+ * @param res 响应对象
+ * @param webDir 前端产物根目录
+ * @param rel 相对路径（已去 /web/ 前缀）
+ */
+function serveStatic(res: import("node:http").ServerResponse, webDir: string, rel: string): void {
+  if (rel.includes("\0")) {
+    res.writeHead(400)
+    res.end("Bad Request")
+    return
+  }
+  const file = normalize(join(webDir, rel))
+  if (!file.startsWith(webDir + "\\") && !file.startsWith(webDir + "/") && file !== webDir) {
+    res.writeHead(403)
+    res.end("Forbidden")
+    return
+  }
+  if (!existsSync(file)) {
+    res.writeHead(404)
+    res.end("Not Found")
+    return
+  }
+  const ext = extname(file).toLowerCase()
+  res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream" })
+  res.end(readFileSync(file))
+}
+
+/**
  * 从历史文件读取某终端记录（跨进程场景：本进程无该会话句柄时用）
  * @param dir 插件缓存根目录
  * @param sessionID opencode 会话 ID
@@ -157,454 +266,4 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
     }
   }
   return out
-}
-
-/** 渲染终端记录页面（黑底绿字等宽，JS 轮询自动刷新），语言由配置 webLang 决定 */
-function renderPage(lang: Lang): string {
-  const w = (key: FlatKey) => tr(key, lang)
-  return `<!DOCTYPE html>
-<html lang="${lang}">
-<head>
-<meta charset="utf-8">
-<title>${w("web_title")}</title>
-<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600&display=swap" rel="stylesheet">
-<style>
-  html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; }
-  header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
-  header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
-  select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-  pre { margin: 0; padding: 16px; font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
-  /* 两列布局：左侧时间列（开关控制显隐），右侧内容列（命令/输出格式不变） */
-  .row { display: flex; align-items: stretch; }
-  .row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
-  .row .c { flex: 1; padding-left: 12px; white-space: pre; }
-  body:not(.show-time) .row .t { display: none; }
-  /* 命令行：明显区分（背景条 + 左侧蓝条 + 加粗）；用 box-shadow 不占布局，保证时间列/分割线与输出行完全对齐 */
-  .row.cmdline { background: #161b22; box-shadow: inset 3px 0 0 #58a6ff; font-weight: 600; }
-  .tgl { font-size: 12px; color: #8b949e; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
-  #meta { font-size: 12px; color: #8b949e; }
-  /* 深色细滚动条：匹配暗色主题 */
-  ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: #161b22; }
-  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; border: 2px solid #161b22; }
-  ::-webkit-scrollbar-thumb:hover { background: #484f58; }
-  ::-webkit-scrollbar-corner { background: #161b22; }
-  * { scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
-  /* 回到底部悬浮按钮：离开底部且有新消息时显示 */
-  .to-bottom-btn {
-    position: fixed; right: 24px; bottom: 24px; display: none;
-    background: #238636; color: #fff; border: none; border-radius: 20px;
-    padding: 8px 16px; font-size: 13px; cursor: pointer; z-index: 10;
-    box-shadow: 0 4px 12px rgba(0,0,0,.4);
-  }
-  .to-bottom-btn:hover { background: #2ea043; }
-</style>
-</head>
-<body>
-<header>
-  <h1>${w("web_title")}</h1>
-  <select id="session" onchange="onSessionChange(true)"></select>
-  <select id="terminal" onchange="onSessionChange(true)"></select>
-  <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> ${w("web_time")}</label>
-  <span id="meta"></span>
-</header>
-<pre id="term">${w("web_loading")}</pre>
-<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">${w("web_new_messages")}</button>
-<script>
-  let sessionsData = [];
-  // 是否贴底（用户向上滚动查看历史时不自动下滚，仅贴底时跟随新输出）
-  let stickToBottom = true;
-  // 上次会话列表指纹（无变化则不重建下拉框，避免打断用户选择/焦点）
-  let lastSessionsKey = "";
-  // 上次渲染的 transcript 文本（判断是否真有新消息才显示悬浮按钮）
-  let lastTranscript = "";
-  // 新消息顶部位置（点击悬浮按钮时滚动到此处，而非底部）
-  let pendingTop = 0;
-
-  // 模板内嵌翻译值：预取为 JS 变量，避免字符串内插值引号冲突
-  const L = {
-    run: ${JSON.stringify(w("web_running"))},
-    commands: ${JSON.stringify(w("web_commands"))},
-    autoRefresh: ${JSON.stringify(w("web_auto_refresh"))},
-    sessionGone: ${JSON.stringify(w("web_session_gone"))},
-    noSession: ${JSON.stringify(w("web_no_session"))},
-    loadFailed: ${JSON.stringify(w("web_load_failed"))},
-  };
-
-  // 轻量终端模拟：按真实终端语义渲染 ANSI 流（光标移动/清屏/颜色/制表符），原样还原屏幕画面
-  const ANSI_BASE = ["#010101","#de382b","#39b54a","#ffc005","#006fb8","#762671","#2cb3e9","#c9d1d9"];
-  const ANSI_BRIGHT = ["#666666","#ff7b72","#3fb950","#d29922","#58a6ff","#bc8cff","#39c5cf","#f0f6fc"];
-  class TermScreen {
-    constructor(cols) {
-      this.cols = cols;               // 列数（超出自动折行，模拟终端 wrap）
-      this.grid = [];                 // 每行: 数组(cols) of {ch, fg, bg, bold}
-      this.r = 0;                     // 当前光标行
-      this.c = 0;                     // 当前光标列
-      this.fg = null; this.bg = null; this.bold = false;   // 当前 SGR 样式
-    }
-    // 确保某行存在
-    _row(r) {
-      while (this.grid.length <= r) {
-        const row = [];
-        for (let i = 0; i < this.cols; i++) row.push({ ch: " ", fg: null, bg: null, bold: false });
-        this.grid.push(row);
-      }
-      return this.grid[r];
-    }
-    // 写一个字符到光标处（自动折行到下一行）
-    _put(ch) {
-      let row = this._row(this.r);
-      row[this.c] = { ch, fg: this.fg, bg: this.bg, bold: this.bold };
-      this.c++;
-      if (this.c >= this.cols) { this.c = 0; this.r++; }
-    }
-    // 处理一段 ANSI 文本（增量喂入）
-    write(text) {
-      let i = 0;
-      const n = text.length;
-      while (i < n) {
-        const ch = text[i];
-        if (ch === "\\x1b") {
-          // OSC: ESC ] ... BEL(0x07) 或 ESC \ —— 设置窗口标题等，不渲染，整段丢弃
-          if (i + 1 < n && text[i + 1] === "]") {
-            let j = i + 2;
-            while (j < n && text[j] !== "\\x07" && !(text[j] === "\\x1b" && text[j + 1] === "\\\\")) j++;
-            if (j >= n) break;
-            i = text[j] === "\\x07" ? j + 1 : j + 2;
-            continue;
-          }
-          // CSI: ESC [ params... final
-          if (i + 1 < n && text[i + 1] === "[") {
-            let j = i + 2;
-            const start = j;
-            while (j < n && !/[A-Za-z@]/.test(text[j])) j++;
-            if (j >= n) break; // 不完整序列，忽略
-            const body = text.slice(start, j);
-            const final = text[j];
-            this._csi(body, final);
-            i = j + 1;
-            continue;
-          }
-          // 其他 ESC 序列（如 ESC 7/8 保存恢复光标）直接忽略
-          i += 2;
-          continue;
-        }
-        if (ch === "\\r") { this.c = 0; i++; continue; }
-        // ONLCR：数据层换行符不带回车，渲染时按终端默认行为归零列（否则出现递进缩进）
-        if (ch === "\\n") { this.r++; this.c = 0; i++; continue; }
-        if (ch === "\\b") { if (this.c > 0) this.c--; i++; continue; }
-        if (ch === "\\t") { this.c = (Math.floor(this.c / 8) + 1) * 8; if (this.c >= this.cols) { this.c = 0; this.r++; } i++; continue; }
-        // 控制字符（如 0x07 BEL）跳过
-        if (ch.charCodeAt(0) < 32) { i++; continue; }
-        this._put(ch);
-        i++;
-      }
-    }
-    // CSI 指令处理（含中间参数）
-    _csi(body, final) {
-      // 分离中参数（如 ？）：光标移动常用；这里简化为忽略问号开头
-      const b = body.replace(/^[?]/ , "");
-      // SGR: 颜色/样式
-      if (final === "m") {
-        const codes = b ? b.split(";").map(x => parseInt(x, 10)) : [0];
-        if (!b || codes.indexOf(0) >= 0) { this.fg = null; this.bg = null; this.bold = false; }
-        for (const c of codes) {
-          if (c === 1) this.bold = true;
-          else if (c === 22) this.bold = false;
-          else if (c >= 30 && c <= 37) this.fg = ANSI_BASE[c - 30];
-          else if (c === 39) this.fg = null;
-          else if (c >= 90 && c <= 97) this.fg = ANSI_BRIGHT[c - 90];
-          else if (c >= 40 && c <= 47) this.bg = ANSI_BASE[c - 40];
-          else if (c === 49) this.bg = null;
-          else if (c >= 100 && c <= 107) this.bg = ANSI_BRIGHT[c - 100];
-        }
-        return;
-      }
-      // 光标移动 / 定位
-      const p = (d) => { const v = parseInt(d, 10); return (Number.isFinite(v) && v > 0) ? v : 1; };
-      const va = (d) => { const v = parseInt(d, 10); return (Number.isFinite(v) && v >= 0) ? v : 0; };
-      if (final === "A") this.r = Math.max(0, this.r - p(b));
-      else if (final === "B") this.r += p(b);
-      else if (final === "C") this.c = Math.min(this.cols - 1, this.c + p(b));
-      else if (final === "D") this.c = Math.max(0, this.c - p(b));
-      else if (final === "H" || final === "f") { const m = b.split(";"); this.r = p(m[0]) - 1; this.c = p(m[1]) - 1; }
-      else if (final === "G" || final.charCodeAt(0) === 96) { this.c = Math.max(0, p(b) - 1); }
-      else if (final === "d") { this.r = Math.max(0, p(b) - 1); }
-      // 清屏/擦除
-      else if (final === "J") {
-        const mode = va(b);
-        if (mode === 2 || mode === 3) { // 全清：所有行置空格
-          for (let ri = 0; ri < this.grid.length; ri++) {
-            const row = this._row(ri);
-            for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
-          }
-          this.r = 0; this.c = 0;
-        } else if (mode === 1) { // 从屏首清到光标
-          for (let ri = 0; ri <= this.r; ri++) {
-            const row = this._row(ri);
-            const end = (ri === this.r) ? this.c : this.cols;
-            for (let ci = 0; ci < end; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
-          }
-        } else { // mode 0: 光标到屏末
-          for (let ri = this.r; ri < this.grid.length; ri++) {
-            const row = this._row(ri);
-            const start = (ri === this.r) ? this.c : 0;
-            for (let ci = start; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false };
-          }
-        }
-      } else if (final === "K") {
-        const mode = va(b);
-        const row = this._row(this.r);
-        if (mode === 2) { for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
-        else if (mode === 1) { for (let ci = 0; ci <= this.c; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
-        else { for (let ci = this.c; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }; }
-      }
-      // 其余 CSI（滚动/插入/删除/光标保存等）暂忽略，不影响内容显示
-    }
-    // 渲染为 HTML 行数组（尾部全空格行裁剪；跳过全空行以减小体积）
-    // 返回 [ { row, html } ]：row 为网格行号，便于外部对特定行打标记（时间列）
-    render() {
-      const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      const out = [];
-      for (let ri = 0; ri < this.grid.length; ri++) {
-        const row = this.grid[ri];
-        let last = this.cols;
-        while (last > 0 && row[last - 1].ch === " ") last--;
-        if (last === 0) continue; // 空行跳过
-        let html = "";
-        let cur = null; // 当前样式段
-        for (let ci = 0; ci < last; ci++) {
-          const cell = row[ci];
-          const style = [];
-          if (cell.bold) style.push("font-weight:bold");
-          if (cell.fg) style.push("color:" + cell.fg);
-          if (cell.bg) style.push("background-color:" + cell.bg);
-          const key = style.join(";");
-          if (key !== cur) {
-            if (cur) html += "</span>";
-            cur = key;
-            if (key) html += '<span style="' + key + '">';
-          }
-          html += esc(cell.ch);
-        }
-        if (cur) html += "</span>";
-        out.push({ row: ri, html });
-      }
-      return out;
-    }
-  }
-
-  // 将 transcript 命令/输出流渲染为连续终端画面（共享一个 TermScreen，保持光标/清屏状态连续），
-  // 命令与输出合并为一块：命令回显（含提示符）+ 输出按真实终端顺序排列，不再分栏
-  function renderTranscript(pairs, showTime) {
-    const screen = new TermScreen(120);
-    const marks = []; // { row, ts, run }：每个命令块起始行
-    let lastEndNL = true; // 上一段文本末尾是否以 \\n 结尾（默认 true，第一段前不需要补）
-    for (const p of pairs) {
-      if (p.type === "cmd") {
-        marks.push({ row: screen.r, ts: p.ts, run: false });
-        continue;
-      }
-      if (p.type === "run") marks.push({ row: screen.r, ts: null, run: true });
-      // 上一段不以 \\n 结尾时补换行，防止命令段间因缺换行拼接在同一网格行
-      if (!lastEndNL && !p.text.startsWith("\\n")) screen.write("\\n");
-      screen.write(p.text);
-      lastEndNL = p.text.endsWith("\\n");
-    }
-    const rows = screen.render();
-    // 按网格行号把标记映射到渲染行（命令块起始 → 该行时间列）
-    const timeByRow = new Map();
-    for (const m of marks) {
-      const hit = rows.find((r) => r.row >= m.row);
-      if (hit && !timeByRow.has(hit.row)) timeByRow.set(hit.row, m);
-    }
-    return rows
-      .map((r) => {
-        const m = timeByRow.get(r.row);
-        const t = m && !m.run && showTime && m.ts ? fmtTime(m.ts) : "";
-        const label = m && m.run ? L.run : "";
-        return '<div class="row"><span class="t">' + t + '</span><span class="c">' + label + r.html + '</span></div>';
-      })
-      .join("");
-  }
-
-  function sessionLabel(s) {
-    // 优先显示会话标题，其次 host@user，最后短 sessionID
-    if (s.title && s.title.trim()) return s.title;
-    const t = s.terminals && s.terminals[0];
-    if (t && t.host) return (t.user ? t.user + "@" : "") + t.host;
-    return s.sessionID.slice(0, 8) + "…";
-  }
-
-  async function loadSessions() {
-    let data;
-    try {
-      const r = await fetch("/api/status");
-      data = await r.json();
-    } catch (e) {
-      return;
-    }
-    const newSessions = data.sessions || [];
-    const sel = document.getElementById("session");
-    // 会话指纹未变化则跳过重建（保留用户选择与焦点）
-    const key = newSessions.map(s => s.sessionID + "|" + s.terminals.length).join(",");
-    if (key === lastSessionsKey) return;
-    lastSessionsKey = key;
-    sessionsData = newSessions;
-    const prev = sel.value;
-    sel.innerHTML = "";
-    for (const s of sessionsData) {
-      const opt = document.createElement("option");
-      opt.value = s.sessionID;
-      opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " ${w("web_terminals")})";
-      sel.appendChild(opt);
-    }
-    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
-    else sel.selectedIndex = sessionsData.length ? 0 : -1;
-    onSessionChange(false);
-  }
-
-  // 剔除失效终端/会话（transcript notFound 时），自动重建下拉框并切到下一个可用项
-  function dropDeadTerminal(sid, name) {
-    const s = sessionsData.find(x => x.sessionID === sid);
-    if (s) {
-      s.terminals = s.terminals.filter(t => (t.name || "default") !== name);
-      if (s.terminals.length === 0) sessionsData = sessionsData.filter(x => x.sessionID !== sid);
-    }
-    lastSessionsKey = "";
-    const sel = document.getElementById("session");
-    const prev = sel.value;
-    sel.innerHTML = "";
-    for (const s2 of sessionsData) {
-      const opt = document.createElement("option");
-      opt.value = s2.sessionID;
-      opt.textContent = sessionLabel(s2) + "  (" + s2.terminals.length + " ${w("web_terminals")})";
-      sel.appendChild(opt);
-    }
-    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
-    else sel.selectedIndex = sessionsData.length ? 0 : -1;
-    onSessionChange(false);
-  }
-
-  function onSessionChange(forceStick) {
-    lastTranscript = "";
-    pendingTop = 0;
-    const sel = document.getElementById("session");
-    const sid = sel.value;
-    const tsel = document.getElementById("terminal");
-    const prev = tsel.value;
-    tsel.innerHTML = "";
-    const s = sessionsData.find(x => x.sessionID === sid);
-    for (const t of (s ? s.terminals : [])) {
-      const opt = document.createElement("option");
-      opt.value = t.name || "default";
-      opt.textContent = (t.name || "default") + (t.kind === "local" ? " [${w("web_local")}]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "");
-      tsel.appendChild(opt);
-    }
-    if (prev && [...tsel.options].some(o => o.value === prev)) tsel.value = prev;
-    else tsel.selectedIndex = tsel.options.length ? 0 : -1;
-    // 仅用户主动切换会话/终端时强制回到底部；自动轮询重建不打扰当前滚动位置
-    if (forceStick) stickToBottom = true;
-    loadTranscript();
-  }
-
-  async function loadTranscript() {
-    const pre = document.getElementById("term");
-    const sel = document.getElementById("session");
-    const tsel = document.getElementById("terminal");
-    const sid = sel.value;
-    const name = tsel.value;
-    if (!sid || !name) { pre.textContent = L.noSession; return; }
-    // 更新前判断是否贴底：用户已向上滚动离开底部则不自动下滚，保持当前位置
-    if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true;
-    const showTime = document.getElementById("showTime").checked;
-    document.body.classList.toggle("show-time", showTime);
-    let data;
-    try {
-      const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name));
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      data = await r.json();
-    } catch (e) {
-      pre.textContent = L.loadFailed;
-      return;
-    }
-    const pairs = data.pairs || [];
-    // 会话已不存在（残留状态文件但记录已清）：提示并自动剔除该终端/会话
-    if (data.notFound) {
-      lastTranscript = "";
-      pendingTop = 0;
-      pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + L.sessionGone + '</span></div>';
-      document.getElementById("meta").textContent = "";
-      dropDeadTerminal(sid, name);
-      return;
-    }
-    // 渲染前旧内容完整高度 = 新消息顶部位置（旧内容不变时高度稳定）
-    const prevHeight = pre.scrollHeight;
-    // 内容是否有新变化（有新消息才显示悬浮按钮）
-    const sig = JSON.stringify(pairs);
-    const changed = sig !== lastTranscript;
-    lastTranscript = sig;
-    // 命令/输出合并为连续终端画面：共享 TermScreen 保持状态连续，时间戳标在命令块首行
-    pre.innerHTML = renderTranscript(pairs, showTime);
-    const cmdCount = pairs.filter((p) => p.type === "cmd").length;
-    document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " " + L.commands + " · " + L.autoRefresh;
-    if (stickToBottom) {
-      pre.scrollTop = pre.scrollHeight;
-      toBottomBtn.style.display = "none";
-    } else if (pendingTop > 0) {
-      // 离开底部且有未读新消息 → 显示悬浮按钮（pendingTop 为跳转位置）
-      toBottomBtn.style.display = "block";
-    }
-    // 无论贴底与否，有内容变化都记录新消息顶部（供用户滚上去后跳转）
-    if (changed && pre.scrollHeight > pre.clientHeight) {
-      pendingTop = prevHeight;
-      if (stickToBottom) {
-        // 贴底跟随 = 已读到最新，清除未读标记（用户滚上去才重新提示）
-        pendingTop = 0;
-      }
-    }
-  }
-
-  // 时间戳格式化 yyyy-MM-dd HH:mm:ss
-  function fmtTime(ts) {
-    const d = new Date(ts);
-    const p = (n) => String(n).padStart(2, "0");
-    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
-  }
-
-  // 时间开关：localStorage 持久化，刷新页面保持状态
-  function onShowTimeChange() {
-    const el = document.getElementById("showTime");
-    localStorage.setItem("showTime", el.checked ? "1" : "0");
-    document.body.classList.toggle("show-time", el.checked);
-    loadTranscript();
-  }
-  document.getElementById("showTime").checked = localStorage.getItem("showTime") === "1";
-  document.body.classList.toggle("show-time", document.getElementById("showTime").checked);
-
-  // 用户滚动：贴底 → 恢复跟随并隐藏按钮；离开底部 → 取消自动贴底
-  const termPre = document.getElementById("term");
-  const toBottomBtn = document.getElementById("toBottom");
-  termPre.addEventListener("scroll", () => {
-    if (termPre.scrollTop + termPre.clientHeight >= termPre.scrollHeight - 30) {
-      stickToBottom = true;
-      toBottomBtn.style.display = "none";
-      pendingTop = 0; // 贴底 = 已读到最新，清除未读标记
-    } else {
-      stickToBottom = false;
-    }
-  });
-  // 点击悬浮按钮：滚动到新消息顶部（阅读未读内容），不强制回到底部
-  function scrollToNewest() {
-    termPre.scrollTop = pendingTop > 0 ? pendingTop : termPre.scrollHeight;
-    pendingTop = 0;
-    toBottomBtn.style.display = "none";
-  }
-
-  loadSessions();
-  setInterval(loadTranscript, 2000);
-  setInterval(loadSessions, 5000);
-</script>
-</body>
-</html>`
 }
