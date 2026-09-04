@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net"
 import type { SshSession } from "./session.js"
 import { listAllSessions } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
+import { PTY_COLS } from "./constants.js"
 
 /** 服务实例信息 */
 export interface ServerHandle {
@@ -186,6 +187,8 @@ function renderPage(lang: Lang, template: string): string {
     i18nObj[jsKey] = tr(i18nKey, lang)
   }
   out = out.replaceAll("__I18N_JSON__", JSON.stringify(i18nObj))
+  // PTY 列宽注入（前端 TermScreen 按此列宽渲染，与后端生成 ANSI 的列宽一致，避免错行）
+  out = out.replaceAll("__PTY_COLS__", String(PTY_COLS))
   return out
 }
 

@@ -23,9 +23,9 @@ export const ANIMATION_WINDOW_MS = 5_000
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 
-/** PTY 窗口尺寸（大窗口减少分页） */
+/** PTY 窗口尺寸（常规终端宽度，与 web 渲染列宽一致，避免 zsh zle 按超宽列布局导致错行） */
 export const PTY_ROWS = 200
-export const PTY_COLS = 500
+export const PTY_COLS = 120
 
 /** 单次工具返回输出上限（字节） */
 export const MAX_OUTPUT_LEN = 50_000

@@ -43,6 +43,7 @@ interface GridCell {
 }
 
 const I18N: I18n = (window as unknown as { __I18N__: I18n }).__I18N__
+const PTY_COLS: number = (window as unknown as { __PTY_COLS__: number }).__PTY_COLS__ || 120
 
 const ANSI_BASE = ["#010101", "#de382b", "#39b54a", "#ffc005", "#006fb8", "#762671", "#2cb3e9", "#c9d1d9"]
 const ANSI_BRIGHT = ["#666666", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#f0f6fc"]
@@ -222,7 +223,7 @@ interface Mark {
 }
 
 function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
-  const screen = new TermScreen(120)
+  const screen = new TermScreen(PTY_COLS)
   const marks: Mark[] = []
   let lastEndNL = true
   for (const p of pairs) {
