@@ -122,6 +122,17 @@ export class SessionHistory {
   }
 
   /**
+   * 清空历史记录：删除所有文件 + 重置内存
+   */
+  clear(): void {
+    for (const p of this.pairs) {
+      try { rmSync(p.file, { force: true }) } catch { /* 忽略 */ }
+    }
+    this.pairs = []
+    this.nextSeq = 1
+  }
+
+  /**
    * 会话关闭：删除整个会话目录（含所有消息文件）
    */
   dispose(): void {

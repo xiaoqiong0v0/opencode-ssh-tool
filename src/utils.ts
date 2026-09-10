@@ -1,45 +1,32 @@
-// 工具函数：哨兵生成、注入剔除、模型文本清理、ANSI 清洗、CR 覆盖合并、提示符剥离
+// 工具函数：命令回显定位、模型文本清理、ANSI 清洗、CR 覆盖合并、完成标记剥离
 
-import { randomBytes } from "node:crypto"
+import { stripMarkers } from "./shell-adapter.js"
 
-/** 单个 ANSI 序列片段（CSI 光标/颜色控制，如 ESC[?2004h） */
-const ANSI_CHUNK = "\\x1b\\[[0-9;?]*[a-zA-Z]"
-/** ANSI 或普通空白（制表/空格）构成的间隙，可插在任意两个字符/词之间（不跨换行） */
-const GAP = `(?:(?:${ANSI_CHUNK})|[ \\t])*`
 /** 正则转义文本 */
 const escRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-/** 把字符串每个字符转义后，字符间用 GAP 串起来（容忍 bash 回显时在字符间隙插入 ANSI 序列） */
-const interleave = (s: string): string => [...s].map(escRe).join(GAP)
+
+/** 命令回显匹配的宽松字符间隙（ANSI 序列或普通空白/换行，可插在命令字符之间；容忍终端列宽自动换行） */
+const ECHO_WIDE = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[^\\x1b]|[ \\t\\r\\n])*"
 
 /**
- * 生成命令完成哨兵标记（随机后缀防撞词）
- * @returns 哨兵字符串
+ * 定位命令回显行在原始流中的结束位置（供流式增量定位使用）：
+ * 丢弃窗口开头到"命令回显行结束"之前的一切内容（提示符、PS1 填充、光标定位噪音均在内）。
+ * 命令回显行 = 命令文本首次出现所在行（命令本身可能含 \033 等转义）。
+ * @param raw 原始终端流（含 ANSI）
+ * @param command 本次执行的命令文本
+ * @returns 命令回显结束后的字节偏移；未命中命令文本返回 0（此时应视作输出尚未开始）
  */
-export function genSentinel(): string {
-  return `__SSH_DONE_${randomBytes(6).toString("hex")}__`
-}
-
-/**
- * 从命令捕获窗口原始字节流中剔除我们注入的哨兵痕迹（其余内容逐字节保真）：
- * 1. 命令回显行末尾拼接的 `; echo SENTINEL` 片段（保留原命令本体，如 `cmd; echo SENTINEL` → `cmd`）
- * 2. 若整行恰为哨兵本体（`echo SENTINEL` 的执行输出），整行删除
- * 不 trim、不删空行、不折叠换行、不动 ANSI —— 存储层/渲染层拿到的是接近真实终端屏幕的字节流，
- * 由 web 端 TermScreen 忠实渲染，由 toModelText() 在给模型时再做清理。
- * @param raw 捕获窗口原始输出（含哨兵）
- * @param sentinel 本次注入的哨兵串
- * @returns 剔除注入痕迹后的原始字节流（哨兵处可能残留空行，属正常）
- */
-export function stripSentinel(raw: string, sentinel: string): string {
-  // 命令回显尾部片段：旧 `; echo <哨兵>` 与新 `; printf '\n<哨兵>\n'` 两种注入格式，
-  // 分号、命令词内/词间、哨兵字符间隙均可插 ANSI 或空白
-  const TAIL_ECHO = new RegExp(`;${GAP}${interleave("echo")}${GAP}${interleave(sentinel)}${GAP}`, "g")
-  const TAIL_PRINTF = new RegExp(
-    `;${GAP}${interleave("printf")}${GAP}${interleave("'")}${GAP}(?:${interleave("\\n")})?${GAP}${interleave(sentinel)}${GAP}(?:${interleave("\\n")})?${GAP}${interleave("'")}`,
-    "g",
-  )
-  // 哨兵独立成行：行首（或换行后）→ 哨兵 → 行尾换行，整行连同其换行删除（保留前置换行，避免行粘连）
-  const STANDALONE = new RegExp(`(^|[\\r\\n])${GAP}${interleave(sentinel)}${GAP}\\r?\\n`, "gm")
-  return raw.replace(TAIL_ECHO, "").replace(TAIL_PRINTF, "").replace(STANDALONE, (_m, lead: string) => lead)
+export function extractOutputStart(raw: string, command: string): number {
+  const cmd = command.trim()
+  if (!cmd) return 0
+  // 单条宽松正则一次性匹配命令回显（命令文本 + 字符间 ANSI 间隙）：
+  // 1) 字符间容忍 ANSI 间隙（WIDE）2) 命令字面 \033 回显可能变真实 ESC（二选一）
+  const norm = cmd.replace(/\\033/gi, "\x1b")
+  const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
+  const re = new RegExp(frags.join(ECHO_WIDE), "g")
+  const m = re.exec(raw)
+  if (!m) return 0
+  return m.index + m[0].length
 }
 
 /**
@@ -47,26 +34,14 @@ export function stripSentinel(raw: string, sentinel: string): string {
  * shell 提示符（含背景填充、zle 重绘序列）依赖其自身终端屏幕状态，字节流脱离该状态无法忠实还原，
  * 故丢弃窗口开头到"命令回显行结束"之前的一切内容（提示符、PS1 填充、光标定位噪音均在内）。
  * 命令回显行 = 命令文本首次出现所在行（命令本身可能含 \033 等转义）。
- * 三阶段定位：精确文本 → WIDE 正则（容忍 ANSI 间隙）→ 规范化（\033→ESC 后剥离 ANSI 匹配）。
- * @param raw 已剔除哨兵注入的原始字节流（stripSentinel 输出，哨兵行已删）
+ * 命中后切到"命令文本结束处"：zsh 下程序输出可能直接粘连在回显尾（无换行），不能按换行截断。
+ * @param raw 原始终端流（含 ANSI）
  * @param command 本次执行的命令文本
  * @returns 纯程序输出原始流（保留程序自身的 ANSI 颜色/进度条，供 web TermScreen 与模型 toModelText）
  */
 export function extractOutput(raw: string, command: string): string {
-  const cmd = command.trim()
-  if (!cmd) return raw
-
-  // 单条宽松正则一次性匹配命令回显（命令文本 + 字符间 ANSI 间隙）：
-  // 1) 字符间容忍 ANSI 间隙（WIDE）2) 命令字面 \033 回显可能变真实 ESC（二选一）
-  // 命中后切到"命令文本结束处"：zsh 下程序输出可能直接粘连在回显尾（无换行），不能按换行截断
-  const WIDE = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[^\\x1b]|[ \\t])*"
-  const escRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const norm = cmd.replace(/\\033/gi, "\x1b")
-  const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
-  const re = new RegExp(frags.join(WIDE), "g")
-  const m = re.exec(raw)
-  if (!m) return raw
-  const end = m.index + m[0].length
+  const end = extractOutputStart(raw, command)
+  if (end <= 0) return raw
   return raw.slice(end).replace(/^[\r\n]+/, "")
 }
 
@@ -74,15 +49,12 @@ export function extractOutput(raw: string, command: string): string {
  * 把原始终端流转为给模型看的干净文本：模拟终端屏幕（处理光标移动/清行/覆盖/退格/SGR/OSC），
  * 输出最终屏幕各行文本，再逐行去尾空白并剔除空行。比纯文本正则更鲁棒地处理 PSReadLine
  * 行内重绘、进度条 \r 覆盖等场景。
- * @param raw 已剔除哨兵的原始字节流（stripSentinel 输出）
+ * @param raw 原始终端流（含 ANSI）
  * @returns 纯文本输出（供模型消费 / exec 返回值 / read 命令）
  */
 export function toModelText(raw: string): string {
-  const screen = simulateScreen(raw)
-  // 移除残留哨兵注入痕迹（PSReadLine 光标重绘后可能残留在未覆盖区域）：
-  // `; echo __SSH_DONE_xxx` 或裸 `__SSH_DONE_xxx` 一并清除
-  const noSentinel = screen.replace(/(?:;\s*echo\s+)?__SSH_DONE_[0-9a-f]*/gi, "")
-  return noSentinel
+  const screen = simulateScreen(stripMarkers(raw))
+  return screen
     .split(/\r?\n/)
     .map((l) => l.replace(/\r/g, "").trimEnd())
     .filter((l) => l !== "")
@@ -207,14 +179,12 @@ function simulateScreen(s: string): string {
 }
 
 /**
- * 剥离尾部 shell 提示符残留（如 "5cb08b77db01:~$ "、"user@host:~/dir$ "、"root@server:/etc#"）
- * @param s 清洗后文本
- * @returns 剥离尾部提示符后的文本
+ * 末尾空白清理（原为提示符剥离，现仅做清理，不依赖正则匹配具体提示符形状）
+ * @param s 文本
+ * @returns 清理后文本
  */
 export function stripPrompt(s: string): string {
-  return s
-    .replace(/(?:^|[\r\n])\s*(?:[\w.-]+@)?[\w.-]+:[^\r\n]*[$#%] ?(?=[\r\n]|$)/g, "")
-    .trim()
+  return s.trimEnd()
 }
 
 /**

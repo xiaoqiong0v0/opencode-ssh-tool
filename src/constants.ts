@@ -23,12 +23,21 @@ export const ANIMATION_WINDOW_MS = 5_000
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 
+/** 注入生效等待超时：shell 执行注入命令并重绘提示符（输出首个标记）的最长等待 */
+export const SETTLE_TIMEOUT_MS = 3_000
+
+/** 注入总超时（含重试）：超过此时长仍无首个标记则断连报错 */
+export const INJECT_TIMEOUT_MS = 30_000
+
 /** PTY 窗口尺寸（常规终端尺寸，避免 zsh 按超大缓冲重绘导致提示符/回显错位） */
 export const PTY_ROWS = 40
 export const PTY_COLS = 120
 
 /** 单次工具返回输出上限（字节） */
 export const MAX_OUTPUT_LEN = 50_000
+
+/** 会话连续原始字节流上限（超过裁剪最旧部分） */
+export const RAW_LOG_MAX = 1_048_576
 
 /** 工具描述语言环境变量（en | zh，默认 en） */
 export const LANG_ENV = "SSH_TOOL_LANG"

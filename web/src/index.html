@@ -10,7 +10,9 @@
   <h1>{{web_title}}</h1>
   <select id="session" onchange="onSessionChange(true)"></select>
   <select id="terminal" onchange="onSessionChange(true)"></select>
+  <button id="delTerm" class="del-btn" onclick="deleteTerminal()" title="{{web_delete_terminal}}">×</button>
   <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> {{web_time}}</label>
+  <label class="tgl"><input type="checkbox" id="debugMode" onchange="onDebugModeChange()"> Raw</label>
   <span id="meta"></span>
 </header>
 <pre id="term">{{web_loading}}</pre>

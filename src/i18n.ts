@@ -186,9 +186,9 @@ Examples:
     en: "Invalid terminal name. Use letters, digits, underscore, hyphen or dot (max 64 chars), no path separators.",
     zh: "终端名非法。仅允许字母、数字、下划线、中划线、点（最多 64 字符），不得含路径分隔符。",
   },
-  no_sessions: {
-    en: "No active SSH sessions.",
-    zh: "当前没有活动的 SSH 会话。",
+no_sessions: {
+    en: "No active terminals.",
+    zh: "当前没有活动的终端会话。",
   },
   connect_ok: {
     en: "Connected: {user}@{host}:{port} (session {sid}, terminal {name})",
@@ -207,8 +207,8 @@ Examples:
     zh: "执行失败",
   },
   session_disconnected: {
-    en: "SSH session disconnected",
-    zh: "SSH 会话已断开",
+    en: "Terminal disconnected",
+    zh: "终端已断开",
   },
   status_busy_hint: {
     en: "\nHint: a command is still running. Wait and retry, or call term_cli read for partial output.",
@@ -226,13 +226,13 @@ Examples:
     en: "\n(HTTP server not enabled)",
     zh: "\n（HTTP 服务未启用）",
   },
-  history_title: {
-    en: "SSH history (last {n} / total {total})",
-    zh: "SSH 历史（最后 {n} 条 / 共 {total} 条）",
+history_title: {
+    en: "Terminal history (last {n} / total {total})",
+    zh: "终端历史（最后 {n} 条 / 共 {total} 条）",
   },
   history_title_head: {
-    en: "SSH history (first {n} / total {total})",
-    zh: "SSH 历史（前 {n} 条 / 共 {total} 条）",
+    en: "Terminal history (first {n} / total {total})",
+    zh: "终端历史（前 {n} 条 / 共 {total} 条）",
   },
   web_title: { en: "Terminal Records", zh: "终端记录" },
   web_loading: { en: "Loading...", zh: "加载中..." },
@@ -243,16 +243,17 @@ Examples:
   web_local: { en: "local", zh: "本地" },
   web_commands: { en: "commands", zh: "条命令" },
   web_auto_refresh: { en: "auto-refresh every 2s", zh: "每 2s 自动刷新" },
-  web_no_session: { en: "No session. Use term_cli connect first.", zh: "无会话，请先用 term_cli connect 建立连接。" },
+  web_no_session: { en: "No terminal. Use term_cli connect (SSH) or term_cli local first.", zh: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。" },
   web_running: { en: "[running] ", zh: "[运行中] " },
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
-  disconnected_ok: {
-    en: "SSH connection closed ({host}).",
-    zh: "SSH 连接已断开（{host}）。",
+  web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
+disconnected_ok: {
+    en: "Terminal closed ({host}).",
+    zh: "终端已断开（{host}）。",
   },
   disconnected_all_ok: {
-    en: "All SSH terminals closed (last host {host}).",
-    zh: "已断开全部 SSH 终端（最后主机 {host}）。",
+    en: "All terminals closed (last host {host}).",
+    zh: "已断开全部终端（最后主机 {host}）。",
   },
   err_not_connected: {
     en: "Not connected",

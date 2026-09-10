@@ -1,21 +1,25 @@
-// SshSession：ssh2 长驻连接 + PTY shell 管理，提供哨兵法命令执行与状态查询
+// SshSession：ssh2 长驻连接 + PTY shell 管理，
+// OSC 不可见标记法：注入 PROMPT_COMMAND 脚本，命令完成时输出 \x1b]777;SSH;D;退出码\x07
+// 子终端中无标记 → 视为仍在运行，子终端输入输出归入上一条命令
 
 import { Client, type ConnectConfig } from "ssh2"
-import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
+import log from "./log.js"
 import {
   ANIMATION_WINDOW_MS,
   EXEC_TIMEOUT_MS,
+  INJECT_TIMEOUT_MS,
   MAX_OUTPUT_LEN,
   PTY_COLS,
   PTY_ROWS,
   QUIET_WINDOW_MS,
+  RAW_LOG_MAX,
   READY_TIMEOUT_MS,
+  SETTLE_TIMEOUT_MS,
 } from "./constants.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import { SessionHistory } from "./history.js"
-import { extractOutput, genSentinel, stripPrompt, stripSentinel, toModelText } from "./utils.js"
-
-const log = createLogger("opencode-ssh-tool", { enabled: true })
+import { toModelText, extractOutputStart, extractOutput } from "./utils.js"
+import { detectDoneMarker, resolveByProbe, stripMarkers, type ShellAdapter } from "./shell-adapter.js"
 
 /** 连接结果 */
 export interface ConnectResult {
@@ -33,7 +37,6 @@ export interface ExecResult {
   interactive?: boolean
   running?: boolean
   timeout?: boolean
-  /** 异步提交成功（命令后台执行中） */
   submitted?: boolean
   error?: string
   host?: string
@@ -61,8 +64,11 @@ const INTERACTIVE_RE =
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
 
-/** 后台哨兵监听最长存活时间（防泄漏） */
+/** 后台监听最长存活时间（防泄漏） */
 const MAX_WATCH_LEN = 10 * 60_000
+
+/** Shell 探测等待超时 */
+const PROBE_TIMEOUT_MS = 5_000
 
 export class SshSession {
   private _client: Client | null = null
@@ -76,13 +82,19 @@ export class SshSession {
   private _connectedAt = 0
   private _lastActive = 0
   private _runningStartPos: number | null = null
-  private _runningSentinel = ""
   private _runningCommand = ""
   private _watchTimer: ReturnType<typeof setInterval> | null = null
-  /** 下次捕获窗口起点（相对当前 buffer）：前一条命令结束后，shell 新打印的提示符/残留从此处开始 */
   private _cursor = 0
+  private _streamPos: number | null = null
   private _closed = false
   private readonly _history: SessionHistory
+  private _adapter: ShellAdapter | null = null
+  /** 连续原始字节流（从 PTY 首字节起累积，含欢迎页/探测/注入/提示符/marker）；ring 裁剪 */
+  private _rawLog = ""
+  /** 已裁剪丢弃的字符数（前端 pos 同步用） */
+  private _rawDiscarded = 0
+  /** 累积原始字节总数（单调递增，前端增量游标） */
+  private _rawTotal = 0
 
   constructor(
     private readonly sessionID: string,
@@ -93,13 +105,12 @@ export class SshSession {
   }
 
   /**
-   * 建立 SSH 连接并打开 PTY shell
+   * 建立 SSH 连接并打开 PTY shell，探测 shell 类型后注入 OSC 标记脚本
    * @param opts 连接参数；显式传 password 时优先用密码认证，否则回退 resolveAuth（私钥/agent/环境变量）
    * @returns 连接结果
    */
   async connect(opts: { host: string; user: string; port?: number; password?: string }): Promise<ConnectResult> {
     const port = opts.port ?? 22
-    // 显式密码（支持 file: 路径读取）> resolveAuth（私钥/agent/环境变量密码）
     let auth: AuthInfo
     if (opts.password) {
       const pw = resolvePassword(opts.password)
@@ -127,7 +138,22 @@ export class SshSession {
         resolve({ ok: false, host: opts.host, user: opts.user, port, error: msg })
       }
 
-      client.once("error", (err: Error) => fail(err.message))
+      // 常驻错误监听：ssh2 可能多次发 error（断线/通道异常），once 首次触发后失效会变 unhandled
+      client.on("error", (err: Error) => {
+        if (!settled) {
+          fail(err.message)
+          return
+        }
+        log.error(`SSH 会话错误 ${opts.host}`, err)
+        // 连接已建立后的错误：标记断开并清理运行态，避免悬空
+        this._connected = false
+        this._remoteBusy = false
+        this._clearRunningContext()
+        if (this._watchTimer) {
+          clearInterval(this._watchTimer)
+          this._watchTimer = null
+        }
+      })
 
       client.once("ready", () => {
         client.shell(
@@ -135,8 +161,8 @@ export class SshSession {
           (err: Error | undefined, stream) => {
             if (err || !stream) {
               client.end()
-      fail(err?.message ?? "shell open failed")
-      return
+              fail(err?.message ?? "shell open failed")
+              return
             }
             settled = true
             this._client = client
@@ -149,8 +175,7 @@ export class SshSession {
             this._lastActive = Date.now()
 
             stream.on("data", (chunk: Buffer) => {
-              const text = chunk.toString()
-              this._appendBuffer(text)
+              this._appendBuffer(chunk.toString())
             })
             stream.on("close", () => {
               this._connected = false
@@ -161,14 +186,42 @@ export class SshSession {
               this._connected = false
             })
 
-            // 等待登录 banner / 初始提示符输出稳定后清空 buffer（不算业务输出）
-;(async () => {
+            // 等待登录 banner / 初始提示符稳定后探测 shell 并注入脚本
+            ;(async () => {
               await new Promise((r) => setTimeout(r, 400))
               this._buffer = ""
               this._cursor = 0
               this._runningStartPos = null
-              this._runningSentinel = ""
               log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID})`)
+
+              // 已有历史则清空重来（重连视为全新开始）
+              if (this._history.totalPairs() > 0) {
+                this._history.clear()
+              }
+
+              // 总时限：shell 从启动到完成标记注入确认，超时判定连接失败
+              const deadline = Date.now() + INJECT_TIMEOUT_MS
+
+              const adapter = await this._probeShell(deadline)
+              if (!adapter) {
+                log.error(`Shell 探测超时，终止连接 ${opts.user}@${opts.host}`)
+                this.close()
+                resolve({ ok: false, host: opts.user, user: opts.user, port, error: "Shell 探测超时（30s 内 shell 未就绪），连接终止" })
+                return
+              }
+              this._adapter = adapter
+              log.info(`Shell 探测结果: ${this._adapter.name}`)
+
+              const injected = await this._injectAndSettle(deadline)
+              if (!injected) {
+                log.error(`标记注入超时终止连接 ${opts.user}@${opts.host}`)
+                this.close()
+                resolve({ ok: false, host: opts.user, user: opts.user, port, error: "完成标记注入超时（shell 未就绪或启动过慢），连接终止" })
+                return
+              }
+              this._buffer = ""
+              this._cursor = 0
+
               resolve({ ok: true, host: opts.user, user: opts.user, port })
             })()
           },
@@ -179,161 +232,156 @@ export class SshSession {
     })
   }
 
-  /**
-   * 异步提交命令：立即返回，命令后台执行，输出由后台监听收集进 history
-   * @param command 命令
-   * @returns 提交结果（立即返回，不等待命令完成）
-   */
-  async submit(command: string): Promise<ExecResult> {
-    const startTs = Date.now()
-    if (!this._connected || !this._stream) {
-      return { ok: false, output: "", error: "Not connected" }
+  /** 探测 shell 类型：deadline 内循环发送探测命令并解析输出（shell 慢启动时也能等到就绪） */
+  private async _probeShell(deadline: number): Promise<ShellAdapter | null> {
+    while (Date.now() < deadline) {
+      this._stream!.write("echo __SHELL_ID__$0\r")
+      const output = await this._waitProbeOutput(Math.min(PROBE_TIMEOUT_MS, deadline - Date.now()))
+      if (output !== null && /\b__SHELL_ID__\b/.test(output)) {
+        const adapter = resolveByProbe(output)
+        this._buffer = ""
+        return adapter
+      }
+      this._buffer = ""
     }
-    if (this._remoteBusy) {
-      return { ok: false, output: "", error: "Previous command still running, poll with ssh_status first" }
-    }
+    return null
+  }
 
-    const sentinel = genSentinel()
-    const combo = `${command}; printf '\\n${sentinel}\\n'`
-    // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
-    this._buffer = this._buffer.slice(this._cursor)
-    const startPos = 0
-    this._runningStartPos = startPos
-    this._runningSentinel = sentinel
-    this._runningCommand = command
-    this._remoteBusy = true
-    this._lastActive = startTs
-    this._stream.write(combo + "\r")
-    this._startBackgroundWatch(sentinel, startPos, command)
-
-    return {
-      ok: true,
-      output: "",
-      submitted: true,
-      host: this._host,
-      command,
-      duration: 0,
+  /** 等待探测输出稳定：buffer 有内容且 500ms 不再变化则返回，超时返回 null */
+  private async _waitProbeOutput(maxMs: number): Promise<string | null> {
+    const start = Date.now()
+    let lastLen = this._buffer.length
+    let lastChange = Date.now()
+    while (Date.now() - start < maxMs) {
+      if (this._buffer.length > 0 && Date.now() - lastChange >= 500) return this._buffer
+      if (this._buffer.length !== lastLen) {
+        lastLen = this._buffer.length
+        lastChange = Date.now()
+      }
+      await new Promise((r) => setTimeout(r, 50))
     }
+    return this._buffer.length > 0 ? this._buffer : null
   }
 
   /**
-   * 在当前会话执行命令（哨兵法，同步等待），保留 cwd/环境
-   * @param command 命令
-   * @param timeout 超时毫秒，默认 30s
-   * @returns 执行结果
+   * deadline 内循环注入+等待完成标记，成功返回 true，超时返回 false
+   * 逐行发送避免因 shell 未就绪导致的整块丢失；每轮等待标记最大 3s
    */
-  async exec(command: string, timeout: number = EXEC_TIMEOUT_MS): Promise<ExecResult> {
+  private async _injectAndSettle(deadline: number): Promise<boolean> {
+    const lines = this._adapter!.injectScript.split("\n")
+    while (Date.now() < deadline) {
+      for (const line of lines) {
+        if (line.trim()) this._stream!.write(line + "\r")
+      }
+      if (await this._waitForMarker(Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) return true
+      log.info("完成标记注入未确认，重试")
+      this._buffer = ""
+      this._cursor = 0
+    }
+    return false
+  }
+
+  /** 等待标记出现（最多 maxMs） */
+  private async _waitForMarker(maxMs: number): Promise<boolean> {
+    const start = Date.now()
+    while (Date.now() - start < maxMs) {
+      if (detectDoneMarker(this._buffer, 0).done) return true
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    return false
+  }
+
+  async submit(command: string): Promise<ExecResult> {
     const startTs = Date.now()
-    if (!this._connected || !this._stream) {
+    if (!this._connected || !this._stream || !this._adapter) {
       return { ok: false, output: "", error: "Not connected" }
     }
     if (this._remoteBusy) {
       return { ok: false, output: "", error: "Previous command still running, poll with ssh_status first" }
     }
 
-    const sentinel = genSentinel()
-    const combo = `${command}; printf '\\n${sentinel}\\n'`
-    // 从上一命令结束点（_cursor）起保留：PS1 与即将到来的本命令输出
     this._buffer = this._buffer.slice(this._cursor)
     const startPos = 0
+    this._runningStartPos = startPos
+    this._runningCommand = command
     this._remoteBusy = true
     this._lastActive = startTs
-    this._stream.write(combo + "\r")
+    this._stream.write(command + "\r")
+    this._startBackgroundWatch(startPos, command)
 
-    const outcome = await this._waitSentinel(sentinel, startPos, timeout, startTs)
+    return { ok: true, output: "", submitted: true, host: this._host, command, duration: 0 }
+  }
+
+  async exec(command: string, timeout: number = EXEC_TIMEOUT_MS): Promise<ExecResult> {
+    const startTs = Date.now()
+    if (!this._connected || !this._stream || !this._adapter) {
+      return { ok: false, output: "", error: "Not connected" }
+    }
+    if (this._remoteBusy) {
+      return { ok: false, output: "", error: "Previous command still running, poll with ssh_status first" }
+    }
+
+    this._buffer = this._buffer.slice(this._cursor)
+    const startPos = 0
+    this._runningCommand = command
+    this._remoteBusy = true
+    this._lastActive = startTs
+    this._stream.write(command + "\r")
+
+    const outcome = await this._waitCompletion(startPos, timeout, startTs)
 
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos, outcome.idx), sentinel), command)
-        // 不裁 buffer：shell 随后打印的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
-        this._cursor = Math.max(startPos, outcome.afterNewline ?? 0)
-        this._history.append(command, raw)
-        return {
-          ok: true,
-          output: this._truncate(toModelText(raw)),
-          host: this._host,
-          command,
-          duration: Date.now() - startTs,
-        }
+        const raw = this._buffer.slice(startPos, outcome.markerPos ?? this._buffer.length)
+        this._cursor = Math.max(startPos, outcome.markerPos ?? this._buffer.length)
+        this._history.append(command, extractOutput(raw, command))
+        this._clearRunningContext()
+        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), host: this._host, command, duration: Date.now() - startTs }
       }
       case "interactive": {
         this._remoteBusy = false
-        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos), sentinel), command)
+        const raw = this._buffer.slice(startPos)
         this._cursor = this._buffer.length
         this._history.append(command, raw)
-        return {
-          ok: true,
-          output: this._truncate(toModelText(raw)),
-          interactive: true,
-          host: this._host,
-          command,
-          duration: Date.now() - startTs,
-        }
+        this._clearRunningContext()
+        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, host: this._host, command, duration: Date.now() - startTs }
       }
       case "running":
       case "timeout": {
         this._runningStartPos = startPos
-        this._runningSentinel = sentinel
-        this._runningCommand = command
         this._remoteBusy = true
-        this._startBackgroundWatch(sentinel, startPos, command)
-        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos), sentinel), command)
-        // running/timeout 不写入 history（后台 watch 在哨兵到达后统一写入，避免重复）
-        return {
-          ok: true,
-          output: this._truncate(toModelText(raw)),
-          running: outcome.kind === "running",
-          timeout: outcome.kind === "timeout",
-          host: this._host,
-          command,
-          duration: Date.now() - startTs,
-        }
+        this._startBackgroundWatch(startPos, command)
+        const raw = this._buffer.slice(startPos)
+        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), running: outcome.kind === "running", timeout: outcome.kind === "timeout", host: this._host, command, duration: Date.now() - startTs }
       }
     }
   }
 
-  /**
-   * 读取并清空未消费缓冲（交互/轮询场景）
-   * @returns 未消费输出
-   */
   async readBuffer(): Promise<{ ok: boolean; output: string; error?: string }> {
-    if (!this._connected) {
-      return { ok: false, output: "", error: "Not connected" }
-    }
+    if (!this._connected) return { ok: false, output: "", error: "Not connected" }
     let out: string
-
     if (this._runningStartPos !== null) {
-      // 有后台运行上下文：输出从运行起点取到哨兵为止
-      const idx = this._findSentinel(this._runningSentinel, this._runningStartPos)
-      if (idx >= 0) {
-        const raw = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos, idx), this._runningSentinel), this._runningCommand)
-        this._buffer = this._buffer.slice(idx)
+      const marker = detectDoneMarker(this._buffer, this._runningStartPos)
+      if (marker.done) {
+        const raw = this._buffer.slice(this._runningStartPos, marker.pos)
+        this._buffer = this._buffer.slice(marker.pos)
         this._cursor = 0
         this._clearRunningContext()
         out = raw
       } else {
-        out = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel), this._runningCommand)
+        out = this._buffer.slice(this._runningStartPos)
       }
     } else {
       out = this._buffer
       this._buffer = ""
       this._cursor = 0
     }
-
-    return { ok: true, output: this._truncate(stripPrompt(toModelText(out))) }
+    return { ok: true, output: this._truncate(toModelText(out)) }
   }
 
-  /**
-   * 发送文本/按键到远程 shell（交互场景：sudo 密码、确认、中断等）
-   * 转义序列：\r 或 \n = 回车，\x03 = Ctrl-C，\x04 = Ctrl-D，\x1a = Ctrl-Z，\x1b = ESC，其余按字面发送
-   * @param text 要发送的文本或按键序列
-   * @returns 是否发送成功（未连接返回 false + 错误）
-   */
   send(text: string): { ok: boolean; error?: string } {
-    if (!this._connected || !this._stream) {
-      return { ok: false, error: "Not connected" }
-    }
+    if (!this._connected || !this._stream) return { ok: false, error: "Not connected" }
     const payload = text
       .replace(/\\x1b/gi, "\x1b")
       .replace(/\\x03/gi, "\x03")
@@ -346,10 +394,6 @@ export class SshSession {
     return { ok: true }
   }
 
-  /**
-   * 获取会话状态（供 ssh_status）
-   * @returns 状态对象
-   */
   getStatus(): SessionStatus {
     return {
       connected: this._connected,
@@ -364,92 +408,87 @@ export class SshSession {
     }
   }
 
-  /**
-   * 获取会话消息对记录（供 ssh_terminal / HTTP 页面渲染）
-   * @returns 消息对存储
-   */
-  getHistory(): SessionHistory {
-    return this._history
-  }
+  getHistory(): SessionHistory { return this._history }
 
-  /**
-   * 获取当前运行中命令的实时缓冲（合并覆盖后，不消费 buffer，保留 ANSI 供 web 着色）
-   * @returns 运行中命令的当前进度文本；无运行命令则返回空串
-   */
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
-    const raw = extractOutput(stripSentinel(this._buffer.slice(this._runningStartPos), this._runningSentinel), this._runningCommand)
-    return raw.trim()
+    return this._buffer.slice(this._runningStartPos)
   }
 
-  /**
-   * 关闭连接，清理会话态（幂等）
-   */
+  getRunningCommand(): string {
+    return this._runningStartPos !== null && this._connected ? this._runningCommand : ""
+  }
+
+  hasRunningStream(): boolean {
+    return this._runningStartPos !== null && this._connected && this._runningCommand !== ""
+  }
+
+  getRunningStream(): { data: string; done: boolean } {
+    if (this._runningStartPos === null || !this._connected || !this._runningCommand) {
+      this._streamPos = null
+      return { data: "", done: false }
+    }
+    const marker = detectDoneMarker(this._buffer, this._runningStartPos)
+    const windowEnd = marker.done ? marker.pos : this._buffer.length
+    if (this._streamPos === null) {
+      const start = extractOutputStart(this._buffer.slice(this._runningStartPos, windowEnd), this._runningCommand)
+      if (start <= 0) return { data: "", done: false }
+      this._streamPos = this._runningStartPos + start
+    }
+    const raw = this._buffer.slice(this._streamPos, windowEnd)
+    this._streamPos = windowEnd
+    return { data: stripMarkers(raw), done: marker.done }
+  }
+
   close(): void {
     if (this._closed) return
     this._closed = true
     if (this._watchTimer) clearInterval(this._watchTimer)
-    if (this._stream) {
-      try {
-        this._stream.end()
-      } catch {
-        /* 忽略 */
-      }
-    }
-    if (this._client) {
-      try {
-        this._client.end()
-      } catch {
-        /* 忽略 */
-      }
-    }
+    if (this._stream) { try { this._stream.end() } catch { /* 忽略 */ } }
+    if (this._client) { try { this._client.end() } catch { /* 忽略 */ } }
     this._connected = false
     this._remoteBusy = false
     this._history.dispose()
     log.hook("ssh_disconnect", `关闭会话 ${this._host}`)
   }
 
-  /**
-   * 追加输出到未消费 buffer，超限时截断头部（保留尾部）并修正运行索引
-   * @param text 新增输出文本
-   */
   private _appendBuffer(text: string): void {
     this._buffer += text
     if (this._buffer.length > MAX_BUFFER_LEN) {
       const trimmed = this._buffer.length - MAX_BUFFER_LEN
       this._buffer = this._buffer.slice(trimmed)
-      // 同步修正后台运行上下文索引与窗口起点（若存在）
-      if (this._runningStartPos !== null) {
-        this._runningStartPos = Math.max(0, this._runningStartPos - trimmed)
-      }
+      if (this._runningStartPos !== null) this._runningStartPos = Math.max(0, this._runningStartPos - trimmed)
       this._cursor = Math.max(0, this._cursor - trimmed)
+      if (this._streamPos !== null) this._streamPos = Math.max(0, this._streamPos - trimmed)
       log.info(`buffer 超限截断 ${trimmed} 字符，当前 ${this._buffer.length}`)
+    }
+    this._rawLog += text
+    this._rawTotal += text.length
+    if (this._rawLog.length > RAW_LOG_MAX) {
+      const trimmed = this._rawLog.length - RAW_LOG_MAX
+      this._rawLog = this._rawLog.slice(trimmed)
+      this._rawDiscarded += trimmed
     }
   }
 
-  private _waitSentinel(
-    sentinel: string,
+  /** 增量读取连续原始字节流 */
+  readRawStream(pos: number): { data: string; pos: number; reset?: boolean } {
+    if (pos < this._rawDiscarded) return { data: this._rawLog, pos: this._rawTotal, reset: true }
+    const from = pos - this._rawDiscarded
+    return { data: this._rawLog.slice(from), pos: this._rawTotal }
+  }
+
+  private _waitCompletion(
     startPos: number,
     timeout: number,
     startTs: number,
-  ): Promise<{ kind: "done" | "interactive" | "running" | "timeout"; idx?: number; afterNewline?: number }> {
+  ): Promise<{ kind: "done" | "interactive" | "running" | "timeout"; markerPos?: number }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
       let lastChange = Date.now()
+      let echoEnd = 0
 
       const timer = setInterval(() => {
-        const idx = this._findSentinel(sentinel, startPos)
-        if (idx >= 0) {
-          clearInterval(timer)
-          const nl = this._buffer.indexOf("\n", idx)
-          resolve({
-            kind: "done",
-            idx,
-            afterNewline: nl >= 0 ? nl + 1 : idx + sentinel.length,
-          })
-          return
-        }
-
         if (INTERACTIVE_RE.test(this._buffer.slice(startPos))) {
           clearInterval(timer)
           resolve({ kind: "interactive" })
@@ -463,7 +502,20 @@ export class SshSession {
           lastChange = now
         }
 
-        // 动画检测：持续有新输出且已超过动画阈值 → 判定仍在运行
+        if (echoEnd <= 0 && this._runningCommand) {
+          const end = extractOutputStart(this._buffer.slice(startPos), this._runningCommand)
+          if (end > 0) echoEnd = startPos + end
+        }
+
+        // 完成标记（精确权威）：命令结束时 shell 重绘提示符前必输出 <SSH_DONE>，
+        // 下载/编译等静默期不会误判完成，中断（Ctrl-C 回到提示符）同样会输出标记
+        const marker = detectDoneMarker(this._buffer, echoEnd > 0 ? echoEnd : startPos)
+        if (marker.done) {
+          clearInterval(timer)
+          resolve({ kind: "done", markerPos: marker.pos })
+          return
+        }
+
         if (now - lastChange < QUIET_WINDOW_MS && now - startTs >= ANIMATION_WINDOW_MS) {
           clearInterval(timer)
           resolve({ kind: "running" })
@@ -479,10 +531,10 @@ export class SshSession {
     })
   }
 
-  /** 后台哨兵监听：轮询到哨兵 → 收集输出进 history + busy=false，供 ssh_status/ssh_terminal 读取 */
-  private _startBackgroundWatch(sentinel: string, startPos: number, command: string): void {
+  private _startBackgroundWatch(startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
     const born = Date.now()
+    let echoEnd = 0
     this._watchTimer = setInterval(() => {
       if (!this._connected || Date.now() - born > MAX_WATCH_LEN) {
         this._remoteBusy = false
@@ -490,14 +542,15 @@ export class SshSession {
         if (this._watchTimer) clearInterval(this._watchTimer)
         return
       }
-      const idx = this._findSentinel(sentinel, startPos)
-      if (idx >= 0) {
-        // 命令完成：收集输出（去哨兵注入 + 剥离提示符/回显）进 history
-        const raw = extractOutput(stripSentinel(this._buffer.slice(startPos, idx), sentinel), command)
-        this._history.append(command, raw)
-        // 不裁 buffer：shell 随后的新提示符（PS1）可能尚未到达，_cursor 指向哨兵行之后
-        const nl = this._buffer.indexOf("\n", idx)
-        this._cursor = Math.max(startPos, nl >= 0 ? nl + 1 : idx + sentinel.length)
+      if (echoEnd <= 0 && command) {
+        const end = extractOutputStart(this._buffer.slice(startPos), command)
+        if (end > 0) echoEnd = startPos + end
+      }
+      const marker = detectDoneMarker(this._buffer, echoEnd > 0 ? echoEnd : startPos)
+      if (marker.done) {
+        const raw = this._buffer.slice(startPos, marker.pos)
+        this._history.append(command, extractOutput(raw, command))
+        this._cursor = Math.max(startPos, marker.pos)
         this._remoteBusy = false
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
@@ -505,30 +558,12 @@ export class SshSession {
     }, 200)
   }
 
-  /** 在缓冲中定位哨兵行起始位置（哨兵串开头，容忍行前与哨兵字符间隙的 ANSI bracketed-paste 序列） */
-  private _findSentinel(sentinel: string, fromPos: number): number {
-    const ANSI = "(?:\\x1b\\[[0-9;?]*[a-zA-Z])*"
-    const esc = sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    // 哨兵逐字符间隙容忍 ANSI（bash 回显时会在哨兵中插入 ESC[?2004h 等序列）
-    // 捕获组 1 = 哨兵文本本体，可直接换算原索引
-    const interleaved = [...esc].join(ANSI)
-    // 行首匹配：换行符 或 CSI 序列（zsh prompt 重绘可能用 CSI 光标定位代替换行）
-    const LEAD = "(?:^|[\\r\\n]|(?:\\x1b\\[[0-9;?]*[a-zA-Z])+)"
-    const re = new RegExp(`${LEAD}${ANSI}(${interleaved})${ANSI}`, "g")
-    re.lastIndex = fromPos
-    const m = re.exec(this._buffer)
-    if (!m || !m[1] || m[1].length <= 0) return -1
-    return m.index + m[0].indexOf(m[1])
-  }
-
-  /** 清理后台运行上下文 */
   private _clearRunningContext(): void {
     this._runningStartPos = null
-    this._runningSentinel = ""
     this._runningCommand = ""
+    this._streamPos = null
   }
 
-  /** 输出截断保护 */
   private _truncate(s: string): string {
     if (s.length <= MAX_OUTPUT_LEN) return s
     return `${s.slice(0, MAX_OUTPUT_LEN)}\n... [output truncated, ${s.length} chars total]`

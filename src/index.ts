@@ -3,7 +3,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import stringArgv from "string-argv"
 import { parseArgs } from "node:util"
-import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
+import log from "./log.js"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -18,8 +18,6 @@ import { LocalSession } from "./local-session.js"
 import { type ServerHandle, type SessionEntry } from "./server.js"
 import { ensureServer } from "./server-manager.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
-
-const log = createLogger("opencode-ssh-tool")
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -82,12 +80,16 @@ function getSession(sessionID: string, name = DEFAULT_NAME): SshSession | undefi
   return getSessionMap(sessionID)?.get(name)
 }
 
-/** 扁平化会话条目列表（供 HTTP 服务展示） */
+/** 扁平化会话条目列表（供 HTTP 服务展示，SSH + 本地/容器，kind 区分历史目录与展示） */
 function listSessionEntries(): SessionEntry[] {
   const entries: SessionEntry[] = []
   for (const [sessionID, map] of sshSessions) {
     const meta = sessionMeta.get(sessionID)
-    for (const [name, session] of map) entries.push({ sessionID, name, session, title: meta?.title, directory: meta?.directory })
+    for (const [name, session] of map) entries.push({ sessionID, name, session, kind: "ssh", title: meta?.title, directory: meta?.directory })
+  }
+  for (const [sessionID, map] of localSessions) {
+    const meta = sessionMeta.get(sessionID)
+    for (const [name, session] of map) entries.push({ sessionID, name, session, kind: "local", title: meta?.title, directory: meta?.directory })
   }
   return entries
 }
@@ -207,6 +209,25 @@ function cleanupAllSessions(sessionID: string): void {
 }
 
 export const OpenCodeSshTool: Plugin = async () => {
+  // 父子会话关系（sessionID → parentID；根的 parentID 为 undefined）
+  // 通过 session.created/updated 事件构建，用于根系查找（主子会话共享终端）
+  const childMap = new Map<string, string | undefined>()
+
+  /**
+   * 沿 parentID 链找到根会话 ID（主子会话共享存储key）
+   * 输出异常时回退回原 sessionID
+   */
+  const findRoot = (sessionID: string): string => {
+    let cur = sessionID
+    const visited = new Set<string>()
+    while (cur && !visited.has(cur)) {
+      visited.add(cur)
+      const parent = childMap.get(cur)
+      if (parent !== undefined && parent !== null) { cur = parent; continue }
+      break
+    }
+    return cur
+  }
   log.loaded()
 
   // 加载配置并启动 HTTP 终端记录服务（默认开启；端口 0=自动分配）
@@ -443,40 +464,60 @@ export const OpenCodeSshTool: Plugin = async () => {
     const tokens = stringArgv(raw)
     const [cmd, ...rest] = tokens
     if (!cmd || cmd === "help") return HELP_TEXT
+    // 统一按根会话 ID 路由（主子会话共享终端）
+    const rootID = await findRoot(ctx.sessionID)
+    const rootCtx: CliCtx = { ...ctx, sessionID: rootID }
     switch (cmd) {
-      case "connect": return doConnect(rest, ctx)
-      case "local": return doLocal(rest, ctx)
-      case "exec": return doExec(rest, ctx)
-      case "read": return doRead(rest, ctx)
-      case "send": return doSend(rest, ctx)
-      case "status": return doStatus(rest, ctx)
-      case "disconnect": return doDisconnect(rest, ctx)
+      case "connect": return doConnect(rest, rootCtx)
+      case "local": return doLocal(rest, rootCtx)
+      case "exec": return doExec(rest, rootCtx)
+      case "read": return doRead(rest, rootCtx)
+      case "send": return doSend(rest, rootCtx)
+      case "status": return doStatus(rest, rootCtx)
+      case "disconnect": return doDisconnect(rest, rootCtx)
       default: return `${tr("cli_unknown", lang).replace("{cmd}", cmd)}\n\n${HELP_TEXT}`
     }
   }
+
+  // 记录哪些根会话已收到过"来自根自身"的标题（防止子会话标题覆盖根标题）
+  const rootTitleOwned = new Set<string>()
 
   return {
     event: async ({ event }) => {
       // 会话创建/更新时记录标题与目录（供 HTTP 页面显示会话名称）
       if (event.type === "session.created" || event.type === "session.updated") {
-        const info = (event as { properties?: { info?: { id?: string; title?: string; directory?: string } } }).properties?.info
+        const info = (event as { properties?: { info?: { id?: string; title?: string; directory?: string; parentID?: string } } }).properties?.info
         if (info?.id) {
-          sessionMeta.set(info.id, { title: info.title ?? "", directory: info.directory ?? "" })
-          // 有活动终端时同步标题/目录到状态文件（供跨进程聚合）
-          const map = getSessionMap(info.id)
-          if (map) for (const name of map.keys()) syncSessionState(info.id, name)
+          // 记录父子关系（用于根系查找）
+          if (info.parentID !== undefined) childMap.set(info.id, info.parentID)
+          else if (!childMap.has(info.id)) childMap.set(info.id, undefined)
+
+          // 标题仅来自根会话自身；子会话不覆盖根标题
+          const root = findRoot(info.id)
+          if (info.id === root) {
+            sessionMeta.set(root, { title: info.title ?? "", directory: info.directory ?? "" })
+            rootTitleOwned.add(root)
+          } else if (!rootTitleOwned.has(root) && !sessionMeta.has(root)) {
+            sessionMeta.set(root, { title: info.title ?? "", directory: info.directory ?? "" })
+          }
+          // 有活动终端时同步状态文件
+          const map = getSessionMap(root)
+          if (map) for (const name of map.keys()) syncSessionState(root, name)
         }
       }
-      // 会话删除时清理：关闭全部终端连接 + 删缓存目录 + 删元信息
       if (event.type === "session.deleted") {
         const props = (event as { properties?: { sessionID?: string; info?: { id?: string } } }).properties
-        // sessionID 直接挂在 properties 层（完整事件）；info.id 为兜底
         const sid = props?.sessionID ?? props?.info?.id
         if (sid) {
-          cleanupAllSessions(sid)
-          cleanupAllLocalSessions(sid)
+          childMap.delete(sid)
+          const root = findRoot(sid)
+          if (root === sid) {
+            cleanupAllSessions(sid)
+            cleanupAllLocalSessions(sid)
+          }
           sessionMeta.delete(sid)
-          log.info(`会话 ${sid} 删除，已清理`)
+          rootTitleOwned.delete(sid)
+          log.info(`会话 ${sid} 删除，根 ${root} 清理`)
         }
       }
     },

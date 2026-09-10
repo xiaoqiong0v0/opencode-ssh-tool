@@ -3,9 +3,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
-
-const log = createLogger("opencode-ssh-tool", { enabled: true })
+import log from "./log.js"
 
 /** 认证信息（互斥，按优先级取其一），字段名对齐 ssh2 ConnectConfig */
 export interface AuthInfo {

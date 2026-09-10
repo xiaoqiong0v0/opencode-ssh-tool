@@ -29,3 +29,7 @@ body:not(.show-time) .row .t { display: none; }
   box-shadow: 0 4px 12px rgba(0,0,0,.4);
 }
 .to-bottom-btn:hover { background: #2ea043; }
+.sep hr { border: none; border-top: 1px dashed #30363d; margin: 8px 0; }
+.del-btn { background: none; border: 1px solid #30363d; color: #f85149; border-radius: 4px; cursor: pointer; padding: 2px 8px; font-size: 14px; line-height: 1; display: none; }
+.del-btn:hover { background: #f85149; color: #fff; }
+.del-btn.show { display: inline-block; }

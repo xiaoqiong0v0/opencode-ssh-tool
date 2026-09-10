@@ -1,4 +1,4 @@
-// 前端入口：TermScreen 终端模拟渲染 + transcript 轮询展示
+// 前端入口：纯 WebSocket 驱动（无 HTTP 轮询/断线重连），TermScreen 实时渲染
 
 interface I18n {
   run: string
@@ -9,13 +9,6 @@ interface I18n {
   loadFailed: string
   terminals: string
   local: string
-}
-
-interface SessionStatus {
-  sessionID: string
-  title?: string
-  directory?: string
-  terminals: TerminalInfo[]
 }
 
 interface TerminalInfo {
@@ -29,8 +22,15 @@ interface TerminalInfo {
   busy: boolean
 }
 
+interface SessionStatus {
+  sessionID: string
+  title?: string
+  directory?: string
+  terminals: TerminalInfo[]
+}
+
 interface TranscriptPair {
-  type: "cmd" | "out" | "run"
+  type: "cmd" | "out" | "run" | "sep"
   ts?: number
   text: string
 }
@@ -185,9 +185,9 @@ class TermScreen {
     }
   }
 
-  render(): { row: number; html: string }[] {
+  render(): string[] {
     const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    const out: { row: number; html: string }[] = []
+    const out: string[] = []
     for (let ri = 0; ri < this.grid.length; ri++) {
       const row = this.grid[ri]
       let last = this.cols
@@ -210,39 +210,247 @@ class TermScreen {
         html += esc(cell.ch)
       }
       if (cur) html += "</span>"
-      out.push({ row: ri, html })
+      out.push(html)
     }
     return out
   }
 }
 
+// ===== 全局状态 =====
+let ws: WebSocket | null = null
+let sessionsData: SessionStatus[] = []
+let stickToBottom = true
+let runScreen: TermScreen | null = null
+let debugMode = false
+
+// ===== WS 连接 =====
+function connectWs(): void {
+  ws = new WebSocket("ws://" + window.location.host + "/ws")
+  ws.onopen = () => {
+    ws!.send(JSON.stringify({ type: "list" }))
+    subscribe()
+  }
+  ws.onmessage = (ev) => {
+    let msg: Record<string, unknown>
+    try {
+      msg = JSON.parse(ev.data as string) as Record<string, unknown>
+    } catch {
+      return
+    }
+    switch (msg.type) {
+      case "sessions": updateSessions(msg as unknown as { sessions: SessionStatus[] }); break
+      case "snapshot": handleSnapshot(msg as unknown as { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }); break
+      case "run": handleRun(msg as unknown as { data: string }); break
+      case "runEnd": /* 等待后续 snapshot */ break
+      case "cmdStart": handleCmdStart(msg as unknown as { command: string }); break
+      case "raw": handleRaw(msg as unknown as { data: string; reset?: boolean }); break
+    }
+  }
+  ws.onclose = () => {
+    // 断线不做重连，页面死掉用户刷新
+    const pre = document.getElementById("term") as HTMLPreElement
+    pre.textContent = "WebSocket disconnected"
+  }
+}
+
+// ===== 会话列表更新 =====
+function updateSessions(msg: { sessions: SessionStatus[] }): void {
+  const newSessions = msg.sessions || []
+  const sel = document.getElementById("session") as HTMLSelectElement
+  const key = newSessions.map((s) => s.sessionID + "|" + s.terminals.length).join(",")
+  const prev = sel.value
+  const prevTerminal = (document.getElementById("terminal") as HTMLSelectElement).value
+  sessionsData = newSessions
+  sel.innerHTML = ""
+  for (const s of sessionsData) {
+    const opt = document.createElement("option")
+    opt.value = s.sessionID
+    opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " " + I18N.terminals + ")"
+    sel.appendChild(opt)
+  }
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev
+  else sel.selectedIndex = sessionsData.length ? 0 : -1
+  updateTerminalSelect(prevTerminal)
+}
+
+function updateTerminalSelect(prevName?: string): void {
+  const sel = document.getElementById("session") as HTMLSelectElement
+  const tsel = document.getElementById("terminal") as HTMLSelectElement
+  const delBtn = document.getElementById("delTerm") as HTMLButtonElement
+  const sid = sel.value
+  const s = sessionsData.find((x) => x.sessionID === sid)
+  tsel.innerHTML = ""
+  for (const t of (s ? s.terminals : [])) {
+    const opt = document.createElement("option")
+    opt.value = t.name || "default"
+    opt.textContent = (t.name || "default") + (t.kind === "local" ? " [" + I18N.local + "]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "")
+    tsel.appendChild(opt)
+  }
+  if (prevName && [...tsel.options].some((o) => o.value === prevName)) tsel.value = prevName
+  else tsel.selectedIndex = tsel.options.length ? 0 : -1
+  // 删除按钮：仅非 default 且已断开时显示
+  const cur = s?.terminals.find((t) => (t.name || "default") === tsel.value)
+  delBtn.classList.toggle("show", !!(cur && !cur.connected))
+  subscribe()
+}
+
+let subSid = ""
+let subName = ""
+/** 是否已收到 raw 流（收到前可回退 snapshot 渲染，收到后 raw 拥有画面） */
+let rawActive = false
+
+function subscribe(): void {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  if (!sid || !name || !ws || ws.readyState !== WebSocket.OPEN) return
+  if (sid === subSid && name === subName) return
+  subSid = sid
+  subName = name
+  runScreen = null
+  rawActive = false
+  ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, raw: debugMode }))
+}
+
+// ===== Snapshot 处理 =====
+function handleSnapshot(msg: { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }): void {
+  const pre = document.getElementById("term") as HTMLPreElement
+  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
+  if (msg.notFound) {
+    pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + I18N.sessionGone + '</span></div>'
+    document.getElementById("meta").textContent = ""
+    dropDeadTerminal(msg.sessionID, msg.name)
+    return
+  }
+  const pairs = msg.pairs || []
+  // Raw/debug 模式下时间列失效（时间随命令分块语义，与连续流/字节视图冲突）
+  const showTime = !debugMode && (document.getElementById("showTime") as HTMLInputElement).checked
+  document.body.classList.toggle("show-time", showTime)
+  const cmdCount = pairs.filter((p) => p.type === "cmd").length
+  document.getElementById("meta").textContent = msg.sessionID + "/" + msg.name + " · " + cmdCount + " " + I18N.commands
+  // debug 模式下 raw 连续流优先：raw 数据渲染画面，snapshot 不再重建 transcript
+  if (debugMode && rawActive) return
+  runScreen = null
+  pre.innerHTML = renderTranscript(pairs, showTime)
+  if (stickToBottom) {
+    pre.scrollTop = pre.scrollHeight
+    toBottomBtn.style.display = "none"
+  } else {
+    toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "block" : "none"
+  }
+}
+
+// ===== Run 增量处理 =====
+function handleRun(msg: { data: string }): void {
+  if (!msg.data || debugMode) return
+  const pre = document.getElementById("term") as HTMLPreElement
+  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
+  let block = document.getElementById("runBlock") as HTMLDivElement | null
+  if (!runScreen) {
+    runScreen = new TermScreen(PTY_COLS)
+    block = document.createElement("div")
+    block.id = "runBlock"
+    pre.appendChild(block)
+  }
+  runScreen.write(stripDone(msg.data))
+  const html = runScreen.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
+  block!.innerHTML = html
+  if (stickToBottom) {
+    pre.scrollTop = pre.scrollHeight
+    toBottomBtn.style.display = "none"
+  } else {
+    toBottomBtn.style.display = "block"
+  }
+}
+
+/** Raw 连续流 TermScreen（debug 模式下模拟终端渲染） */
+let rawScreen: TermScreen | null = null
+
+// ===== Raw 连续流处理 =====
+function handleRaw(msg: { data: string; reset?: boolean }): void {
+  if (!debugMode) return
+  const pre = document.getElementById("term") as HTMLPreElement
+  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
+  if (!rawActive) {
+    rawActive = true
+    pre.innerHTML = ""
+    rawScreen = null
+  }
+  if (msg.reset) {
+    rawScreen = new TermScreen(PTY_COLS)
+    rawScreen.write(msg.data || "")
+  } else if (msg.data) {
+    if (!rawScreen) rawScreen = new TermScreen(PTY_COLS)
+    rawScreen.write(msg.data)
+  }
+  if (rawScreen) {
+    const rows = rawScreen.render().map((r) => '<div class="row"><span class="c">' + r + '</span></div>').join("")
+    pre.innerHTML = rows
+  }
+  if (stickToBottom) {
+    pre.scrollTop = pre.scrollHeight
+    toBottomBtn.style.display = "none"
+  } else {
+    toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "block" : "none"
+  }
+}
+
+// ===== 命令开始处理 =====
+function handleCmdStart(msg: { command: string }): void {
+  if (debugMode) return // 调试模式不单独渲染 cmd，echo 已在 raw 输出中
+  if (!msg.command) return
+  const pre = document.getElementById("term") as HTMLPreElement
+  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
+  // 清理旧 runBlock（若存在），避免残留
+  const old = document.getElementById("runBlock")
+  if (old) old.remove()
+  runScreen = null
+  // 插入命令行
+  const showTime = (document.getElementById("showTime") as HTMLInputElement).checked
+  const t = showTime ? fmtTime(Date.now()) : ""
+  const row = document.createElement("div")
+  row.className = "row cmdline"
+  row.innerHTML = '<span class="t">' + t + '</span><span class="c">' + escHtml(msg.command) + '</span>'
+  pre.appendChild(row)
+  if (stickToBottom) {
+    pre.scrollTop = pre.scrollHeight
+    toBottomBtn.style.display = "none"
+  }
+}
+
+// ===== 渲染函数 =====
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+}
+
+/** 可见完成标记剥离（展示给用户/模型的输出前调用） */
+const DONE_RE = /<SSH_DONE:(-?\d+)>/g
+function stripDone(s: string): string {
+  return s.replace(DONE_RE, "")
+}
+
 function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
-  // 结构化渲染：命令文本单独成行（时间戳标在此），每条输出用独立 TermScreen 渲染其 ANSI 颜色。
-  // 输出流已是剥离提示符/回显后的纯程序输出（服务端 extractOutput），故不依赖 zsh 提示符
-  // 渲染状态，任何 shell/主题都能稳定对齐。
   const out: string[] = []
   for (const p of pairs) {
+    if (p.type === "sep") {
+      out.push('<div class="sep"><hr></div>')
+      continue
+    }
     if (p.type === "cmd") {
-      const t = showTime && p.ts ? fmtTime(p.ts) : ""
+      const t = p.ts ? fmtTime(p.ts) : ""
       out.push('<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + escHtml(p.text) + '</span></div>')
     } else if (p.type === "run") {
-      const t = showTime && p.ts ? fmtTime(p.ts) : ""
-      out.push('<div class="row"><span class="t">' + t + '</span><span class="c">' + I18N.run + escHtml(p.text) + '</span></div>')
+      runScreen = new TermScreen(PTY_COLS)
+      runScreen.write(stripDone(p.text))
+      const rows = runScreen.render().map((r) => '<div class="row"><span class="t"></span><span class="c">' + r + '</span></div>').join("")
+      out.push('<div id="runBlock">' + rows + '</div>')
     } else {
-      // out：纯程序输出，TermScreen 逐字渲染（含 ANSI 颜色），输出 HTML 行
-      const screen = new TermScreen(PTY_COLS)
-      screen.write(p.text)
-      for (const r of screen.render()) {
-        out.push('<div class="row"><span class="t"></span><span class="c">' + r.html + '</span></div>')
-      }
+      const scr = new TermScreen(PTY_COLS)
+      scr.write(stripDone(p.text))
+      const rows = scr.render().map((r) => '<div class="row"><span class="t"></span><span class="c">' + r + '</span></div>').join("")
+      out.push(rows)
     }
   }
   return out.join("")
-}
-
-/** HTML 转义（命令文本、纯文本运行态标签等，避免 XSS/格式破坏） */
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
 function sessionLabel(s: SessionStatus): string {
@@ -258,46 +466,12 @@ function fmtTime(ts: number): string {
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds())
 }
 
-let sessionsData: SessionStatus[] = []
-let stickToBottom = true
-let lastSessionsKey = ""
-let lastTranscript = ""
-let pendingTop = 0
-
-async function loadSessions(): Promise<void> {
-  let data: { sessions: SessionStatus[] }
-  try {
-    const r = await fetch("/api/status")
-    data = (await r.json()) as { sessions: SessionStatus[] }
-  } catch {
-    return
-  }
-  const newSessions = data.sessions || []
-  const sel = document.getElementById("session") as HTMLSelectElement
-  const key = newSessions.map((s) => s.sessionID + "|" + s.terminals.length).join(",")
-  if (key === lastSessionsKey) return
-  lastSessionsKey = key
-  sessionsData = newSessions
-  const prev = sel.value
-  sel.innerHTML = ""
-  for (const s of sessionsData) {
-    const opt = document.createElement("option")
-    opt.value = s.sessionID
-    opt.textContent = sessionLabel(s) + "  (" + s.terminals.length + " " + I18N.terminals + ")"
-    sel.appendChild(opt)
-  }
-  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev
-  else sel.selectedIndex = sessionsData.length ? 0 : -1
-  onSessionChange(false)
-}
-
 function dropDeadTerminal(sid: string, name: string): void {
   const s = sessionsData.find((x) => x.sessionID === sid)
   if (s) {
     s.terminals = s.terminals.filter((t) => (t.name || "default") !== name)
     if (s.terminals.length === 0) sessionsData = sessionsData.filter((x) => x.sessionID !== sid)
   }
-  lastSessionsKey = ""
   const sel = document.getElementById("session") as HTMLSelectElement
   const prev = sel.value
   sel.innerHTML = ""
@@ -309,101 +483,68 @@ function dropDeadTerminal(sid: string, name: string): void {
   }
   if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev
   else sel.selectedIndex = sessionsData.length ? 0 : -1
-  onSessionChange(false)
+  const prevTerminal = (document.getElementById("terminal") as HTMLSelectElement).value
+  updateTerminalSelect(prevTerminal)
 }
 
 function onSessionChange(forceStick: boolean): void {
-  lastTranscript = ""
-  pendingTop = 0
-  const sel = document.getElementById("session") as HTMLSelectElement
-  const sid = sel.value
-  const tsel = document.getElementById("terminal") as HTMLSelectElement
-  const prev = tsel.value
-  tsel.innerHTML = ""
-  const s = sessionsData.find((x) => x.sessionID === sid)
-  for (const t of (s ? s.terminals : [])) {
-    const opt = document.createElement("option")
-    opt.value = t.name || "default"
-    opt.textContent = (t.name || "default") + (t.kind === "local" ? " [" + I18N.local + "]" : "") + "  " + (t.connected ? "●" : "○") + (t.busy ? " ⏳" : "")
-    tsel.appendChild(opt)
-  }
-  if (prev && [...tsel.options].some((o) => o.value === prev)) tsel.value = prev
-  else tsel.selectedIndex = tsel.options.length ? 0 : -1
   if (forceStick) stickToBottom = true
-  loadTranscript(true)
-}
-
-async function loadTranscript(force = false): Promise<void> {
-  const pre = document.getElementById("term") as HTMLPreElement
-  const sel = document.getElementById("session") as HTMLSelectElement
-  const tsel = document.getElementById("terminal") as HTMLSelectElement
-  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
-  const sid = sel.value
-  const name = tsel.value
-  if (!sid || !name) {
-    pre.textContent = I18N.noSession
-    return
-  }
-  if (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30) stickToBottom = true
-  const showTime = (document.getElementById("showTime") as HTMLInputElement).checked
-  document.body.classList.toggle("show-time", showTime)
-  let data: { pairs?: TranscriptPair[]; notFound?: boolean }
-  try {
-    const r = await fetch("/api/transcript?session=" + encodeURIComponent(sid) + "&name=" + encodeURIComponent(name))
-    if (!r.ok) throw new Error("HTTP " + r.status)
-    data = (await r.json()) as { pairs?: TranscriptPair[]; notFound?: boolean }
-  } catch {
-    pre.textContent = I18N.loadFailed
-    return
-  }
-  const pairs = data.pairs || []
-  if (data.notFound) {
-    lastTranscript = ""
-    pendingTop = 0
-    pre.innerHTML = '<div class="row"><span class="t"></span><span class="c">' + I18N.sessionGone + '</span></div>'
-    document.getElementById("meta").textContent = ""
-    dropDeadTerminal(sid, name)
-    return
-  }
-  const sig = JSON.stringify(pairs)
-  const changed = sig !== lastTranscript
-  // 内容无变化且非强制刷新：跳过重渲染，避免每 2s 轮询导致布局抖动
-  if (!changed && !force) return
-  lastTranscript = sig
-  const prevHeight = pre.scrollHeight
-  pre.innerHTML = renderTranscript(pairs, showTime)
-  const cmdCount = pairs.filter((p) => p.type === "cmd").length
-  document.getElementById("meta").textContent = sid + "/" + name + " · " + cmdCount + " " + I18N.commands + " · " + I18N.autoRefresh
-  if (stickToBottom) {
-    pre.scrollTop = pre.scrollHeight
-    toBottomBtn.style.display = "none"
-  } else if (pendingTop > 0) {
-    toBottomBtn.style.display = "block"
-  }
-  if (changed && pre.scrollHeight > pre.clientHeight) {
-    pendingTop = prevHeight
-    if (stickToBottom) pendingTop = 0
-  }
+  const prevName = (document.getElementById("terminal") as HTMLSelectElement).value
+  updateTerminalSelect(prevName)
 }
 
 function onShowTimeChange(): void {
   const el = document.getElementById("showTime") as HTMLInputElement
   localStorage.setItem("showTime", el.checked ? "1" : "0")
   document.body.classList.toggle("show-time", el.checked)
-  loadTranscript()
+}
+
+function onDebugModeChange(): void {
+  const el = document.getElementById("debugMode") as HTMLInputElement
+  debugMode = el.checked
+  localStorage.setItem("debugMode", el.checked ? "1" : "0")
+  document.body.classList.toggle("debug", el.checked)
+  // 立即重渲染：重新订阅当前终端，触发 snapshot 重推
+  subSid = ""
+  subName = ""
+  subscribe()
+}
+
+function deleteTerminal(): void {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  if (!name || !ws || ws.readyState !== WebSocket.OPEN) return
+  const s = sessionsData.find((x) => x.sessionID === sid)
+  const t = s?.terminals.find((t2) => (t2.name || "default") === name)
+  if (!t || t.connected) return
+  ws.send(JSON.stringify({ type: "deleteTerminal", sessionID: sid, name }))
+  // 立即从本地状态移除，等下次 sessions 推送会同步
+  if (s) {
+    s.terminals = s.terminals.filter((t2) => (t2.name || "default") !== name)
+    if (s.terminals.length === 0) sessionsData = sessionsData.filter((x) => x.sessionID !== sid)
+  }
+  // 切到第一个终端
+  const prev = (document.getElementById("terminal") as HTMLSelectElement).value
+  updateTerminalSelect(prev !== name ? prev : undefined)
 }
 
 function scrollToNewest(): void {
   const pre = document.getElementById("term") as HTMLPreElement
   const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
-  pre.scrollTop = pendingTop > 0 ? pendingTop : pre.scrollHeight
-  pendingTop = 0
+  pre.scrollTop = pre.scrollHeight
+  stickToBottom = true
   toBottomBtn.style.display = "none"
 }
 
+// ===== 初始化 =====
 const showTimeEl = document.getElementById("showTime") as HTMLInputElement
 showTimeEl.checked = localStorage.getItem("showTime") === "1"
 document.body.classList.toggle("show-time", showTimeEl.checked)
+
+const debugModeEl = document.getElementById("debugMode") as HTMLInputElement
+debugMode = localStorage.getItem("debugMode") === "1"
+debugModeEl.checked = debugMode
+document.body.classList.toggle("debug", debugMode)
 
 const termPre = document.getElementById("term") as HTMLPreElement
 const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
@@ -411,19 +552,17 @@ termPre.addEventListener("scroll", () => {
   if (termPre.scrollTop + termPre.clientHeight >= termPre.scrollHeight - 30) {
     stickToBottom = true
     toBottomBtn.style.display = "none"
-    pendingTop = 0
   } else {
     stickToBottom = false
   }
 })
 
-// 暴露给 HTML 内联 onchange/onclick 的全局函数
 Object.assign(window, {
   onSessionChange,
   onShowTimeChange,
+  onDebugModeChange,
+  deleteTerminal,
   scrollToNewest,
 })
 
-loadSessions()
-setInterval(loadTranscript, 2000)
-setInterval(loadSessions, 5000)
+connectWs()
