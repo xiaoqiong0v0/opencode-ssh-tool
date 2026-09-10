@@ -439,10 +439,12 @@ export const OpenCodeSshTool: Plugin = async () => {
     const lmap = getLocalSessionMap(ctx.sessionID)
     if ((!smap || smap.size === 0) && (!lmap || lmap.size === 0)) return tr("no_sessions", lang)
     if (!values.name) {
-      const firstHost = [...(smap?.values() ?? [])][0]?.getStatus().host
+      const firstSshHost = [...(smap?.values() ?? [])][0]?.getStatus().host
+      const firstLocalProgram = [...(lmap?.values() ?? [])][0]?.getStatus().program
       cleanupAllSessions(ctx.sessionID)
       cleanupAllLocalSessions(ctx.sessionID)
-      return tr("disconnected_all_ok", lang).replace("{host}", firstHost ?? "-")
+      if (firstSshHost) return tr("disconnected_all_ok", lang).replace("{host}", firstSshHost)
+      return tr("disconnected_all_ok_local", lang).replace("{program}", firstLocalProgram ?? "-")
     }
     const ssh = getSession(ctx.sessionID, values.name)
     if (ssh) {
@@ -454,7 +456,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (local) {
       const program = local.getStatus().program
       cleanupLocalSession(ctx.sessionID, values.name)
-      return tr("disconnected_ok", lang).replace("{host}", program ?? "-")
+      return tr("disconnected_ok_local", lang).replace("{program}", program ?? "-")
     }
     return tr("no_sessions", lang)
   }

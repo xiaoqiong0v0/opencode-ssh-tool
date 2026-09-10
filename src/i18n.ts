@@ -60,7 +60,7 @@ Subcommands:
   exec "<command>" [-n name] [-w]
       run a command in the terminal (default: submit async and return immediately; -w waits for result)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
-      read terminal output: buffer (live) / history (default tail last N)
+      read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [-n name]
       send text/keystrokes (\\r Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   status [-n name]
@@ -95,7 +95,7 @@ Examples:
   exec "<command>" [-n name] [-w]
       在指定终端执行命令（默认异步提交立即返回；-w 同步等待结果）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
-      读终端输出：buffer 实时 / history 历史（默认 tail 后 N 条）
+      读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [-n name]
       发送文本/按键（\\r 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   status [-n name]
@@ -175,8 +175,8 @@ Examples:
     zh: "危险命令，已拒绝执行。",
   },
   not_connected: {
-    en: "No active terminal. Use term_cli connect (SSH) or term_cli local (wsl/docker/local shell) first.",
-    zh: "无活动终端。请先用 term_cli connect（SSH）或 term_cli local（wsl/docker/本地 shell）建立。",
+    en: "No active terminal. Use term_cli connect (SSH) or term_cli local first.",
+    zh: "无活动终端。请先用 term_cli connect（SSH）或 term_cli local 建立。",
   },
   rejected_connect: {
     en: "Connection rejected.",
@@ -186,7 +186,7 @@ Examples:
     en: "Invalid terminal name. Use letters, digits, underscore, hyphen or dot (max 64 chars), no path separators.",
     zh: "终端名非法。仅允许字母、数字、下划线、中划线、点（最多 64 字符），不得含路径分隔符。",
   },
-no_sessions: {
+  no_sessions: {
     en: "No active terminals.",
     zh: "当前没有活动的终端会话。",
   },
@@ -226,7 +226,7 @@ no_sessions: {
     en: "\n(HTTP server not enabled)",
     zh: "\n（HTTP 服务未启用）",
   },
-history_title: {
+  history_title: {
     en: "Terminal history (last {n} / total {total})",
     zh: "终端历史（最后 {n} 条 / 共 {total} 条）",
   },
@@ -247,13 +247,21 @@ history_title: {
   web_running: { en: "[running] ", zh: "[运行中] " },
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
-disconnected_ok: {
+  disconnected_ok: {
     en: "Terminal closed ({host}).",
     zh: "终端已断开（{host}）。",
+  },
+  disconnected_ok_local: {
+    en: "Terminal closed ({program}).",
+    zh: "终端已断开（{program}）。",
   },
   disconnected_all_ok: {
     en: "All terminals closed (last host {host}).",
     zh: "已断开全部终端（最后主机 {host}）。",
+  },
+  disconnected_all_ok_local: {
+    en: "All terminals closed (last program {program}).",
+    zh: "已断开全部终端（最后程序 {program}）。",
   },
   err_not_connected: {
     en: "Not connected",
