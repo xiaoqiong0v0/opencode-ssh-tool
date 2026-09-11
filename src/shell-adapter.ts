@@ -48,7 +48,7 @@ class BashAdapter implements ShellAdapter {
     return /\b(bash|sh|zsh)\b/i.test(output)
   }
 
-  readonly injectScript = `__ssh_prompt() { local ec=$?; printf '\\n<SSH_DONE:%s>' "$ec"; }
+  readonly injectScript = `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }
 PROMPT_COMMAND=__ssh_prompt`
 }
 
