@@ -59,6 +59,10 @@ export abstract class BaseSession {
   /** Shell 适配器（探测后确定） */
   protected _adapter: ShellAdapter | null = null
   protected _closed = false
+  /** 调试模式：命令完成时在提示符注入时间戳（仅 raw 调试视图可见） */
+  protected _debug = false
+  /** 当前运行命令的输入时刻（history 记录展示命令发起时间用） */
+  private _runningStartTs = 0
   /** 连续原始字节流（从首字节起累积，含欢迎页/探测/注入/提示符/marker）；ring 裁剪 */
   private _rawLog = ""
   /** 已裁剪丢弃的字符数（前端 pos 同步用） */
@@ -121,7 +125,7 @@ export abstract class BaseSession {
         this._remoteBusy = false
         const raw = this._buffer.slice(0, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
-        this._history.append(command, extractOutput(raw, command))
+        this._history.append(command, extractOutput(raw, command), this._runningStartTs)
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -129,7 +133,7 @@ export abstract class BaseSession {
         this._remoteBusy = false
         const raw = this._buffer.slice(0)
         this._cursor = this._buffer.length
-        this._history.append(command, raw)
+        this._history.append(command, raw, this._runningStartTs)
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -262,6 +266,7 @@ export abstract class BaseSession {
     }
     this._runningStartPos = 0
     this._runningCommand = command
+    this._runningStartTs = Date.now()
     this._remoteBusy = true
     this._lastActive = Date.now()
   }
@@ -317,38 +322,40 @@ export abstract class BaseSession {
   }
 
   /**
-   * deadline 内循环注入+等待完成标记，成功返回 true，超时返回 false
-   * 逐行发送避免因 shell 未就绪导致的整块丢失；每轮等待标记最大 3s
-   */
-  protected async _injectAndSettle(deadline: number): Promise<boolean> {
-    const lines = this._adapter!.injectScript.split("\n")
-    while (Date.now() < deadline) {
-      for (const line of lines) {
-        if (line.trim()) this._write(line + "\r")
-      }
-      if (await this._waitForMarker(Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
-        // 标记确认后吸收迟到输出（最后一条注入命令的提示符残留等），保证后续命令从干净缓冲开始
-        await new Promise((r) => setTimeout(r, 100))
-        this._buffer = ""
-        this._cursor = 0
-        return true
-      }
-      log.info("完成标记注入未确认，重试")
+ * deadline 内循环注入+等待确认，成功返回 true，超时返回 false
+ * 逐行发送避免因 shell 未就绪导致的整块丢失；每轮等待最大 3s
+ * 注入命令原样回显（不抑制），确认以 echo 唯一标识为准，避免与后续命令时序混淆
+ */
+protected async _injectAndSettle(deadline: number): Promise<boolean> {
+  const TOKEN = "__SSH_INJECT_DONE__"
+  const lines = this._adapter!.buildInjectScript(this._debug).split("\n")
+  while (Date.now() < deadline) {
+    for (const line of lines) {
+      if (line.trim()) this._write(line + "\r")
+    }
+    this._write(`echo ${TOKEN}\r`)
+    if (await this._waitForBufferToken(TOKEN, Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
+      await new Promise((r) => setTimeout(r, 100))
       this._buffer = ""
       this._cursor = 0
+      return true
     }
-    return false
+    log.info("注入标识未确认，重试")
+    this._buffer = ""
+    this._cursor = 0
   }
+  return false
+}
 
-  /** 等待标记出现（最多 maxMs） */
-  private async _waitForMarker(maxMs: number): Promise<boolean> {
-    const start = Date.now()
-    while (Date.now() - start < maxMs) {
-      if (detectDoneMarker(this._buffer, 0).done) return true
-      await new Promise((r) => setTimeout(r, 50))
-    }
-    return false
+/** 等待缓冲中出现指定文本（最多 maxMs） */
+private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < maxMs) {
+    if (this._buffer.includes(token)) return true
+    await new Promise((r) => setTimeout(r, 50))
   }
+  return false
+}
 
   private _waitCompletion(
     startPos: number,
@@ -420,7 +427,7 @@ export abstract class BaseSession {
       const marker = detectDoneMarker(this._buffer, echoEnd)
       if (marker.done) {
         const raw = this._buffer.slice(startPos, marker.pos)
-        this._history.append(command, extractOutput(raw, command))
+        this._history.append(command, extractOutput(raw, command), this._runningStartTs)
         this._cursor = Math.max(startPos, marker.pos)
         this._remoteBusy = false
         this._clearRunningContext()
@@ -433,6 +440,7 @@ export abstract class BaseSession {
     this._runningStartPos = null
     this._runningCommand = ""
     this._streamPos = null
+    this._runningStartTs = 0
   }
 
   private _truncate(s: string): string {

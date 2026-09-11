@@ -67,9 +67,10 @@ export class SessionHistory {
    * 追加一条命令+原始流输出对（写文件），超对数移除最旧
    * @param command 命令
    * @param output 原始终端流（已去哨兵注入，未做其他清理），供 web 忠实渲染、模型按需 toModelText
+   * @param startTs 命令输入时刻（默认取当前时间）；用于展示命令发起时间
    */
-  append(command: string, output: string): void {
-    const ts = Date.now()
+  append(command: string, output: string, startTs?: number): void {
+    const ts = startTs ?? Date.now()
     const seq = this.nextSeq++
     const file = join(this.dir, `${String(seq).padStart(6, "0")}-${ts}.json`)
     writeFileSync(file, JSON.stringify({ command, output, ts }), "utf8")

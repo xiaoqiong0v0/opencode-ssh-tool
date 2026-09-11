@@ -9,12 +9,18 @@ export interface ShellAdapter {
   readonly probeCommand: string
   /** 解析探测输出，返回 true 表示匹配 */
   parseProbe(output: string): boolean
-  /** 注入脚本（连接后执行一次，让 shell 在每条命令完成后输出可见完成标记） */
-  readonly injectScript: string
+  /**
+   * 生成注入脚本（连接后执行一次，让 shell 在每条命令完成后输出可见完成标记）
+   * @param debug true 时在标记前额外输出时间戳 <SSH_TS:...>（仅 raw 视图可见）
+   */
+  buildInjectScript(debug: boolean): string
 }
 
 /** 可见完成标记正则（退出码兼容 pwsh 负数，如 -1） */
 const DONE_RE = /<SSH_DONE:(-?\d+)>/g
+
+/** 调试时间戳标记正则（debug 模式下提示符输出，仅 raw 可见，剥离后不进模型） */
+const TS_RE = /<SSH_TS:[^>]*>/g
 
 /**
  * 在缓冲中定位下一个 done 标记
@@ -35,7 +41,7 @@ export function detectDoneMarker(buffer: string, fromPos: number): { done: boole
  * @returns 剥离标记后的流
  */
 export function stripMarkers(raw: string): string {
-  return raw.replace(DONE_RE, "")
+  return raw.replace(TS_RE, "").replace(DONE_RE, "")
 }
 
 // ===== Bash 系（bash / sh / zsh） =====
@@ -48,8 +54,12 @@ class BashAdapter implements ShellAdapter {
     return /\b(bash|sh|zsh)\b/i.test(output)
   }
 
-  readonly injectScript = `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }
-PROMPT_COMMAND=__ssh_prompt`
+  buildInjectScript(debug: boolean): string {
+    const marker = debug
+      ? `printf '\\n<SSH_TS:%s><SSH_DONE:%s>' "$(date '+%H:%M:%S.%3N')" "$ec"`
+      : `printf '\\n<SSH_DONE:%s>' "$ec"`
+    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then ${marker}; __SSH_LAST_HIST=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt`
+  }
 }
 
 // ===== PowerShell =====
@@ -71,10 +81,15 @@ class PwshAdapter implements ShellAdapter {
   //   - 命令正常/中断完成 → prompt() 发标记
   //   - resize/空闲重绘（未读命令）→ 不发
   // 兜底：history 前进 或 嵌套等级下降（多行模式 Ctrl-C 退出）也发，防钩子不可用
-  readonly injectScript = [
-    `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:__SSH_PENDING -or $global:__SSH_PENDING -or $hid -ne $global:__SSH_HID -or $nested -lt $global:__SSH_NESTED) { $s = "<SSH_DONE:$ec>" }; $global:__SSH_PENDING = $false; $global:__SSH_HID = $hid; $global:__SSH_NESTED = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }`,
-    `if ($function:PSConsoleHostReadLine) { $global:__SSH_ORIG_RL = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:__SSH_PENDING = $true; & $global:__SSH_ORIG_RL } }`,
-  ].join("\n")
+  buildInjectScript(debug: boolean): string {
+    const marker = debug
+      ? `$s = "<SSH_TS:$(Get-Date -Format HH:mm:ss.fff)><SSH_DONE:$ec>"`
+      : `$s = "<SSH_DONE:$ec>"`
+    return [
+      `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:__SSH_PENDING -or $global:__SSH_PENDING -or $hid -ne $global:__SSH_HID -or $nested -lt $global:__SSH_NESTED) { ${marker} }; $global:__SSH_PENDING = $false; $global:__SSH_HID = $hid; $global:__SSH_NESTED = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }`,
+      `if ($function:PSConsoleHostReadLine) { $global:__SSH_ORIG_RL = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:__SSH_PENDING = $true; & $global:__SSH_ORIG_RL } }`,
+    ].join("\n")
+  }
 }
 
 /** 注册表（按优先级排列） */

@@ -53,7 +53,8 @@ export class SshSession extends BaseSession {
     log.hook("ssh_disconnect", `关闭会话 ${this._host}`)
   }
 
-  async connect(opts: { host: string; user: string; port?: number; password?: string }): Promise<ConnectResult> {
+  async connect(opts: { host: string; user: string; port?: number; password?: string; debug?: boolean }): Promise<ConnectResult> {
+    this._debug = opts.debug ?? false
     const port = opts.port ?? 22
     let auth: AuthInfo
     if (opts.password) {

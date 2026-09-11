@@ -53,8 +53,9 @@ export class LocalSession extends BaseSession {
    * @param opts 命令（如 "pwsh" / "docker exec -it <容器> bash"）与工作目录
    * @returns 是否启动成功
    */
-  async connect(opts: { command: string; cwd?: string }): Promise<{ ok: boolean; error?: string }> {
+  async connect(opts: { command: string; cwd?: string; debug?: boolean }): Promise<{ ok: boolean; error?: string }> {
     try {
+      this._debug = opts.debug ?? false
       const term = new Bun.Terminal({
         cols: PTY_COLS,
         rows: PTY_ROWS,
