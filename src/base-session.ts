@@ -59,8 +59,6 @@ export abstract class BaseSession {
   /** Shell 适配器（探测后确定） */
   protected _adapter: ShellAdapter | null = null
   protected _closed = false
-  /** 调试模式：命令完成时在提示符注入时间戳（仅 raw 调试视图可见） */
-  protected _debug = false
   /** 当前运行命令的输入时刻（history 记录展示命令发起时间用） */
   private _runningStartTs = 0
   /** 连续原始字节流（从首字节起累积，含欢迎页/探测/注入/提示符/marker）；ring 裁剪 */
@@ -125,7 +123,7 @@ export abstract class BaseSession {
         this._remoteBusy = false
         const raw = this._buffer.slice(0, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
-        this._history.append(command, extractOutput(raw, command), this._runningStartTs)
+        this._history.append(command, extractOutput(raw, command), this._runningStartTs, Date.now())
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -133,7 +131,7 @@ export abstract class BaseSession {
         this._remoteBusy = false
         const raw = this._buffer.slice(0)
         this._cursor = this._buffer.length
-        this._history.append(command, raw, this._runningStartTs)
+        this._history.append(command, raw, this._runningStartTs, Date.now())
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -328,7 +326,7 @@ export abstract class BaseSession {
  */
 protected async _injectAndSettle(deadline: number): Promise<boolean> {
   const TOKEN = "__SSH_INJECT_DONE__"
-  const lines = this._adapter!.buildInjectScript(this._debug).split("\n")
+  const lines = this._adapter!.buildInjectScript().split("\n")
   while (Date.now() < deadline) {
     for (const line of lines) {
       if (line.trim()) this._write(line + "\r")

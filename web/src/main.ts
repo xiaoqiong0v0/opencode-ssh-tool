@@ -32,7 +32,18 @@ interface SessionStatus {
 interface TranscriptPair {
   type: "cmd" | "out" | "run" | "sep"
   ts?: number
+  endTs?: number
   text: string
+}
+
+/** 从原始终端输出中提取退出码和剥离标记后的文本 */
+function parseOutput(raw: string): { text: string; exitCode?: number } {
+  const m = raw.match(DONE_RE)
+  if (m && m.length > 0) {
+    const code = parseInt(m[m.length - 1].replace(/<SSH_DONE:|>/g, ""), 10)
+    return { text: raw.replace(DONE_RE, ""), exitCode: isNaN(code) ? undefined : code }
+  }
+  return { text: raw }
 }
 
 interface GridCell {
@@ -430,12 +441,15 @@ function stripDone(s: string): string {
 
 function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
   const out: string[] = []
+  /** 当前命令的开始/结束时刻（供下一条输出行展示耗时与退出状态） */
+  let pending: { ts?: number; endTs?: number } | null = null
   for (const p of pairs) {
     if (p.type === "sep") {
       out.push('<div class="sep"><hr></div>')
       continue
     }
     if (p.type === "cmd") {
+      pending = { ts: p.ts, endTs: p.endTs }
       const t = p.ts ? fmtTime(p.ts) : ""
       out.push('<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + escHtml(p.text) + '</span></div>')
     } else if (p.type === "run") {
@@ -444,13 +458,30 @@ function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
       const rows = runScreen.render().map((r) => '<div class="row"><span class="t"></span><span class="c">' + r + '</span></div>').join("")
       out.push('<div id="runBlock">' + rows + '</div>')
     } else {
+      const parsed = parseOutput(p.text)
       const scr = new TermScreen(PTY_COLS)
-      scr.write(stripDone(p.text))
-      const rows = scr.render().map((r) => '<div class="row"><span class="t"></span><span class="c">' + r + '</span></div>').join("")
-      out.push(rows)
+      scr.write(parsed.text)
+      const rows = scr.render()
+      const meta = showTime ? resultMeta(pending, parsed.exitCode) : ""
+      const rowOf = (t: string, c: string): string => '<div class="row"><span class="t">' + t + '</span><span class="c">' + c + '</span></div>'
+      if (rows.length === 0) {
+        // 无输出命令：占一个空行，让输出块可见（时间列展示耗时/退出状态）
+        out.push(rowOf(meta, "&nbsp;"))
+      } else {
+        rows.forEach((r, i) => out.push(rowOf(i === rows.length - 1 ? meta : "", r)))
+      }
+      pending = null
     }
   }
   return out.join("")
+}
+
+/** 生成结果元信息（耗时 + 退出状态），展示在输出最后一行的时间列 */
+function resultMeta(pending: { ts?: number; endTs?: number } | null, exitCode?: number): string {
+  const parts: string[] = []
+  if (pending && pending.ts && pending.endTs) parts.push("+" + ((pending.endTs - pending.ts) / 1000).toFixed(3) + "s")
+  if (exitCode !== undefined) parts.push(exitCode === 0 ? "✓" : "✗ " + exitCode)
+  return parts.join(" ")
 }
 
 function sessionLabel(s: SessionStatus): string {

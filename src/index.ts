@@ -291,7 +291,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       map!.delete(name)
     }
     const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name)
-    const result = await session.connect({ host, user, port, password: values.password, debug: cfg.debug })
+    const result = await session.connect({ host, user, port, password: values.password })
     log.tool("ssh_connect", { host, user, port: port ?? 22, name })
     if (!result.ok) {
       session.close()
@@ -317,7 +317,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       map!.delete(name)
     }
     const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name)
-    const result = await session.connect({ command, cwd: values.cwd, debug: cfg.debug })
+    const result = await session.connect({ command, cwd: values.cwd })
     log.tool("local_connect", { command, name })
     if (!result.ok) {
       session.close()

@@ -33,8 +33,6 @@ export interface ToolConfig {
   /** Web 界面语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
   webLang: Lang
   permission: PermissionConfig
-  /** 调试模式：命令完成时在提示符注入时间戳（仅 raw 调试视图可见），默认 false */
-  debug: boolean
 }
 
 /** 配置默认值 */
@@ -54,7 +52,6 @@ const DEFAULT_CONFIG: ToolConfig = {
     deny: [],
     allow: [],
   },
-  debug: false,
 }
 
 /** 配置文件路径：~/.config/opencode/ssh-tool.jsonc */
@@ -94,10 +91,7 @@ const CONFIG_TEMPLATE = `{
     //   ls | cd | cat | grep | tail | head | ps | df | free | pwd | env | echo | curl | wget | git status | whoami | hostname | date | uname | uptime
     // 自定义补充示例：["^df\\s.*-h$"]（此数组为空 = 仅使用内置默认）
     "allow": []
-  },
-  // 调试模式：命令完成时在提示符注入时间戳（仅 web Raw 调试视图可见，不影响模型/用户）
-  // 默认 false
-  "debug": false
+  }
 }
 `
 
@@ -145,7 +139,6 @@ export function loadConfig(): ToolConfig {
         deny: Array.isArray(permission.deny) ? permission.deny : [],
         allow: Array.isArray(permission.allow) ? permission.allow : [],
       },
-      debug: raw.debug === true,
     }
   } catch (e) {
     // 配置解析失败回退默认

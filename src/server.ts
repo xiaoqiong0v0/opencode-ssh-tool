@@ -59,6 +59,8 @@ interface WsClient extends WebSocket {
 export interface TranscriptPair {
   type: "cmd" | "out" | "run" | "sep"
   ts?: number
+  /** 命令完成时刻（cmd 项）；用于展示耗时 */
+  endTs?: number
   text: string
 }
 
@@ -184,7 +186,7 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
         if (pair.command === "__SSH_SEP__") {
           pairs.push({ type: "sep", ts: pair.ts, text: "" })
         } else {
-          pairs.push({ type: "cmd", ts: pair.ts, text: pair.command })
+          pairs.push({ type: "cmd", ts: pair.ts, endTs: pair.endTs, text: pair.command })
           pairs.push({ type: "out", text: entry.session.getHistory().readOutput(pair) })
         }
       }
@@ -473,7 +475,7 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
         out.push({ type: "sep", ts: data.ts ?? Date.now(), text: "" })
         continue
       }
-      if (typeof data.command === "string") out.push({ type: "cmd", ts: data.ts ?? Date.now(), text: data.command })
+      if (typeof data.command === "string") out.push({ type: "cmd", ts: data.ts ?? Date.now(), endTs: data.endTs, text: data.command })
       if (typeof data.output === "string") out.push({ type: "out", text: data.output })
     } catch {
       /* 跳过损坏文件 */

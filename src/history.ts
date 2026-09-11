@@ -9,7 +9,10 @@ export interface HistoryPair {
   /** 输出文件路径（持久化） */
   file: string
   size: number
+  /** 命令输入时刻 */
   ts: number
+  /** 命令完成时刻（标记出现时） */
+  endTs: number
   /** 序号（文件顺序） */
   seq: number
 }
@@ -50,10 +53,11 @@ export class SessionHistory {
           command: string
           output?: string
           ts: number
+          endTs?: number
         }
         const seq = parseInt(f.split("-")[0] ?? "0", 10) || this.nextSeq
         const size = data.output?.length ?? 0
-        this.pairs.push({ command: data.command, file: join(this.dir, f), size, ts: data.ts, seq })
+        this.pairs.push({ command: data.command, file: join(this.dir, f), size, ts: data.ts, endTs: data.endTs ?? data.ts, seq })
         if (seq >= this.nextSeq) this.nextSeq = seq + 1
       } catch {
         /* 跳过损坏文件 */
@@ -68,13 +72,15 @@ export class SessionHistory {
    * @param command 命令
    * @param output 原始终端流（已去哨兵注入，未做其他清理），供 web 忠实渲染、模型按需 toModelText
    * @param startTs 命令输入时刻（默认取当前时间）；用于展示命令发起时间
+   * @param endTs 命令完成时刻（标记出现时；默认取当前时间）
    */
-  append(command: string, output: string, startTs?: number): void {
+  append(command: string, output: string, startTs?: number, endTs?: number): void {
     const ts = startTs ?? Date.now()
+    const end = endTs ?? Date.now()
     const seq = this.nextSeq++
     const file = join(this.dir, `${String(seq).padStart(6, "0")}-${ts}.json`)
-    writeFileSync(file, JSON.stringify({ command, output, ts }), "utf8")
-    this.pairs.push({ command, file, size: output.length, ts, seq })
+    writeFileSync(file, JSON.stringify({ command, output, ts, endTs: end }), "utf8")
+    this.pairs.push({ command, file, size: output.length, ts, endTs: end, seq })
     this._trim()
   }
 
