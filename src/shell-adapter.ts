@@ -38,14 +38,31 @@ export function stripMarkers(raw: string): string {
   return raw.replace(DONE_RE, "")
 }
 
-// ===== Bash 系（bash / sh / zsh） =====
+// ===== Zsh =====
+// zsh 无 PROMPT_COMMAND；用 precmd_functions 钩子（每次提示符绘制前执行）：
+// 命令结束后重绘提示符 → precmd 运行 → 若历史号前进则输出完成标记
+class ZshAdapter implements ShellAdapter {
+  readonly name = "zsh"
+  readonly probeCommand = "echo __SHELL_ID__$0"
+
+  parseProbe(output: string): boolean {
+    return /\bzsh\b/i.test(output)
+  }
+
+  buildInjectScript(): string {
+    return `__ssh_prompt() { local ec=$?; if [[ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }
+precmd_functions+=(__ssh_prompt); echo __SSH_INJECT_DONE__`
+  }
+}
+
+// ===== Bash 系（bash / sh） =====
 // PROMPT_COMMAND 在每条命令执行完、绘制下一条提示符前执行 —— 是 bash 的可靠"命令完成"钩子
 class BashAdapter implements ShellAdapter {
   readonly name = "bash"
   readonly probeCommand = "echo __SHELL_ID__$0"
 
   parseProbe(output: string): boolean {
-    return /\b(bash|sh|zsh)\b/i.test(output)
+    return /\b(bash|sh)\b/i.test(output)
   }
 
   buildInjectScript(): string {
@@ -79,6 +96,7 @@ class PwshAdapter implements ShellAdapter {
 
 /** 注册表（按优先级排列） */
 const adapters: ShellAdapter[] = [
+  new ZshAdapter(),
   new BashAdapter(),
   new PwshAdapter(),
 ]
