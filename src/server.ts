@@ -470,7 +470,7 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
   const out: TranscriptPair[] = []
   for (const f of files) {
     try {
-      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string; ts?: number }
+      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string; ts?: number; endTs?: number }
       if (data.command === "__SSH_SEP__") {
         out.push({ type: "sep", ts: data.ts ?? Date.now(), text: "" })
         continue

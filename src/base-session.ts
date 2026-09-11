@@ -331,7 +331,6 @@ protected async _injectAndSettle(deadline: number): Promise<boolean> {
     for (const line of lines) {
       if (line.trim()) this._write(line + "\r")
     }
-    this._write(`echo ${TOKEN}\r`)
     if (await this._waitForBufferToken(TOKEN, Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
       await new Promise((r) => setTimeout(r, 100))
       this._buffer = ""

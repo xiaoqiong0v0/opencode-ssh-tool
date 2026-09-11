@@ -476,11 +476,14 @@ function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
   return out.join("")
 }
 
-/** 生成结果元信息（耗时 + 退出状态），展示在输出最后一行的时间列 */
+/** 生成结果元信息 HTML（耗时 + 退出状态），展示在输出最后一行的时间列 */
 function resultMeta(pending: { ts?: number; endTs?: number } | null, exitCode?: number): string {
   const parts: string[] = []
   if (pending && pending.ts && pending.endTs) parts.push("+" + ((pending.endTs - pending.ts) / 1000).toFixed(3) + "s")
-  if (exitCode !== undefined) parts.push(exitCode === 0 ? "✓" : "✗ " + exitCode)
+  if (exitCode !== undefined) {
+    const color = exitCode === 0 ? "#3fb950" : "#ff7b72"
+    parts.push('<span style="color:' + color + '">' + (exitCode === 0 ? "✓" : "✗ " + exitCode) + '</span>')
+  }
   return parts.join(" ")
 }
 

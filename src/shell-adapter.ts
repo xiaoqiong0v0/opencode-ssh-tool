@@ -49,7 +49,7 @@ class BashAdapter implements ShellAdapter {
   }
 
   buildInjectScript(): string {
-    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt`
+    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt; echo __SSH_INJECT_DONE__`
   }
 }
 
@@ -73,10 +73,7 @@ class PwshAdapter implements ShellAdapter {
   //   - resize/空闲重绘（未读命令）→ 不发
   // 兜底：history 前进 或 嵌套等级下降（多行模式 Ctrl-C 退出）也发，防钩子不可用
   buildInjectScript(): string {
-    return [
-      `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:__SSH_PENDING -or $global:__SSH_PENDING -or $hid -ne $global:__SSH_HID -or $nested -lt $global:__SSH_NESTED) { $s = "<SSH_DONE:$ec>" }; $global:__SSH_PENDING = $false; $global:__SSH_HID = $hid; $global:__SSH_NESTED = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }`,
-      `if ($function:PSConsoleHostReadLine) { $global:__SSH_ORIG_RL = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:__SSH_PENDING = $true; & $global:__SSH_ORIG_RL } }`,
-    ].join("\n")
+    return `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:__SSH_PENDING -or $global:__SSH_PENDING -or $hid -ne $global:__SSH_HID -or $nested -lt $global:__SSH_NESTED) { $s = "<SSH_DONE:$ec>" }; $global:__SSH_PENDING = $false; $global:__SSH_HID = $hid; $global:__SSH_NESTED = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; if ($function:PSConsoleHostReadLine) { $global:__SSH_ORIG_RL = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:__SSH_PENDING = $true; & $global:__SSH_ORIG_RL } }; echo __SSH_INJECT_DONE__`
   }
 }
 
