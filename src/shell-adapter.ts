@@ -46,7 +46,7 @@ class ZshAdapter implements ShellAdapter {
   readonly probeCommand = "echo __SHELL_ID__$0"
 
   parseProbe(output: string): boolean {
-    return /\bzsh\b/i.test(output)
+    return /__SHELL_ID__zsh|(?:^|\W)zsh(?:\W|$)/i.test(output)
   }
 
   buildInjectScript(): string {
@@ -62,7 +62,7 @@ class BashAdapter implements ShellAdapter {
   readonly probeCommand = "echo __SHELL_ID__$0"
 
   parseProbe(output: string): boolean {
-    return /\b(bash|sh)\b/i.test(output)
+    return /__SHELL_ID__(bash|sh)\b|(?:^|\W)(bash|sh)(?:\W|$)/i.test(output)
   }
 
   buildInjectScript(): string {
