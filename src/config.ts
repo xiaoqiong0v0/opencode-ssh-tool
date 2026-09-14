@@ -9,6 +9,10 @@ import type { Lang } from "./i18n.js"
 export interface ServerConfig {
   enabled: boolean
   port: number
+  /** 流推送间隔（ms），默认 100。越小实时性越高但 WS 消息更频繁 */
+  streamTickMs?: number
+  /** 无任何会话连接时自动关闭超时（ms），0=不自动关闭。默认 0 */
+  idleShutdownMs?: number
 }
 
 /** 会话记录（命令+输出 消息对）配置 */
@@ -39,8 +43,9 @@ export interface ToolConfig {
 const DEFAULT_CONFIG: ToolConfig = {
   server: {
     enabled: true,
-    // 端口不设默认值：0 = 自动分配随机端口（避免冲突）
     port: 0,
+    streamTickMs: 100,
+    idleShutdownMs: 0,
   },
   history: {
     // 保留的消息对数（最小 1，保留最新）
@@ -65,8 +70,12 @@ const CONFIG_TEMPLATE = `{
   // HTTP 终端记录服务开关（默认 true）
   "server": {
     "enabled": true,
-    // 端口：不设默认值。0 = 自动分配随机端口（推荐，避免冲突）；可显式指定，如 8137
-    "port": 0
+    // 端口：0 = 自动分配随机端口（推荐，避免冲突）；可显式指定，如 8137
+    "port": 0,
+    // 流推送间隔（毫秒），默认 100。越小实时性越高但 WS 消息越频繁，最小 20
+    "streamTickMs": 100,
+    // 无任何会话连接时自动关闭超时（毫秒），0=不自动关闭。默认 0
+    "idleShutdownMs": 0
   },
   // 会话记录（命令+输出 消息对）管理：全部存文件（~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/），随会话清理
   "history": {
@@ -129,6 +138,8 @@ export function loadConfig(): ToolConfig {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
         port: typeof server.port === "number" && Number.isFinite(server.port) ? server.port : DEFAULT_CONFIG.server.port,
+        streamTickMs: typeof server.streamTickMs === "number" && server.streamTickMs >= 20 ? server.streamTickMs : DEFAULT_CONFIG.server.streamTickMs,
+        idleShutdownMs: typeof server.idleShutdownMs === "number" && server.idleShutdownMs >= 0 ? server.idleShutdownMs : DEFAULT_CONFIG.server.idleShutdownMs,
       },
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),

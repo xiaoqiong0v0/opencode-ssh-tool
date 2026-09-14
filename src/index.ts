@@ -15,8 +15,9 @@ import { toModelText } from "./utils.js"
 import { createDecider } from "./permission.js"
 import { SshSession } from "./session.js"
 import { LocalSession } from "./local-session.js"
-import { type ServerHandle, type SessionEntry } from "./server.js"
+import { type SessionEntry } from "./server.js"
 import { ensureServer } from "./server-manager.js"
+import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
 
 /** 默认终端名（不传 name 时用） */
@@ -51,23 +52,35 @@ const localSessions = new Map<string, Map<string, LocalSession>>()
 /** 会话元信息（标题/目录，供 HTTP 页面显示），key = sessionID */
 const sessionMeta = new Map<string, { title: string; directory: string }>()
 
-/** HTTP 终端记录服务句柄（本进程持有，可能为 null） */
-let httpServer: ServerHandle | null = null
-
-/** HTTP 服务已知地址（本进程启动或复用时记录，供展示） */
+/** HTTP 服务已知地址（独立进程托管，本进程仅记录用于展示） */
 let httpUrl = ""
 
-/** 进程退出兜底：关闭全部连接（SSH + 本地终端）+ 关闭本进程持有的 HTTP 服务 */
+/** 代理客户端句柄（连接独立服务转发交互），可能为 null */
+let agent: AgentHandle | null = null
+
+/** 本进程持有的全部会话（供代理注册，{sessionID, name}[]） */
+function listAgentSessions(): Array<{ sessionID: string; name: string }> {
+  const out: Array<{ sessionID: string; name: string }> = []
+  for (const [sessionID, map] of sshSessions) for (const name of map.keys()) out.push({ sessionID, name })
+  for (const [sessionID, map] of localSessions) for (const name of map.keys()) out.push({ sessionID, name })
+  return out
+}
+
+/** 按 sessionID/name 取会话（供代理转发执行），转为 AgentSession 结构 */
+function resolveAgentSession(sessionID: string, name: string): AgentSession | undefined {
+  return resolveSession(sessionID, name) as AgentSession | undefined
+}
+
+/** 会话增删后通知代理重新注册（无代理时空操作） */
+function refreshAgent(): void {
+  agent?.reRegister()
+}
+
+/** 进程退出兜底：关闭全部连接（SSH + 本地终端）+ 断开代理（独立服务不受影响） */
 process.on("exit", () => {
   for (const map of sshSessions.values()) for (const s of map.values()) s.close()
   for (const map of localSessions.values()) for (const s of map.values()) s.close()
-  if (httpServer) {
-    try {
-      httpServer.close()
-    } catch {
-      /* 忽略 */
-    }
-  }
+  agent?.close()
 })
 
 /** 按 sessionID 取内层终端表（无则返回 undefined） */
@@ -149,6 +162,7 @@ function cleanupLocalSession(sessionID: string, name = DEFAULT_NAME): void {
     if (map!.size === 0) localSessions.delete(sessionID)
   }
   removeSessionState(cacheRoot(), sessionID, name)
+  refreshAgent()
 }
 
 /** 清理一个 sessionID 下全部本地终端 */
@@ -165,6 +179,7 @@ function cleanupAllLocalSessions(sessionID: string): void {
   } catch {
     /* 忽略 */
   }
+  refreshAgent()
 }
 
 /** 插件缓存根目录（历史消息对存文件，随会话清理） */
@@ -190,6 +205,7 @@ function cleanupSession(sessionID: string, name = DEFAULT_NAME): void {
     }
   }
   removeSessionState(cacheRoot(), sessionID, name)
+  refreshAgent()
 }
 
 /** 清理一个 sessionID 下全部终端 */
@@ -206,6 +222,7 @@ function cleanupAllSessions(sessionID: string): void {
   } catch {
     /* 忽略 */
   }
+  refreshAgent()
 }
 
 export const OpenCodeSshTool: Plugin = async () => {
@@ -239,13 +256,11 @@ export const OpenCodeSshTool: Plugin = async () => {
   if (cfg.server.enabled) {
     try {
       const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), getLang(cfg.webLang))
-      if (sr.server) {
-        httpServer = sr.server
+      if (sr.url) {
         httpUrl = sr.url
-        log.info(`HTTP 服务已启动 ${sr.url}`)
-      } else if (sr.reused) {
-        httpUrl = sr.url
-        log.info(`HTTP 服务复用 ${sr.url}`)
+        log.info(`HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`)
+        const wsUrl = sr.url.replace(/^http/, "ws") + "/ws"
+        agent = startAgent(wsUrl, resolveAgentSession, listAgentSessions)
       } else {
         log.info("HTTP 服务未启动（端口冲突或锁竞争）")
       }
@@ -300,6 +315,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!map) sshSessions.set(ctx.sessionID, new Map())
     sshSessions.get(ctx.sessionID)!.set(name, session)
     syncSessionState(ctx.sessionID, name)
+    refreshAgent()
     return tr("connect_ok", lang).replace("{user}", user).replace("{host}", host).replace("{port}", String(port ?? 22)).replace("{sid}", ctx.sessionID).replace("{name}", name)
   }
 
@@ -326,6 +342,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!map) localSessions.set(ctx.sessionID, new Map())
     localSessions.get(ctx.sessionID)!.set(name, session)
     syncSessionState(ctx.sessionID, name)
+    refreshAgent()
     return tr("local_connect_ok", lang).replace("{cmd}", command).replace("{name}", name)
   }
 
