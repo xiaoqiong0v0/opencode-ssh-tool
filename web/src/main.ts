@@ -647,10 +647,25 @@ termPre.addEventListener("scroll", () => {
 // ===== 底部命令输入 =====
 const cmdHistory: string[] = []
 let cmdHistIdx = -1
+let tabMatchIdx = -1
+let tabPrefix = ""
 
 const cmdInput = document.getElementById("cmdInput") as HTMLTextAreaElement
 cmdInput.placeholder = I18N.cmdPlaceholder || ""
 cmdInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Tab") {
+    ev.preventDefault()
+    const val = cmdInput.value.trim()
+    if (!val) return
+    if (tabPrefix !== val) { tabMatchIdx = -1; tabPrefix = val }
+    const matches = cmdHistory.filter((c) => c.startsWith(tabPrefix))
+    if (matches.length === 0) return
+    tabMatchIdx = (tabMatchIdx + 1) % matches.length
+    cmdInput.value = matches[tabMatchIdx]
+    autoGrowCmdInput()
+    return
+  }
+  tabPrefix = ""
   if (ev.key === "ArrowUp") {
     ev.preventDefault()
     if (cmdHistIdx > 0) { cmdHistIdx--; cmdInput.value = cmdHistory[cmdHistIdx]; autoGrowCmdInput() }
