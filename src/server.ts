@@ -167,9 +167,20 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
     const states = listAllSessions(dir)
     // 用 live 连接修正 stale 状态：进程复苏后旧状态文件里的 connected=true 实为已断开
     const liveKey = new Set(getSessions().map((e) => `${e.sessionID}:${e.name}`))
+    // live 会话的实时 busy/connected（web 端 WS exec 不写状态文件，busy 需从内存读）
+    const liveStatus = new Map<string, { connected: boolean; busy: boolean }>()
+    for (const e of getSessions()) {
+      const st = (e.session as unknown as { getStatus(): { connected: boolean; busy: boolean } }).getStatus()
+      liveStatus.set(`${e.sessionID}:${e.name}`, { connected: st.connected, busy: st.busy })
+    }
     for (const s of states) {
       if (s.connected && !liveKey.has(`${s.sessionID}:${s.name}`)) {
         s.connected = false
+      }
+      const live = liveStatus.get(`${s.sessionID}:${s.name}`)
+      if (live) {
+        s.connected = live.connected
+        s.busy = live.busy
       }
     }
     const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
@@ -346,7 +357,24 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
           if (!sid || !command) break
           const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
           if (!entry) break
-          ;(entry.session as any).exec(command)
+          ;(entry.session as any).exec(command).then(() => {
+            // exec 完成后立即推送一次会话状态（busy 复位），不等 2s 定时器
+            const payload = buildSessions()
+            const json = JSON.stringify(payload)
+            for (const client of wss.clients as Set<WsClient>) {
+              if (client.readyState !== WebSocket.OPEN) continue
+              client._lastSessionsJson = json
+              send(client, { type: "sessions", ...payload })
+            }
+          })
+          // exec 前立即推送一次（busy 置位），让前端马上看到沙漏
+          const payload = buildSessions()
+          const json = JSON.stringify(payload)
+          for (const client of wss.clients as Set<WsClient>) {
+            if (client.readyState !== WebSocket.OPEN) continue
+            client._lastSessionsJson = json
+            send(client, { type: "sessions", ...payload })
+          }
           break
         }
         case "send": {
