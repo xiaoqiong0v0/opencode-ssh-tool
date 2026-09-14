@@ -37,9 +37,7 @@ body:not(.show-time) .row .t { display: none; }
 #cmdInput { flex: 1; box-sizing: border-box; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; outline: none; resize: none; max-height: 120px; overflow-y: auto; }
 #cmdInput:focus { border-color: #58a6ff; }
 #cmdInput:disabled { opacity: 0.4; }
-#cmdSend { flex: 0 0 auto; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
-#cmdSend:disabled { opacity: 0.4; cursor: default; }
-#cmdSend:hover:not(:disabled) { background: #2ea043; }
-#cmdPrev, #cmdNext { flex: 0 0 auto; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; font-size: 13px; cursor: pointer; }
-#cmdPrev:disabled, #cmdNext:disabled { opacity: 0.4; cursor: default; }
-#cmdPrev:hover:not(:disabled), #cmdNext:hover:not(:disabled) { background: #30363d; }
+#cmdKey { flex: 0 0 auto; width: 72px; text-align: center; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 6px; font-size: 12px; white-space: nowrap; overflow: hidden; cursor: crosshair; user-select: none; display: flex; align-items: center; justify-content: center; transition: border-color .15s; }
+#cmdKey.capture { border-color: #e67e22; animation: pulse 0.6s ease-in-out infinite alternate; }
+#cmdKey.disabled { opacity: 0.35; cursor: default; }
+@keyframes pulse { from { opacity: 0.6; } to { opacity: 1; } }

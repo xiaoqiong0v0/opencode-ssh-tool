@@ -312,11 +312,11 @@ function updateCmdBar(): void {
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   const s = sessionsData.find((x) => x.sessionID === sid)
   const t = s?.terminals.find((t2) => (t2.name || "default") === name)
-  // 无终端或未连接时禁用中断按钮；busy 时不禁用（执行中正需要 Ctrl-C 中断）
+  // 无终端或未连接时显示灰色提示，busy 时正常可捕获（执行中正需要快捷键）
   const disabled = !t || !t.connected
-  const send = document.getElementById("cmdSend") as HTMLButtonElement
-  // 输入框不禁用（避免失焦需重新点击），仅无连接时禁中断按钮；发送逻辑在 Enter 处理里按 connected/busy 判断
-  send.disabled = disabled
+  const key = document.getElementById("cmdKey") as HTMLSpanElement
+  key.classList.toggle("disabled", disabled)
+  key.title = disabled ? "" : (I18N.sendCtrlC || "")
 }
 
 function updateTerminalSelect(prevName?: string): void {
@@ -707,45 +707,52 @@ function autoGrowCmdInput(): void {
 }
 cmdInput.addEventListener("input", autoGrowCmdInput)
 
-// 快捷键发送按钮：点击后等待下一个按键，自动编码并发送到终端
-const cmdSend = document.getElementById("cmdSend") as HTMLButtonElement
-let recordingKey = false
-cmdSend.textContent = I18N.sendCtrlC || "Ctrl-C"
-cmdSend.addEventListener("click", () => {
+// 快捷键捕获区：鼠标悬停后按任意键松开即发送到终端
+const cmdKey = document.getElementById("cmdKey") as HTMLSpanElement
+const CMD_KEY_RESET = I18N.sendCtrlC || "Ctrl-C"
+let capActive = false
+cmdKey.textContent = CMD_KEY_RESET
+function sendKeystroke(ev: KeyboardEvent): void {
+  if (!capActive) return
+  capActive = false
+  cmdKey.classList.remove("capture")
+  document.removeEventListener("keyup", sendKeystroke)
   const sid = (document.getElementById("session") as HTMLSelectElement).value
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
-  recordingKey = true
-  cmdSend.textContent = "..."
-  cmdSend.classList.add("recording")
-  document.addEventListener("keydown", _onCaptureKey, { once: true })
-})
-function _onCaptureKey(ev: KeyboardEvent): void {
-  recordingKey = false
-  cmdSend.classList.remove("recording")
-  const sid = (document.getElementById("session") as HTMLSelectElement).value
-  const name = (document.getElementById("terminal") as HTMLSelectElement).value
   let text: string
   let label: string
   if (ev.ctrlKey && ev.key !== "Control") {
     const code = ev.key.toLowerCase().charCodeAt(0) - 96
-    if (code >= 1 && code <= 26) {
-      text = "\\x" + code.toString(16).padStart(2, "0")
-      label = "Ctrl-" + ev.key.toUpperCase()
-    } else { text = ""; label = "" }
+    if (code >= 1 && code <= 26) { text = "\\x" + code.toString(16).padStart(2, "0"); label = "Ctrl-" + ev.key.toUpperCase() }
+    else { text = ""; label = "" }
   } else if (ev.key === "Enter") { text = "\\r"; label = "↵" }
   else if (ev.key === "Escape") { text = "\\x1b"; label = "Esc" }
   else if (ev.key === "Tab") { text = "\\t"; label = "Tab" }
   else if (ev.key === "Backspace") { text = "\\x7f"; label = "⌫" }
   else if (ev.key === " " || ev.key === "Space") { text = " "; label = "Space" }
   else if (ev.key.length === 1) { text = ev.key; label = ev.key }
-  else { text = "\\x03"; label = "Ctrl-C" } // 兜底
-  if (text && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text }))
-  }
-  if (label) cmdSend.textContent = label
-  else cmdSend.textContent = I18N.sendCtrlC || "Ctrl-C"
+  else { text = "\\x03"; label = "Ctrl-C" }
+  if (text) ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text }))
+  cmdKey.textContent = label || CMD_KEY_RESET
+  setTimeout(() => { if (!capActive) cmdKey.textContent = CMD_KEY_RESET }, 1500)
 }
+cmdKey.addEventListener("mouseenter", () => {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  if (!sid) return
+  capActive = true
+  cmdKey.classList.add("capture")
+  cmdKey.textContent = "..."
+  document.addEventListener("keyup", sendKeystroke)
+})
+cmdKey.addEventListener("mouseleave", () => {
+  if (!capActive) return
+  capActive = false
+  cmdKey.classList.remove("capture")
+  document.removeEventListener("keyup", sendKeystroke)
+  cmdKey.textContent = CMD_KEY_RESET
+})
 
 Object.assign(window, {
   onSessionChange,
