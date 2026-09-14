@@ -357,12 +357,17 @@ protected async _injectAndSettle(deadline: number): Promise<boolean> {
   return false
 }
 
-/** 等待缓冲中出现指定文本（最多 maxMs） */
+/** 等待缓冲中出现指定文本（最多 maxMs）
+ * 注入脚本很长时 ConPTY 会在 120 列处自动换行，输出流在换行处插入新行，
+ * 整行精确匹配会失败导致无限重试；改用"脚本前缀 + 其后 TOKEN"判定
+ */
 private async _waitForBufferToken(line: string, token: string, maxMs: number): Promise<boolean> {
   const startTime = Date.now()
+  // 前缀取脚本开头 40 字符（不会触及终端列宽换行点），作为注入脚本确实被回显的锚点
+  const prefix = line.slice(0, 40)
   while (Date.now() - startTime < maxMs) {
-    const lineEnd = findLastEndOf(line, this._buffer)
-    if (lineEnd >= 0 && this._buffer.includes(token, lineEnd + 1)) return true
+    const prefixEnd = findLastEndOf(prefix, this._buffer)
+    if (prefixEnd >= 0 && this._buffer.includes(token, prefixEnd + 1)) return true
     await new Promise((r) => setTimeout(r, 50))
   }
   return false
