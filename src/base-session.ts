@@ -129,7 +129,7 @@ export abstract class BaseSession {
         this._remoteBusy = false
         const raw = this._buffer.slice(captureStart)
         this._cursor = this._buffer.length
-        this._history.append(command, raw, this._runningStartTs, Date.now())
+        this._history.append(command, extractOutput(raw, command), this._runningStartTs, Date.now())
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }

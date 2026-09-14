@@ -338,6 +338,10 @@ function updateTerminalSelect(prevName?: string): void {
   const cur = s?.terminals.find((t) => (t.name || "default") === tsel.value)
   delBtn.classList.toggle("show", !!(cur && !cur.connected))
   updateCmdBar()
+  updateMetaFromSessions()
+  // 强制重新订阅（切换终端或删除后原订阅失效）
+  subSid = ""
+  subName = ""
   subscribe()
 }
 
@@ -373,11 +377,7 @@ function handleSnapshot(msg: { sessionID: string; name: string; pairs: Transcrip
   const showTime = !debugMode && (document.getElementById("showTime") as HTMLInputElement).checked
   document.body.classList.toggle("show-time", showTime)
   const cmdCount = pairs.filter((p) => p.type === "cmd").length
-  const s = sessionsData.find((x) => x.sessionID === msg.sessionID)
-  const t = s?.terminals.find((t2) => (t2.name || "default") === msg.name)
-  const typeInfo = t ? (t.host ? t.host + (t.port ? ":" + t.port : "") : (t.program || "")) : ""
-  const typePart = typeInfo ? " [" + typeInfo + "]" : ""
-  document.getElementById("meta").textContent = msg.sessionID + "/" + msg.name + typePart + " · " + cmdCount + " " + I18N.commands
+  updateMetaFromSessions(cmdCount)
   // debug 模式下 raw 连续流优先：raw 数据渲染画面，snapshot 不再重建 transcript
   if (debugMode && rawActive) return
   runScreen = null
@@ -388,6 +388,19 @@ function handleSnapshot(msg: { sessionID: string; name: string; pairs: Transcrip
   } else {
     toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "block" : "none"
   }
+}
+
+/** 从本地 sessionsData 更新顶部 meta（终端标识 + 类型 + 命令数） */
+function updateMetaFromSessions(cmdCount?: number): void {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  if (!sid) { document.getElementById("meta").textContent = ""; return }
+  const s = sessionsData.find((x) => x.sessionID === sid)
+  const t = s?.terminals.find((t2) => (t2.name || "default") === name)
+  const typeInfo = t ? (t.host ? t.host + (t.port ? ":" + t.port : "") : (t.program || "")) : ""
+  const typePart = typeInfo ? " [" + typeInfo + "]" : ""
+  const countPart = cmdCount !== undefined ? " · " + cmdCount + " " + I18N.commands : ""
+  document.getElementById("meta").textContent = sid + "/" + name + typePart + countPart
 }
 
 // ===== Run 增量处理 =====
