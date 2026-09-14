@@ -101,6 +101,7 @@ export function startServer(
   const agents = new Map<WsClient, Set<string>>()
   const agentBySession = new Map<string, WsClient>()
   const streamBuf = new Map<string, { data: string; done: boolean }>()
+  const rawBuf = new Map<string, { data: string; pos: number }>()
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -265,6 +266,13 @@ export function startServer(
           const key = JSON.stringify(snap)
           if (key !== client._lastKey) { client._lastKey = key; send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...snap }) }
         }
+        if (client._rawPos !== undefined) {
+          const r = rawBuf.get(sKey)
+          if (r && r.pos > client._rawPos) {
+            const data = r.data.slice(client._rawPos)
+            if (data) { client._rawPos = r.pos; send(client, { type: "raw", data, pos: r.pos }) }
+          }
+        }
       }
     }
   }, streamTickMs)
@@ -345,6 +353,19 @@ export function startServer(
 
       // --- 以下 web 客户端消息 ---
 
+      if (t === "raw") {
+        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+        const name = typeof msg.name === "string" ? msg.name : ""
+        const data = typeof msg.data === "string" ? msg.data : ""
+        const pos = typeof msg.pos === "number" ? msg.pos : 0
+        if (!sid) return
+        const k = sessionKey(sid, name)
+        const existing = rawBuf.get(k)
+        if (msg.reset === true || !existing) rawBuf.set(k, { data, pos })
+        else if (data) rawBuf.set(k, { data: existing.data + data, pos })
+        return
+      }
+
       if (t === "subscribe") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
@@ -355,13 +376,17 @@ export function startServer(
         ws._lastKey = JSON.stringify(snap)
         ws._forceSnap = false
         send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
-        if (entry) {
-          const wantRaw = msg.raw === true
-          if (wantRaw) {
+        const wantRaw = msg.raw === true
+        if (wantRaw) {
+          if (entry) {
             const r = entry.session.readRawStream(0)
             ws._rawPos = r.pos
             send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
-          } else { ws._rawPos = undefined }
+          } else if (agentBySession.has(sessionKey(sid, name))) {
+            const r = rawBuf.get(sessionKey(sid, name))
+            ws._rawPos = r?.pos ?? 0
+            if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+          } else { ws._rawPos = 0 }
         } else { ws._rawPos = undefined }
         return
       }

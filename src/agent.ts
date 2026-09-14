@@ -10,8 +10,9 @@ export interface AgentSession {
   close(): void
   hasRunningStream(): boolean
   getRunningStream(): { data: string; done: boolean }
-  /** 当前正在运行的命令文本（若无运行中命令返回空字符串） */
   getRunningCommand(): string
+  /** 读取原始字节流增量 */
+  readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
 }
 
 /** 代理状态 */
@@ -47,13 +48,21 @@ export function startAgent(
   }
 
   const prevRunning = new Set<string>()
+  const rawPosMap = new Map<string, number>()
 
   const pushStreams = (): void => {
     const nowRunning = new Set<string>()
     for (const { sessionID, name } of listSessions()) {
       const session = resolveSession(sessionID, name)
       const key = `${sessionID}:${name}`
-      if (!session || !session.hasRunningStream()) continue
+      if (!session) continue
+      // 原始字节流增量（所有会话统一推送，server 按 raw 订阅者转发）
+      const raw = session.readRawStream(rawPosMap.get(key) ?? 0)
+      if (raw.data) {
+        rawPosMap.set(key, raw.pos)
+        send({ type: "raw", sessionID, name, data: raw.data, pos: raw.pos, reset: !!raw.reset })
+      }
+      if (!session.hasRunningStream()) continue
       nowRunning.add(key)
       const st = session.getRunningStream()
       if (st.done) {
