@@ -373,7 +373,11 @@ function handleSnapshot(msg: { sessionID: string; name: string; pairs: Transcrip
   const showTime = !debugMode && (document.getElementById("showTime") as HTMLInputElement).checked
   document.body.classList.toggle("show-time", showTime)
   const cmdCount = pairs.filter((p) => p.type === "cmd").length
-  document.getElementById("meta").textContent = msg.sessionID + "/" + msg.name + " · " + cmdCount + " " + I18N.commands
+  const s = sessionsData.find((x) => x.sessionID === msg.sessionID)
+  const t = s?.terminals.find((t2) => (t2.name || "default") === msg.name)
+  const typeInfo = t ? (t.host ? t.host + (t.port ? ":" + t.port : "") : (t.program || "")) : ""
+  const typePart = typeInfo ? " [" + typeInfo + "]" : ""
+  document.getElementById("meta").textContent = msg.sessionID + "/" + msg.name + typePart + " · " + cmdCount + " " + I18N.commands
   // debug 模式下 raw 连续流优先：raw 数据渲染画面，snapshot 不再重建 transcript
   if (debugMode && rawActive) return
   runScreen = null
