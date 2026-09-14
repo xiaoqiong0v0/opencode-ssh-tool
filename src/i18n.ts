@@ -249,6 +249,8 @@ Examples:
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
   web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
   web_send_ctrlc: { en: "Send Ctrl-C", zh: "发送 Ctrl-C" },
+  web_cmd_prev: { en: "Previous command", zh: "上一条命令" },
+  web_cmd_next: { en: "Next command", zh: "下一条命令" },
   disconnected_ok: {
     en: "Terminal closed ({host}).",
     zh: "终端已断开（{host}）。",

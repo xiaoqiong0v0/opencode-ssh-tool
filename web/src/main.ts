@@ -645,15 +645,25 @@ termPre.addEventListener("scroll", () => {
 })
 
 // ===== 底部命令输入 =====
+const cmdHistory: string[] = []
+let cmdHistIdx = -1
+
 const cmdInput = document.getElementById("cmdInput") as HTMLTextAreaElement
 cmdInput.placeholder = I18N.cmdPlaceholder || ""
 cmdInput.addEventListener("keydown", (ev) => {
-  if (ev.key !== "Enter") return
-  // Shift+Enter 换行；单独 Enter 发送命令
-  if (ev.shiftKey) {
-    autoGrowCmdInput()
+  if (ev.key === "ArrowUp") {
+    ev.preventDefault()
+    if (cmdHistIdx > 0) { cmdHistIdx--; cmdInput.value = cmdHistory[cmdHistIdx]; autoGrowCmdInput() }
     return
   }
+  if (ev.key === "ArrowDown") {
+    ev.preventDefault()
+    if (cmdHistIdx < cmdHistory.length - 1) { cmdHistIdx++; cmdInput.value = cmdHistory[cmdHistIdx]; autoGrowCmdInput() }
+    else { cmdHistIdx = cmdHistory.length; cmdInput.value = ""; autoGrowCmdInput() }
+    return
+  }
+  if (ev.key !== "Enter") return
+  if (ev.shiftKey) { autoGrowCmdInput(); return }
   ev.preventDefault()
   const command = cmdInput.value.trim()
   if (!command) return
@@ -665,11 +675,12 @@ cmdInput.addEventListener("keydown", (ev) => {
   if (t.busy) return
   cmdInput.value = ""
   autoGrowCmdInput()
+  cmdHistory.push(command)
+  cmdHistIdx = cmdHistory.length
+  updateHistButtons()
   if (!ws || ws.readyState !== WebSocket.OPEN) return
-  // 未订阅则先订阅，确保命令输出能推过来
   if (subSid !== sid || subName !== name) {
-    subSid = sid
-    subName = name
+    subSid = sid; subName = name
     ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name }))
   }
   ws.send(JSON.stringify({ type: "exec", sessionID: sid, name, command }))
@@ -691,6 +702,26 @@ cmdSend.addEventListener("click", () => {
   if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
   ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text: "\\x03" }))
 })
+
+// 历史命令切换按钮
+const cmdPrev = document.getElementById("cmdPrev") as HTMLButtonElement
+const cmdNext = document.getElementById("cmdNext") as HTMLButtonElement
+cmdPrev.textContent = "↑"
+cmdPrev.title = I18N.cmdPrev || ""
+cmdNext.textContent = "↓"
+cmdNext.title = I18N.cmdNext || ""
+function updateHistButtons(): void {
+  cmdPrev.disabled = cmdHistIdx <= 0
+  cmdNext.disabled = cmdHistIdx >= cmdHistory.length
+}
+cmdPrev.addEventListener("click", () => {
+  if (cmdHistIdx > 0) { cmdHistIdx--; cmdInput.value = cmdHistory[cmdHistIdx]; autoGrowCmdInput(); updateHistButtons() }
+})
+cmdNext.addEventListener("click", () => {
+  if (cmdHistIdx < cmdHistory.length - 1) { cmdHistIdx++; cmdInput.value = cmdHistory[cmdHistIdx]; autoGrowCmdInput(); updateHistButtons() }
+  else { cmdHistIdx = cmdHistory.length; cmdInput.value = ""; autoGrowCmdInput(); updateHistButtons() }
+})
+updateHistButtons()
 
 Object.assign(window, {
   onSessionChange,

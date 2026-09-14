@@ -75,6 +75,8 @@ const PAGE_KEYS: FlatKey[] = [
   "web_delete_terminal",
   "web_cmd_placeholder",
   "web_send_ctrlc",
+  "web_cmd_prev",
+  "web_cmd_next",
 ]
 
 /** 前端 JS 内 I18N 对象键 → i18n key */
@@ -89,6 +91,8 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   terminals: "web_terminals",
   cmdPlaceholder: "web_cmd_placeholder",
   sendCtrlC: "web_send_ctrlc",
+  cmdPrev: "web_cmd_prev",
+  cmdNext: "web_cmd_next",
 }
 
 /** WS 运行增量轮询间隔 */

@@ -40,3 +40,6 @@ body:not(.show-time) .row .t { display: none; }
 #cmdSend { flex: 0 0 auto; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
 #cmdSend:disabled { opacity: 0.4; cursor: default; }
 #cmdSend:hover:not(:disabled) { background: #2ea043; }
+#cmdPrev, #cmdNext { flex: 0 0 auto; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; font-size: 13px; cursor: pointer; }
+#cmdPrev:disabled, #cmdNext:disabled { opacity: 0.4; cursor: default; }
+#cmdPrev:hover:not(:disabled), #cmdNext:hover:not(:disabled) { background: #30363d; }
