@@ -313,9 +313,8 @@ function updateCmdBar(): void {
   const s = sessionsData.find((x) => x.sessionID === sid)
   const t = s?.terminals.find((t2) => (t2.name || "default") === name)
   const disabled = !t || !t.connected || t.busy
-  const input = document.getElementById("cmdInput") as HTMLTextAreaElement
   const send = document.getElementById("cmdSend") as HTMLButtonElement
-  input.disabled = disabled
+  // 输入框不禁用（避免失焦需重新点击），仅中断按钮禁用；发送逻辑在 Enter 处理里按 connected/busy 判断
   send.disabled = disabled
 }
 
