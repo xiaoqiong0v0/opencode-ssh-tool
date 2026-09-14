@@ -307,7 +307,8 @@ export abstract class BaseSession {
     while (Date.now() < deadline) {
       this._write("echo __SHELL_ID__$0\r")
       const output = await this._waitProbeOutput(Math.min(PROBE_TIMEOUT_MS, deadline - Date.now()))
-      if (output !== null && /\b__SHELL_ID__\b/.test(output)) {
+      // __SHELL_ID__ 后须有 shell 名称（避免命令回显 echo __SHELL_ID__$0 提前误匹配）
+      if (output !== null && /__SHELL_ID__[a-zA-Z]/.test(output)) {
         const adapter = resolveByProbe(output)
         this._buffer = ""
         return adapter
