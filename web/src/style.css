@@ -8,7 +8,7 @@ html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-
 header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
 header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
 select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-pre { margin: 0; padding: 16px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+pre { margin: 0 0 48px; padding: 16px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
 .row { display: flex; align-items: stretch; }
 .row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
 .row .c { flex: 1; padding-left: 12px; white-space: pre; }
@@ -33,3 +33,10 @@ body:not(.show-time) .row .t { display: none; }
 .del-btn { background: none; border: 1px solid #30363d; color: #f85149; border-radius: 4px; cursor: pointer; padding: 2px 8px; font-size: 14px; line-height: 1; display: none; }
 .del-btn:hover { background: #f85149; color: #fff; }
 .del-btn.show { display: inline-block; }
+#cmdbar { position: fixed; bottom: 8px; left: 16px; right: 16px; display: flex; gap: 6px; }
+#cmdInput { flex: 1; box-sizing: border-box; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; outline: none; resize: none; max-height: 120px; overflow-y: auto; }
+#cmdInput:focus { border-color: #58a6ff; }
+#cmdInput:disabled { opacity: 0.4; }
+#cmdSend { flex: 0 0 auto; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px; }
+#cmdSend:disabled { opacity: 0.4; cursor: default; }
+#cmdSend:hover:not(:disabled) { background: #2ea043; }

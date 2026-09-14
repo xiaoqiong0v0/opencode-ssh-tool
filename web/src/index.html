@@ -17,6 +17,10 @@
 </header>
 <pre id="term">{{web_loading}}</pre>
 <button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
+<div id="cmdbar">
+  <textarea id="cmdInput" rows="1" placeholder="{{web_cmd_placeholder}}"></textarea>
+  <button id="cmdSend" title="{{web_send_ctrlc}}" disabled>Ctrl-C</button>
+</div>
 <script>window.__I18N__ = __I18N_JSON__;</script>
 <script>window.__PTY_COLS__ = __PTY_COLS_VAL__;</script>
 <script src="/web/app.js"></script>

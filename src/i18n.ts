@@ -247,6 +247,8 @@ Examples:
   web_running: { en: "[running] ", zh: "[运行中] " },
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
+  web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
+  web_send_ctrlc: { en: "Send Ctrl-C", zh: "发送 Ctrl-C" },
   disconnected_ok: {
     en: "Terminal closed ({host}).",
     zh: "终端已断开（{host}）。",

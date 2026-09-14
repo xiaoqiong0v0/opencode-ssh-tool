@@ -73,6 +73,8 @@ const PAGE_KEYS: FlatKey[] = [
   "web_terminals",
   "web_local",
   "web_delete_terminal",
+  "web_cmd_placeholder",
+  "web_send_ctrlc",
 ]
 
 /** 前端 JS 内 I18N 对象键 → i18n key */
@@ -85,6 +87,8 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   loadFailed: "web_load_failed",
   local: "web_local",
   terminals: "web_terminals",
+  cmdPlaceholder: "web_cmd_placeholder",
+  sendCtrlC: "web_send_ctrlc",
 }
 
 /** WS 运行增量轮询间隔 */
@@ -329,6 +333,26 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
         }
         case "ping": {
           send(ws, { type: "pong" })
+          break
+        }
+        case "exec": {
+          const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+          const name = typeof msg.name === "string" ? msg.name : ""
+          const command = typeof msg.command === "string" ? msg.command : ""
+          if (!sid || !command) break
+          const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
+          if (!entry) break
+          ;(entry.session as any).exec(command)
+          break
+        }
+        case "send": {
+          const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+          const name = typeof msg.name === "string" ? msg.name : ""
+          const text = typeof msg.text === "string" ? msg.text : ""
+          if (!sid || !text) break
+          const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
+          if (!entry) break
+          ;(entry.session as any).send(text)
           break
         }
         case "deleteTerminal": {

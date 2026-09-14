@@ -306,6 +306,19 @@ function updateSessions(msg: { sessions: SessionStatus[] }): void {
   updateTerminalSelect(prevTerminal)
 }
 
+/** 根据当前终端连接/忙状态更新输入框与快捷键按钮可用性 */
+function updateCmdBar(): void {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  const s = sessionsData.find((x) => x.sessionID === sid)
+  const t = s?.terminals.find((t2) => (t2.name || "default") === name)
+  const disabled = !t || !t.connected || t.busy
+  const input = document.getElementById("cmdInput") as HTMLTextAreaElement
+  const send = document.getElementById("cmdSend") as HTMLButtonElement
+  input.disabled = disabled
+  send.disabled = disabled
+}
+
 function updateTerminalSelect(prevName?: string): void {
   const sel = document.getElementById("session") as HTMLSelectElement
   const tsel = document.getElementById("terminal") as HTMLSelectElement
@@ -324,6 +337,7 @@ function updateTerminalSelect(prevName?: string): void {
   // 删除按钮：仅非 default 且已断开时显示
   const cur = s?.terminals.find((t) => (t.name || "default") === tsel.value)
   delBtn.classList.toggle("show", !!(cur && !cur.connected))
+  updateCmdBar()
   subscribe()
 }
 
@@ -611,6 +625,54 @@ termPre.addEventListener("scroll", () => {
   } else {
     stickToBottom = false
   }
+})
+
+// ===== 底部命令输入 =====
+const cmdInput = document.getElementById("cmdInput") as HTMLTextAreaElement
+cmdInput.placeholder = I18N.cmdPlaceholder || ""
+cmdInput.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return
+  // Shift+Enter 换行；单独 Enter 发送命令
+  if (ev.shiftKey) {
+    autoGrowCmdInput()
+    return
+  }
+  ev.preventDefault()
+  const command = cmdInput.value.trim()
+  if (!command) return
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  const s = sessionsData.find((x) => x.sessionID === sid)
+  const t = s?.terminals.find((t2) => (t2.name || "default") === name)
+  if (!t || !t.connected) return
+  if (t.busy) return
+  cmdInput.value = ""
+  autoGrowCmdInput()
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  // 未订阅则先订阅，确保命令输出能推过来
+  if (subSid !== sid || subName !== name) {
+    subSid = sid
+    subName = name
+    ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name }))
+  }
+  ws.send(JSON.stringify({ type: "exec", sessionID: sid, name, command }))
+  stickToBottom = true
+})
+
+function autoGrowCmdInput(): void {
+  cmdInput.style.height = "auto"
+  cmdInput.style.height = Math.min(cmdInput.scrollHeight, 120) + "px"
+}
+cmdInput.addEventListener("input", autoGrowCmdInput)
+
+// 快捷键按钮：发送 Ctrl-C 中断当前命令
+const cmdSend = document.getElementById("cmdSend") as HTMLButtonElement
+cmdSend.textContent = I18N.sendCtrlC || "Ctrl-C"
+cmdSend.addEventListener("click", () => {
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
+  ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text: "\\x03" }))
 })
 
 Object.assign(window, {
