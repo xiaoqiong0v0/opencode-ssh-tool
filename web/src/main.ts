@@ -312,9 +312,10 @@ function updateCmdBar(): void {
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   const s = sessionsData.find((x) => x.sessionID === sid)
   const t = s?.terminals.find((t2) => (t2.name || "default") === name)
-  const disabled = !t || !t.connected || t.busy
+  // 无终端或未连接时禁用中断按钮；busy 时不禁用（执行中正需要 Ctrl-C 中断）
+  const disabled = !t || !t.connected
   const send = document.getElementById("cmdSend") as HTMLButtonElement
-  // 输入框不禁用（避免失焦需重新点击），仅中断按钮禁用；发送逻辑在 Enter 处理里按 connected/busy 判断
+  // 输入框不禁用（避免失焦需重新点击），仅无连接时禁中断按钮；发送逻辑在 Enter 处理里按 connected/busy 判断
   send.disabled = disabled
 }
 
