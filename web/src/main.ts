@@ -680,14 +680,27 @@ cmdInput.addEventListener("keydown", (ev) => {
   if (ev.key !== "Enter") return
   if (ev.shiftKey) { autoGrowCmdInput(); return }
   ev.preventDefault()
-  const command = cmdInput.value.trim()
-  if (!command) return
   const sid = (document.getElementById("session") as HTMLSelectElement).value
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   const s = sessionsData.find((x) => x.sessionID === sid)
   const t = s?.terminals.find((t2) => (t2.name || "default") === name)
   if (!t || !t.connected) return
-  if (t.busy) return
+  if (t.busy) {
+    // 忙时（子 shell/交互程序）：Enter 发送原样文本到终端
+    const text = cmdInput.value
+    cmdInput.value = ""
+    autoGrowCmdInput()
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return
+    if (subSid !== sid || subName !== name) {
+      subSid = sid; subName = name
+      ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name }))
+    }
+    ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text: text + "\r" }))
+    stickToBottom = true
+    return
+  }
+  const command = cmdInput.value.trim()
+  if (!command) return
   cmdInput.value = ""
   autoGrowCmdInput()
   cmdHistory.push(command)
