@@ -390,7 +390,7 @@ export function startServer(port: number, getSessions: () => SessionEntry[], dir
           const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
           if (entry) {
             // 有活动句柄：close() 已含 history.dispose() 删除历史目录
-            entry.session.close()
+            try { entry.session.close() } catch { log.info(`删除终端 ${sid}/${name} 时 close 抛异常（已忽略）`) }
           } else {
             // 跨进程/陈旧终端：无句柄，直接删除历史目录（历史文件 + 会话记录）
             const histName = `local-${name}`
