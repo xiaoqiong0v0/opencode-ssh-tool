@@ -317,15 +317,15 @@ export function startServer(
         const done = msg.done === true
         const command = typeof msg.command === "string" ? msg.command : ""
         const existing = streamBuf.get(k)
-        if (!existing && command) {
-          // 新执行开始：重置订阅者游标 + 通知前端新命令行
+        if (command) {
+          // 新执行开始（无论是否已有 entry）：重置数据+游标+通知前端
+          streamBuf.set(k, { data, done })
           for (const c of wss.clients as Set<WsClient>) {
             if (c.readyState !== WebSocket.OPEN || !c._sub || c._sub.sid !== sid || c._sub.name !== name) continue
             c._bufPos = 0
             send(c, { type: "cmdStart", command })
           }
-        }
-        if (existing && done) { existing.done = true; if (data) existing.data = (existing.data || "") + data }
+        } else if (existing && done) { existing.done = true; if (data) existing.data = (existing.data || "") + data }
         else if (existing && !done) { if (data) existing.data = (existing.data || "") + data }
         else { streamBuf.set(k, { data, done }) }
         return
