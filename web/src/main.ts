@@ -707,15 +707,45 @@ function autoGrowCmdInput(): void {
 }
 cmdInput.addEventListener("input", autoGrowCmdInput)
 
-// 快捷键按钮：发送 Ctrl-C 中断当前命令
+// 快捷键发送按钮：点击后等待下一个按键，自动编码并发送到终端
 const cmdSend = document.getElementById("cmdSend") as HTMLButtonElement
+let recordingKey = false
 cmdSend.textContent = I18N.sendCtrlC || "Ctrl-C"
 cmdSend.addEventListener("click", () => {
   const sid = (document.getElementById("session") as HTMLSelectElement).value
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
-  ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text: "\\x03" }))
+  recordingKey = true
+  cmdSend.textContent = "..."
+  cmdSend.classList.add("recording")
+  document.addEventListener("keydown", _onCaptureKey, { once: true })
 })
+function _onCaptureKey(ev: KeyboardEvent): void {
+  recordingKey = false
+  cmdSend.classList.remove("recording")
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  let text: string
+  let label: string
+  if (ev.ctrlKey && ev.key !== "Control") {
+    const code = ev.key.toLowerCase().charCodeAt(0) - 96
+    if (code >= 1 && code <= 26) {
+      text = "\\x" + code.toString(16).padStart(2, "0")
+      label = "Ctrl-" + ev.key.toUpperCase()
+    } else { text = ""; label = "" }
+  } else if (ev.key === "Enter") { text = "\\r"; label = "↵" }
+  else if (ev.key === "Escape") { text = "\\x1b"; label = "Esc" }
+  else if (ev.key === "Tab") { text = "\\t"; label = "Tab" }
+  else if (ev.key === "Backspace") { text = "\\x7f"; label = "⌫" }
+  else if (ev.key === " " || ev.key === "Space") { text = " "; label = "Space" }
+  else if (ev.key.length === 1) { text = ev.key; label = ev.key }
+  else { text = "\\x03"; label = "Ctrl-C" } // 兜底
+  if (text && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text }))
+  }
+  if (label) cmdSend.textContent = label
+  else cmdSend.textContent = I18N.sendCtrlC || "Ctrl-C"
+}
 
 Object.assign(window, {
   onSessionChange,
