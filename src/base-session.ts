@@ -4,16 +4,15 @@
 
 import {
   ANIMATION_WINDOW_MS,
-  EXEC_TIMEOUT_MS,
   MAX_OUTPUT_LEN,
-  QUIET_WINDOW_MS,
   RAW_LOG_MAX,
   SETTLE_TIMEOUT_MS,
 } from "./constants.js"
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart, extractOutput } from "./utils.js"
-import { detectDoneMarker, resolveByProbe, stripMarkers, type ShellAdapter } from "./shell-adapter.js"
+import { findLastEndOf } from "./last-match.js"
+import { detectLastDoneMarker, stripMarkers, resolveByProbe, type ShellAdapter } from "./shell-adapter.js"
 
 /** 命令执行结果 */
 export interface ExecResult {
@@ -21,7 +20,6 @@ export interface ExecResult {
   output: string
   interactive?: boolean
   running?: boolean
-  timeout?: boolean
   submitted?: boolean
   error?: string
   host?: string
@@ -105,23 +103,23 @@ export abstract class BaseSession {
   /**
    * 在当前终端执行命令（同步等待），保留 cwd/环境
    * @param command 命令
-   * @param timeout 超时毫秒，默认 30s
    * @returns 执行结果
    */
-  async exec(command: string, timeout: number = EXEC_TIMEOUT_MS): Promise<ExecResult> {
+  async exec(command: string): Promise<ExecResult> {
     const startTs = Date.now()
     if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
     if (this._remoteBusy) return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` }
 
     this._beginCapture(command)
+    const captureStart = this._buffer.length
     this._write(command + "\r")
 
-    const outcome = await this._waitCompletion(0, timeout, startTs)
+    const outcome = await this._waitCompletion(0, startTs)
 
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
-        const raw = this._buffer.slice(0, outcome.markerPos ?? this._buffer.length)
+        const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
         this._history.append(command, extractOutput(raw, command), this._runningStartTs, Date.now())
         this._clearRunningContext()
@@ -129,19 +127,31 @@ export abstract class BaseSession {
       }
       case "interactive": {
         this._remoteBusy = false
-        const raw = this._buffer.slice(0)
+        const raw = this._buffer.slice(captureStart)
         this._cursor = this._buffer.length
         this._history.append(command, raw, this._runningStartTs, Date.now())
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
-      case "running":
-      case "timeout": {
+      case "running": {
         this._runningStartPos = 0
         this._remoteBusy = true
-        this._startBackgroundWatch(0, command)
-        const raw = this._buffer.slice(0)
-        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), running: outcome.kind === "running", timeout: outcome.kind === "timeout", command, duration: Date.now() - startTs, ...this._extraResult }
+        this._cursor = this._buffer.length
+        this._startBackgroundWatch(captureStart, command)
+        // 等待后台 watch 完成（不设硬超时，模型可通过 Ctrl-C 中断）
+        await new Promise<void>((resolve) => {
+          const poll = setInterval(() => {
+            if (!this._remoteBusy) {
+              clearInterval(poll)
+              resolve()
+            }
+          }, 200)
+        })
+        // watch 已写入 history，取最后一条记录的输出
+        const pairs = this._history.getPairs()
+        const last = pairs[pairs.length - 1]
+        const output = last ? this._truncate(toModelText(stripMarkers(this._history.readOutput(last)))) : ""
+        return { ok: true, output, command, duration: Date.now() - startTs, ...this._extraResult }
       }
     }
   }
@@ -156,7 +166,7 @@ export abstract class BaseSession {
     if (this._runningStartPos !== null && this._runningCommand) {
       const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
       const marker = end > 0
-        ? detectDoneMarker(this._buffer, this._runningStartPos + end)
+        ? detectLastDoneMarker(this._buffer, this._runningStartPos + end)
         : { done: false, exitCode: 0, pos: 0 }
       if (marker.done) {
         const raw = this._buffer.slice(this._runningStartPos, marker.pos)
@@ -223,7 +233,7 @@ export abstract class BaseSession {
     const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
     if (end <= 0) return { data: "", done: false }
     const echoEnd = this._runningStartPos + end
-    const marker = detectDoneMarker(this._buffer, echoEnd)
+    const marker = detectLastDoneMarker(this._buffer, echoEnd)
     const windowEnd = marker.done ? marker.pos : this._buffer.length
     if (this._streamPos === null) {
       this._streamPos = echoEnd
@@ -256,12 +266,16 @@ export abstract class BaseSession {
 
   /** 命令执行/提交前准备：裁剪已消费缓冲 + 丢弃上一条命令的迟到残留标记 */
   private _beginCapture(command: string): void {
+    // 用上一条命令完成标记（最后一个合法 <SSH_DONE:N>）定位命令起点；
+    // 备屏重放等场景下 buffer 可能含旧标记，裁剪到最后一个标记之后即可
+    const marker = detectLastDoneMarker(this._buffer, 0)
+    if (marker.done) {
+      this._buffer = this._buffer.slice(marker.pos)
+      this._cursor = 0
+    }
+    // fallback：无标记时依赖 _cursor 裁剪
     this._buffer = this._buffer.slice(this._cursor)
     this._cursor = 0
-    const stale = detectDoneMarker(this._buffer, 0)
-    if (stale.done) {
-      this._buffer = this._buffer.slice(stale.pos)
-    }
     this._runningStartPos = 0
     this._runningCommand = command
     this._runningStartTs = Date.now()
@@ -326,12 +340,11 @@ export abstract class BaseSession {
  */
 protected async _injectAndSettle(deadline: number): Promise<boolean> {
   const TOKEN = "__SSH_INJECT_DONE__"
-  const lines = this._adapter!.buildInjectScript().split("\n")
+  const line = this._adapter!.buildInjectScript().trim()
+  if (!line) return true
   while (Date.now() < deadline) {
-    for (const line of lines) {
-      if (line.trim()) this._write(line + "\r")
-    }
-    if (await this._waitForBufferToken(TOKEN, Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
+    this._write(line + "\r")
+    if (await this._waitForBufferToken(line, TOKEN, Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
       await new Promise((r) => setTimeout(r, 100))
       this._buffer = ""
       this._cursor = 0
@@ -345,10 +358,11 @@ protected async _injectAndSettle(deadline: number): Promise<boolean> {
 }
 
 /** 等待缓冲中出现指定文本（最多 maxMs） */
-private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean> {
-  const start = Date.now()
-  while (Date.now() - start < maxMs) {
-    if (this._buffer.includes(token)) return true
+private async _waitForBufferToken(line: string, token: string, maxMs: number): Promise<boolean> {
+  const startTime = Date.now()
+  while (Date.now() - startTime < maxMs) {
+    const lineEnd = findLastEndOf(line, this._buffer)
+    if (lineEnd >= 0 && this._buffer.includes(token, lineEnd + 1)) return true
     await new Promise((r) => setTimeout(r, 50))
   }
   return false
@@ -356,12 +370,10 @@ private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean
 
   private _waitCompletion(
     startPos: number,
-    timeout: number,
     startTs: number,
-  ): Promise<{ kind: "done" | "interactive" | "running" | "timeout"; markerPos?: number }> {
+  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
-      let lastChange = Date.now()
       let echoEnd = 0
       const timer = setInterval(() => {
         if (INTERACTIVE_RE.test(this._buffer.slice(startPos))) {
@@ -371,10 +383,7 @@ private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean
         }
         const now = Date.now()
         const curLen = this._buffer.length
-        if (curLen !== lastLen) {
-          lastLen = curLen
-          lastChange = now
-        }
+        if (curLen !== lastLen) lastLen = curLen
         if (echoEnd <= 0 && this._runningCommand) {
           const end = extractOutputStart(this._buffer.slice(startPos), this._runningCommand)
           if (end > 0) echoEnd = startPos + end
@@ -383,21 +392,17 @@ private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean
         // 下载/编译等静默期不会误判完成，中断（Ctrl-C 回到提示符）同样会输出标记。
         // 必须等命令回显出现后才检测：回显前的标记只可能是上一条命令的迟到残留。
         if (echoEnd > 0) {
-          const marker = detectDoneMarker(this._buffer, echoEnd)
+          const marker = detectLastDoneMarker(this._buffer, echoEnd)
           if (marker.done) {
             clearInterval(timer)
             resolve({ kind: "done", markerPos: marker.pos })
             return
           }
         }
-        if (now - lastChange < QUIET_WINDOW_MS && now - startTs >= ANIMATION_WINDOW_MS) {
+        // 超过动画窗口仍未出现完成标记 → 交给后台 watch 继续监听（不设硬超时）
+        if (now - startTs >= ANIMATION_WINDOW_MS) {
           clearInterval(timer)
           resolve({ kind: "running" })
-          return
-        }
-        if (now - startTs >= timeout) {
-          clearInterval(timer)
-          resolve({ kind: "timeout" })
           return
         }
       }, 50)
@@ -421,7 +426,7 @@ private async _waitForBufferToken(token: string, maxMs: number): Promise<boolean
         if (end > 0) echoEnd = startPos + end
       }
       if (echoEnd <= 0) return
-      const marker = detectDoneMarker(this._buffer, echoEnd)
+const marker = detectLastDoneMarker(this._buffer, echoEnd)
       if (marker.done) {
         const raw = this._buffer.slice(startPos, marker.pos)
         this._history.append(command, extractOutput(raw, command), this._runningStartTs)

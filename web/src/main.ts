@@ -67,6 +67,9 @@ class TermScreen {
   private fg: string | null = null
   private bg: string | null = null
   private bold = false
+  private sr = 0 // 保存的光标行（ESC 7 / CSI s）
+  private sc = 0 // 保存的光标列
+  private altGrid: GridCell[][] | null = null // 备屏保存（CSI ?1049h/l）
 
   constructor(cols: number) {
     this.cols = cols
@@ -113,6 +116,8 @@ class TermScreen {
           i = j + 1
           continue
         }
+        if (text[i + 1] === "7") { this.sr = this.r; this.sc = this.c; i += 2; continue }
+        if (text[i + 1] === "8") { this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc; i += 2; continue }
         i += 2
         continue
       }
@@ -192,6 +197,23 @@ class TermScreen {
         for (let ci = 0; ci <= this.c; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
       } else {
         for (let ci = this.c; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
+      }
+    }
+    else if (final === "s") { this.sr = this.r; this.sc = this.c }
+    else if (final === "u") { this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc }
+    else if ((final === "h" || final === "l") && body.startsWith("?")) {
+      const mode = va(body.slice(1).split(";")[0])
+      if (mode === 1049) {
+        if (final === "h") {
+          this.altGrid = this.grid.map((row) => row.slice())
+          this.sr = this.r; this.sc = this.c
+          this.grid = []
+          this.r = 0; this.c = 0
+        } else if (this.altGrid) {
+          this.grid = this.altGrid
+          this.altGrid = null
+          this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc
+        }
       }
     }
   }

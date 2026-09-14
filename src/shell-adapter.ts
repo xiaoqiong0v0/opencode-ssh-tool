@@ -2,95 +2,65 @@
 // 标记格式：<SSH_DONE:<退出码>>  —— 可见文本便于 web Raw 模式直接调试；
 // 展示给用户/模型的输出会在上层剥离标记（用户实际看不到，与不可见标记等效）
 
+import { DONE_TAG, INJECT_TOKEN, SHELL_ID_PREFIX, VAR_LAST_HIST, VAR_NESTED, VAR_ORIG_RL, VAR_PENDING, VAR_HID } from "./constants.js"
+import { findLastMatch } from "./last-match.js"
+
 /** Shell 适配器接口 */
 export interface ShellAdapter {
   readonly name: string
-  /** Shell 探测命令 */
   readonly probeCommand: string
-  /** 解析探测输出，返回 true 表示匹配 */
   parseProbe(output: string): boolean
-  /** 生成注入脚本（连接后执行一次，让 shell 在每条命令完成后输出可见完成标记） */
   buildInjectScript(): string
 }
 
-/** 可见完成标记正则（退出码兼容 pwsh 负数，如 -1） */
+// ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:退出码>） =====
+
 const DONE_RE = /<SSH_DONE:(-?\d+)>/g
 
-/**
- * 在缓冲中定位下一个 done 标记
- * @param buffer 原始终端流
- * @param fromPos 搜索起点
- * @returns done 是否找到；exitCode 退出码；pos 标记结束位置
- */
-export function detectDoneMarker(buffer: string, fromPos: number): { done: boolean; exitCode: number; pos: number } {
-  DONE_RE.lastIndex = fromPos
-  const m = DONE_RE.exec(buffer)
+export function detectLastDoneMarker(buffer: string, fromPos: number): { done: boolean; exitCode: number; pos: number } {
+  // 取最后一个合法标记（退出码为数字）——避免注入脚本字面文本 <SSH_DONE:%s> 被误判
+  const m = findLastMatch(DONE_RE, buffer, fromPos)
   if (!m) return { done: false, exitCode: 0, pos: 0 }
   return { done: true, exitCode: parseInt(m[1], 10) || 0, pos: m.index + m[0].length }
 }
 
-/**
- * 从原始流中剥离完成标记（给用户/模型的输出前调用）
- * @param raw 原始终端流
- * @returns 剥离标记后的流
- */
 export function stripMarkers(raw: string): string {
   return raw.replace(DONE_RE, "")
 }
 
-// ===== Zsh =====
-// zsh 无 PROMPT_COMMAND；用 precmd_functions 钩子（每次提示符绘制前执行）：
-// 命令结束后重绘提示符 → precmd 运行 → 若历史号前进则输出完成标记
+// ===== Shell 类型探测与注入脚本 =====
 class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
-  readonly probeCommand = "echo __SHELL_ID__$0"
-
+  readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   parseProbe(output: string): boolean {
-    return /__SHELL_ID__zsh|(?:^|\W)zsh(?:\W|$)/i.test(output)
+    return new RegExp(`${SHELL_ID_PREFIX}zsh|(?:^|\\W)zsh(?:\\W|$)`, "i").test(output)
   }
-
   buildInjectScript(): string {
-    return `__ssh_prompt() { local ec=$?; if [[ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }
-precmd_functions+=(__ssh_prompt); echo __SSH_INJECT_DONE__`
+    return `PS1='${DONE_TAG}%?>'"\$PS1"; echo ${INJECT_TOKEN}`
   }
 }
 
 // ===== Bash 系（bash / sh） =====
-// PROMPT_COMMAND 在每条命令执行完、绘制下一条提示符前执行 —— 是 bash 的可靠"命令完成"钩子
 class BashAdapter implements ShellAdapter {
   readonly name = "bash"
-  readonly probeCommand = "echo __SHELL_ID__$0"
-
+  readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   parseProbe(output: string): boolean {
-    return /__SHELL_ID__(bash|sh)\b|(?:^|\W)(bash|sh)(?:\W|$)/i.test(output)
+    return new RegExp(`${SHELL_ID_PREFIX}(bash|sh)\\b|(?:^|\\W)(bash|sh)(?:\\W|$)`, "i").test(output)
   }
-
   buildInjectScript(): string {
-    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${__SSH_LAST_HIST:-}" ]; then printf '\\n<SSH_DONE:%s>' "$ec"; __SSH_LAST_HIST=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt; echo __SSH_INJECT_DONE__`
+    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${${VAR_LAST_HIST}:-}" ]; then printf '\\n${DONE_TAG}%s>' "$ec"; ${VAR_LAST_HIST}=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt; echo ${INJECT_TOKEN}`
   }
 }
 
 // ===== PowerShell =====
-// pwsh 无 PROMPT_COMMAND；改 prompt() 函数（VSCode 同款机制）：
-// 每条命令完成后 pwsh 会重新调用 prompt() 获取下一条提示符，此时在返回串开头输出完成标记
 class PwshAdapter implements ShellAdapter {
   readonly name = "pwsh"
-  readonly probeCommand = "echo __SHELL_ID__$0"
-
+  readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   parseProbe(_output: string): boolean {
-    // pwsh 没有 $0，echo 输出可能为空或报错
-    // 如果 bash 探测失败，再尝试 pwsh 探测
-    return false
+    return true
   }
-
-  // pwsh 无 PROMPT_COMMAND：改写 prompt() 函数（VSCode 同款机制）。
-  // 命令结束（含 Ctrl-C 中断）后 pwsh 重绘提示符 → 在返回串开头输出完成标记。
-  // 用 PSConsoleHostReadLine 钩子在"读取命令前"置 __SSH_PENDING，prompt() 据此发标记：
-  //   - 命令正常/中断完成 → prompt() 发标记
-  //   - resize/空闲重绘（未读命令）→ 不发
-  // 兜底：history 前进 或 嵌套等级下降（多行模式 Ctrl-C 退出）也发，防钩子不可用
   buildInjectScript(): string {
-    return `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:__SSH_PENDING -or $global:__SSH_PENDING -or $hid -ne $global:__SSH_HID -or $nested -lt $global:__SSH_NESTED) { $s = "<SSH_DONE:$ec>" }; $global:__SSH_PENDING = $false; $global:__SSH_HID = $hid; $global:__SSH_NESTED = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; if ($function:PSConsoleHostReadLine) { $global:__SSH_ORIG_RL = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:__SSH_PENDING = $true; & $global:__SSH_ORIG_RL } }; echo __SSH_INJECT_DONE__`
+    return `function global:prompt { $h = Get-History -Count 1; $hid = if ($h) { $h.Id } else { 0 }; $nested = $nestedPromptLevel; $ec = $LASTEXITCODE; if ($null -eq $ec) { $ec = 0 }; $s = ""; if ($null -eq $global:${VAR_PENDING} -or $global:${VAR_PENDING} -or $hid -ne $global:${VAR_HID} -or $nested -lt $global:${VAR_NESTED}) { $s = "${DONE_TAG}$ec>" }; $global:${VAR_PENDING} = $false; $global:${VAR_HID} = $hid; $global:${VAR_NESTED} = $nested; $s + "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; if ($function:PSConsoleHostReadLine) { $global:${VAR_ORIG_RL} = $function:PSConsoleHostReadLine; function global:PSConsoleHostReadLine { $global:${VAR_PENDING} = $true; & $global:${VAR_ORIG_RL} } }; echo ${INJECT_TOKEN}`
   }
 }
 
@@ -110,6 +80,6 @@ export function resolveByProbe(probeOutput: string): ShellAdapter {
   for (const a of adapters) {
     if (a.parseProbe(probeOutput)) return a
   }
-  // 默认 bash（pwsh 的 probe 也会返回 false，所以走到这里就是 pwsh）
-  return adapters[1]
+  // 默认最后一个适配器兜底
+  return adapters[adapters.length - 1]
 }

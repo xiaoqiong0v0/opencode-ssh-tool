@@ -1,6 +1,7 @@
 // 工具函数：命令回显定位、模型文本清理、ANSI 清洗、CR 覆盖合并、完成标记剥离
 
 import { stripMarkers } from "./shell-adapter.js"
+import { findLastEndOf } from "./last-match.js"
 
 /** 正则转义文本 */
 const escRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
@@ -24,9 +25,9 @@ export function extractOutputStart(raw: string, command: string): number {
   const norm = cmd.replace(/\\033/gi, "\x1b")
   const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
   const re = new RegExp(frags.join(ECHO_WIDE), "g")
-  const m = re.exec(raw)
-  if (!m) return 0
-  return m.index + m[0].length
+  // 取最后一次匹配：备屏退出（如 cmatrix）会重放主屏历史，其中含旧命令回显，
+  // 只有最后一次出现的回显之后才是本次命令的真实输出
+  return findLastEndOf(re, raw)
 }
 
 /**
@@ -72,6 +73,9 @@ function simulateScreen(s: string): string {
   const rows: { maxCol: number; cols: Map<number, string> }[] = []
   let r = 0   // 当前行
   let c = 0   // 当前列
+  let sr = 0  // 保存的光标行（ESC 7 / CSI s）
+  let sc = 0  // 保存的光标列
+  let altRows: typeof rows | null = null // 备屏保存（CSI ?1049h/l）
   const COLS = 240 // 足够宽
 
   const row = (i: number) => {
@@ -123,6 +127,25 @@ function simulateScreen(s: string): string {
         }
         else if (final === "G" || final.charCodeAt(0) === 96) { c = Math.max(0, p(body) - 1) }
         else if (final === "d") { r = Math.max(0, p(body) - 1) }
+        else if (final === "s") { sr = r; sc = c }
+        else if (final === "u") { r = Math.min(sr, rows.length - 1); c = sc }
+        else if (final === "h" && body.startsWith("?")) {
+          // 私有模式 set：?1049h 进入备屏（保存主屏+光标，清屏）
+          if (va(body.slice(1)) === 1049) {
+            altRows = rows.map((x) => ({ maxCol: x.maxCol, cols: new Map(x.cols) }))
+            sr = r; sc = c
+            rows.length = 0; r = 0; c = 0
+          }
+        }
+        else if (final === "l" && body.startsWith("?")) {
+          // 私有模式 reset：?1049l 退出备屏（恢复主屏+光标）
+          if (va(body.slice(1)) === 1049 && altRows) {
+            rows.length = 0
+            rows.push(...altRows)
+            altRows = null
+            r = Math.min(sr, rows.length - 1); c = sc
+          }
+        }
         else if (final === "K") {
           const mode = va(body)
           const curRow = row(r)
@@ -145,7 +168,10 @@ function simulateScreen(s: string): string {
         i = j + 1
         continue
       }
-      // 其他 ESC 序列（如 ESC 7/8 保存/恢复光标）：忽略
+      // ESC 7 保存光标 / ESC 8 恢复光标
+      if (s[i + 1] === "7") { sr = r; sc = c; i += 2; continue }
+      if (s[i + 1] === "8") { r = Math.min(sr, rows.length - 1); c = sc; i += 2; continue }
+      // 其他 ESC 序列忽略
       i += 2
       continue
     }

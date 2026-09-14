@@ -348,8 +348,10 @@ export const OpenCodeSshTool: Plugin = async () => {
         return tr("denied", lang)
       }
     }
+    const name = values.name ?? DEFAULT_NAME
+    syncSessionState(ctx.sessionID, name)
     const result = values.waitResult ? await session.exec(command) : await session.submit(command)
-    syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME)
+    syncSessionState(ctx.sessionID, name)
     log.tool("term_exec", { command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
     if (result.submitted) return tr("submitted", lang)
     return result.ok ? result.output : result.error ?? tr("exec_failed", lang)
