@@ -24,7 +24,9 @@ export function extractOutputStart(raw: string, command: string): number {
   // 1) 字符间容忍 ANSI 间隙（WIDE）2) 命令字面 \033 回显可能变真实 ESC（二选一）
   const norm = cmd.replace(/\\033/gi, "\x1b")
   const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
-  const re = new RegExp(frags.join(ECHO_WIDE), "g")
+  // 要求命令文本（及尾部 ANSI 重置序列）后紧跟行尾（\r?\n 或串尾），避免子 shell 输出内命令字（如 zsh: not found）误匹配
+  const TAIL_ANSI = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[^\\x1b])*"
+  const re = new RegExp(frags.join(ECHO_WIDE) + TAIL_ANSI + "(?=\\r?\\n|$)", "g")
   // 取最后一次匹配：备屏退出（如 cmatrix）会重放主屏历史，其中含旧命令回显，
   // 只有最后一次出现的回显之后才是本次命令的真实输出
   return findLastEndOf(re, raw)
