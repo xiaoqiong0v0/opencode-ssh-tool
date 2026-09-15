@@ -40,7 +40,8 @@ interface TranscriptPair {
 function parseOutput(raw: string): { text: string; exitCode?: number } {
   const m = raw.match(DONE_RE)
   if (m && m.length > 0) {
-    const code = parseInt(m[m.length - 1].replace(/<SSH_DONE:|>/g, ""), 10)
+    const last = m[m.length - 1].match(/(-?\d+)>$/)
+    const code = last ? parseInt(last[1], 10) : NaN
     return { text: raw.replace(DONE_RE, ""), exitCode: isNaN(code) ? undefined : code }
   }
   return { text: raw }
@@ -486,8 +487,8 @@ function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
-/** 可见完成标记剥离（展示给用户/模型的输出前调用） */
-const DONE_RE = /<SSH_DONE:(-?\d+)>/g
+/** 可见完成标记剥离（含序号式 <SSH_DONE:seq:code>，退出码在末尾；展示给用户/模型的输出前调用） */
+const DONE_RE = /<SSH_DONE:(?:\d+:)?(-?\d+)>/g
 function stripDone(s: string): string {
   return s.replace(DONE_RE, "")
 }

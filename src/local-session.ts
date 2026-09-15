@@ -87,11 +87,6 @@ export class LocalSession extends BaseSession {
       this._adapter = adapter
       log.info(`Shell 探测结果: ${this._adapter.name}`)
 
-      const injected = await this._injectAndSettle(deadline)
-      if (!injected) {
-        this.close()
-        return { ok: false, error: "完成标记注入超时（shell 未就绪或启动过慢），连接终止" }
-      }
       this._buffer = ""
       this._cursor = 0
       return { ok: true }

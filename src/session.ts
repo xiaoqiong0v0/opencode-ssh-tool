@@ -141,13 +141,6 @@ export class SshSession extends BaseSession {
               this._adapter = adapter
               log.info(`Shell 探测结果: ${this._adapter.name}`)
 
-              const injected = await this._injectAndSettle(deadline)
-              if (!injected) {
-                log.error(`标记注入超时终止连接 ${opts.user}@${opts.host}`)
-                this.close()
-                resolve({ ok: false, host: opts.user, user: opts.user, port, error: "完成标记注入超时（shell 未就绪或启动过慢），连接终止" })
-                return
-              }
               this._buffer = ""
               this._cursor = 0
               resolve({ ok: true, host: opts.user, user: opts.user, port })

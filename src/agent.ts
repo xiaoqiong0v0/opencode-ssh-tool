@@ -56,7 +56,6 @@ export function startAgent(
       const session = resolveSession(sessionID, name)
       const key = `${sessionID}:${name}`
       if (!session) continue
-      // 原始字节流增量（所有会话统一推送，server 按 raw 订阅者转发）
       const raw = session.readRawStream(rawPosMap.get(key) ?? 0)
       if (raw.data) {
         rawPosMap.set(key, raw.pos)
@@ -70,16 +69,15 @@ export function startAgent(
         send({ type: "done", sessionID, name })
         nowRunning.delete(key)
       } else if (st.data) {
-        // 首次推流时附带当前命令名（server 发给 web 作为 cmdStart）
         const command = !prevRunning.has(key) ? session.getRunningCommand() : undefined
         send({ type: "stream", sessionID, name, data: st.data, command })
       }
     }
-    // 运行→停止转变检测：代理发 done（tool 直接调 exec 的场景，不走 run-exec finally）
     for (const key of prevRunning) {
       if (!nowRunning.has(key)) {
         const sep = key.indexOf(":")
         send({ type: "done", sessionID: key.slice(0, sep), name: key.slice(sep + 1) })
+        log.info(`agent pushStreams 转变检测发 done ${key}`)
       }
     }
     prevRunning.clear()

@@ -23,9 +23,6 @@ export const ANIMATION_WINDOW_MS = 5_000
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 
-/** 注入生效等待超时：shell 执行注入命令并重绘提示符（输出首个标记）的最长等待 */
-export const SETTLE_TIMEOUT_MS = 3_000
-
 /** 注入总超时（含重试）：超过此时长仍无首个标记则断连报错 */
 export const INJECT_TIMEOUT_MS = 30_000
 
@@ -50,25 +47,11 @@ export const CACHE_DIR = ".opencode/plugins-cache/opencode-ssh-tool"
 /** 完成标记前缀（后续跟退出码 + ">"，如 <SSH_DONE:0>） */
 export const DONE_TAG = "<SSH_DONE:"
 
-/** 完成标记完整正则（内部于 shell-adapter 私有，避免 lastIndex 全局状态污染） */
-
 /** 完成标记字符串：给定退出码 */
 export const doneTag = (ec: number | string): string => `<SSH_DONE:${ec}>`
-
-/** 注入确认 token：shell 执行注入脚本末尾的 echo 输出，用于确认注入完成 */
-export const INJECT_TOKEN = "__SSH_INJECT_DONE__"
 
 /** shell 类型探测前缀：probeCommand 回显 <前缀>$0 */
 export const SHELL_ID_PREFIX = "__SHELL_ID__"
 
 /** 探测输出匹配正则 */
 export const SHELL_ID_RE = /\b__SHELL_ID__\b/
-
-/** bash/zsh 注入脚本内部变量名（bash 历史号守卫；zsh precmd） */
-export const VAR_LAST_HIST = "__SSH_LAST_HIST"
-
-/** pwsh 注入脚本内部变量名（pending 标记 / history id / 嵌套等级 / 原 ReadLine） */
-export const VAR_PENDING = "__SSH_PENDING"
-export const VAR_HID = "__SSH_HID"
-export const VAR_NESTED = "__SSH_NESTED"
-export const VAR_ORIG_RL = "__SSH_ORIG_RL"

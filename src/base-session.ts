@@ -56,6 +56,10 @@ export abstract class BaseSession {
   protected _runningStartPos: number | null = null
   protected _runningCommand = ""
   protected _watchTimer: ReturnType<typeof setInterval> | null = null
+  /** 命令序号（完成标记 <SSH_DONE:seq:code> 标识本次命令，防残留误判） */
+  private _cmdSeq = 0
+  /** 当前命令序号（_beginCapture 递增，供检测/拼接用） */
+  private _runningSeq = 0
   /** 下次捕获窗口起点（相对当前 buffer）：前一条命令结束后，标记/残留从此处开始 */
   protected _cursor = 0
   /** WS 实时流已发送位置（相对 buffer 偏移）；null = 尚未定位命令回显结束点 */
@@ -176,7 +180,7 @@ export abstract class BaseSession {
     if (this._runningStartPos !== null && this._runningCommand) {
       const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
       const marker = end > 0
-        ? detectLastDoneMarker(this._buffer, this._runningStartPos + end)
+        ? detectLastDoneMarker(this._buffer, this._runningStartPos + end, this._runningSeq)
         : { done: false, exitCode: 0, pos: 0 }
       if (marker.done) {
         const raw = this._buffer.slice(this._runningStartPos, marker.pos)
@@ -243,7 +247,7 @@ export abstract class BaseSession {
     const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
     if (end <= 0) return { data: "", done: false }
     const echoEnd = this._runningStartPos + end
-    const marker = detectLastDoneMarker(this._buffer, echoEnd)
+    const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
     const windowEnd = marker.done ? marker.pos : this._buffer.length
     if (this._streamPos === null) {
       this._streamPos = echoEnd
@@ -251,7 +255,7 @@ export abstract class BaseSession {
     const raw = this._buffer.slice(this._streamPos, windowEnd)
     this._streamPos = windowEnd
     let data = stripMarkers(raw)
-    if (this._adapter) data = data.replace(this._adapter.markerCmd, "")
+    if (this._adapter) data = data.replace(this._adapter.markerCmd(this._runningSeq), "")
     return { data, done: marker.done }
   }
 
@@ -285,7 +289,7 @@ export abstract class BaseSession {
    * @returns 实际写入 PTY 的文本
    */
   private _composeCommand(command: string): string {
-    const marker = this._adapter ? this._adapter.markerCmd : "printf '\\n<SSH_DONE:%s>' $?"
+    const marker = this._adapter ? this._adapter.markerCmd(this._runningSeq) : `printf '\\n<SSH_DONE:${this._runningSeq}:%s>' $?`
     const head = command.trim().split(/[\s;|&]+/)[0] ?? ""
     if (INTERACTIVE_PROGRAMS.has(head.toLowerCase())) return `${command}\r`
     return `${command}\r\n${marker}\r`
@@ -302,22 +306,22 @@ export abstract class BaseSession {
     const end = extractOutputStart(raw, command)
     if (end <= 0) return stripMarkers(raw)
     let out: string
-    const marker = detectLastDoneMarker(raw, end)
+    const marker = detectLastDoneMarker(raw, end, this._runningSeq)
     if (marker.done) {
       out = raw.slice(end, marker.pos)
     } else {
       const intr = detectInterrupt(raw, end)
       out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
     }
-    if (this._adapter) out = out.replace(this._adapter.markerCmd, "")
+    if (this._adapter) out = out.replace(this._adapter.markerCmd(this._runningSeq), "")
     return stripMarkers(out.replace(/^[\r\n]+/, ""))
   }
 
   /** 命令执行/提交前准备：裁剪已消费缓冲 + 丢弃上一条命令的迟到残留标记 */
   private _beginCapture(command: string): void {
-    // 用上一条命令完成标记（最后一个合法 <SSH_DONE:N>）定位命令起点；
+    // 用上一条命令完成标记（<SSH_DONE:seq:N>，此刻 _runningSeq 仍是上一条的）定位命令起点；
     // 备屏重放等场景下 buffer 可能含旧标记，裁剪到最后一个标记之后即可
-    const marker = detectLastDoneMarker(this._buffer, 0)
+    const marker = detectLastDoneMarker(this._buffer, 0, this._runningSeq)
     if (marker.done) {
       this._buffer = this._buffer.slice(marker.pos)
       this._cursor = 0
@@ -328,6 +332,8 @@ export abstract class BaseSession {
     this._runningStartPos = 0
     this._runningCommand = command
     this._runningStartTs = Date.now()
+    this._cmdSeq += 1
+    this._runningSeq = this._cmdSeq
     this._remoteBusy = true
     this._lastActive = Date.now()
   }
@@ -407,7 +413,7 @@ export abstract class BaseSession {
         // 或 Ctrl-C 中断时 TTY 回显 ^C。均与环境/框架无关。
         // 必须等命令回显出现后才检测：回显前的标记只可能是上一条的迟到残留。
         if (echoEnd > 0) {
-          const marker = detectLastDoneMarker(this._buffer, echoEnd)
+          const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
           if (marker.done) {
             clearInterval(timer)
             resolve({ kind: "done", markerPos: marker.pos })
@@ -447,9 +453,10 @@ export abstract class BaseSession {
         if (end > 0) echoEnd = startPos + end
       }
       if (echoEnd <= 0) return
-      const marker = detectLastDoneMarker(this._buffer, echoEnd)
-      const end = marker.done ? marker.pos : detectInterrupt(this._buffer, echoEnd).pos
-      if (marker.done || detectInterrupt(this._buffer, echoEnd).interrupted) {
+      const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
+      const intr = detectInterrupt(this._buffer, echoEnd)
+      const end = marker.done ? marker.pos : intr.pos
+      if (marker.done || intr.interrupted) {
         const raw = this._buffer.slice(startPos, end)
         this._history.append(command, this._extractOutput(raw, command), this._runningStartTs)
         this._cursor = Math.max(startPos, end)
