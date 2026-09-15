@@ -5,6 +5,7 @@ import { startServer, type SessionEntry } from "./server.js"
 import { listAllSessions } from "./session-store.js"
 import { loadConfig } from "./config.js"
 import { getLang } from "./i18n.js"
+import { SERVER_PROTO_VERSION } from "./constants.js"
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import log from "./log.js"
@@ -30,10 +31,10 @@ async function main(): Promise<void> {
 
   const handle = await startServer(port, getSessions, dir, lang, streamTickMs)
 
-  // 写服务信息文件（供其他进程探测复用）
+  // 写服务信息文件（供其他进程探测复用；proto 标识代码/协议版本，版本不符会触发重启）
   writeFileSync(
     join(dir, INFO_FILE),
-    JSON.stringify({ port: handle.port, host: "127.0.0.1", pid: process.pid, startedAt: Date.now() }),
+    JSON.stringify({ port: handle.port, host: "127.0.0.1", pid: process.pid, startedAt: Date.now(), proto: SERVER_PROTO_VERSION }),
     "utf8",
   )
 

@@ -55,3 +55,10 @@ export const SHELL_ID_PREFIX = "__SHELL_ID__"
 
 /** 探测输出匹配正则 */
 export const SHELL_ID_RE = /\b__SHELL_ID__\b/
+
+/**
+ * 独立 HTTP 服务协议/代码版本号：插件的 server/agent 协议或服务端逻辑变更时递增。
+ * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
+ * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
+ */
+export const SERVER_PROTO_VERSION = 1
