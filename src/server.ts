@@ -100,8 +100,9 @@ export function startServer(
 
   const agents = new Map<WsClient, Set<string>>()
   const agentBySession = new Map<string, WsClient>()
-  const streamBuf = new Map<string, { data: string; done: boolean }>()
+  const streamBuf = new Map<string, { data: string; done: boolean; ts: number }>()
   const rawBuf = new Map<string, { data: string; pos: number }>()
+  const BUSY_TIMEOUT = 30000 // 30s 无推流更新自动清 busy
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -144,8 +145,11 @@ export function startServer(
     const states = listAllSessions(dir)
     const liveKey = new Set(agentBySession.keys())
     const liveBusy = new Map<string, boolean>()
+    const now = Date.now()
     for (const [key] of agentBySession) {
       const b = streamBuf.get(key)
+      // 超过 30s 无更新且未完成则自动清为 done（防止 agent 推流竞争导致 busy 卡死）
+      if (b && !b.done && now - b.ts > BUSY_TIMEOUT) { b.done = true; b.ts = now }
       liveBusy.set(key, !!b && !b.done)
     }
     for (const s of states) {
@@ -319,15 +323,15 @@ export function startServer(
         const existing = streamBuf.get(k)
         if (command) {
           // 新执行开始（无论是否已有 entry）：重置数据+游标+通知前端
-          streamBuf.set(k, { data, done })
+          streamBuf.set(k, { data, done, ts: Date.now() })
           for (const c of wss.clients as Set<WsClient>) {
             if (c.readyState !== WebSocket.OPEN || !c._sub || c._sub.sid !== sid || c._sub.name !== name) continue
             c._bufPos = 0
             send(c, { type: "cmdStart", command })
           }
-        } else if (existing && done) { existing.done = true; if (data) existing.data = (existing.data || "") + data }
-        else if (existing && !done) { if (data) existing.data = (existing.data || "") + data }
-        else { streamBuf.set(k, { data, done }) }
+        } else if (existing && done) { existing.done = true; existing.ts = Date.now(); if (data) existing.data = (existing.data || "") + data }
+        else if (existing && !done) { existing.ts = Date.now(); if (data) existing.data = (existing.data || "") + data }
+        else { streamBuf.set(k, { data, done, ts: Date.now() }) }
         return
       }
 
@@ -337,7 +341,7 @@ export function startServer(
         if (sid) {
           const k = sessionKey(sid, name)
           const b = streamBuf.get(k)
-          if (b) { b.done = true }
+          if (b) { b.done = true; b.ts = Date.now() }
         }
         const payload = buildSessions()
         const json = JSON.stringify(payload)
@@ -422,7 +426,7 @@ export function startServer(
         const agent = agentBySession.get(sessionKey(sid, name))
         if (agent) {
           const reqId = `${sid}:${name}:${Date.now()}`
-          streamBuf.set(sessionKey(sid, name), { data: "", done: false })
+          streamBuf.set(sessionKey(sid, name), { data: "", done: false, ts: Date.now() })
           // 新命令开始：重置各订阅者 buf 流游标
           for (const c of wss.clients as Set<WsClient>) {
             if (c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name) c._bufPos = 0
