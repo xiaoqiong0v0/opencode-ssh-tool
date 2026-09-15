@@ -326,6 +326,7 @@ function updateTerminalSelect(prevName?: string): void {
   const delBtn = document.getElementById("delTerm") as HTMLButtonElement
   const sid = sel.value
   const s = sessionsData.find((x) => x.sessionID === sid)
+  const prevSel = tsel.value
   tsel.innerHTML = ""
   for (const t of (s ? s.terminals : [])) {
     const opt = document.createElement("option")
@@ -340,10 +341,13 @@ function updateTerminalSelect(prevName?: string): void {
   delBtn.classList.toggle("show", !!(cur && !cur.connected))
   updateCmdBar()
   updateMetaFromSessions()
-  // 强制重新订阅（切换终端或删除后原订阅失效）
-  subSid = ""
-  subName = ""
-  subscribe()
+  // 仅当选中的会话/终端实际变化时强制重订阅（sessions 状态推送不触发订阅风暴）
+  const curSel = tsel.value
+  if (curSel !== prevSel) {
+    subSid = ""
+    subName = ""
+    subscribe()
+  }
 }
 
 let subSid = ""
