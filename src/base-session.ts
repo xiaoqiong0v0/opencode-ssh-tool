@@ -6,12 +6,11 @@ import {
   ANIMATION_WINDOW_MS,
   MAX_OUTPUT_LEN,
   RAW_LOG_MAX,
-  SETTLE_TIMEOUT_MS,
 } from "./constants.js"
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
-import { toModelText, extractOutputStart, extractOutput } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, resolveByProbe, type ShellAdapter } from "./shell-adapter.js"
+import { toModelText, extractOutputStart } from "./utils.js"
+import { detectLastDoneMarker, stripMarkers, resolveByProbe, detectInterrupt, type ShellAdapter } from "./shell-adapter.js"
 
 /** 命令执行结果 */
 export interface ExecResult {
@@ -28,7 +27,15 @@ export interface ExecResult {
 
 /** 交互触发词（sudo 密码 / 分页器 / 确认提示），含中英文 */
 const INTERACTIVE_RE =
-  /(\[sudo\] password for|password for \S+:|Password:|密码:|--More--|\(END\)|\[y\/N\]|\[Y\/n\]|yes\/no|是\/否)/i
+  /(\[sudo\] password for|password for \S+:|\*\*\*\s*$|Password:|密码:|--More--|\(END\)|\[y\/N\]|\[Y\/n\]|yes\/no|是\/否)/i
+
+/** 已知交互式程序（REPL/分页器），命令以它们开头时不追加完成标记行 */
+const INTERACTIVE_PROGRAMS = new Set([
+  "python", "python2", "python3", "ipython", "node", "bun", "deno", "ruby", "irb", "php",
+  "perl", "lua", "tclsh", "elixir", "iex", "psql", "mysql", "sqlite3", "mongo", "redis-cli",
+  "bash", "zsh", "sh", "ksh", "csh", "fish", "pwsh", "powershell", "cmd",
+  "top", "htop", "btop", "vim", "vi", "nvim", "less", "more", "man",
+])
 
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
@@ -93,7 +100,7 @@ export abstract class BaseSession {
     if (this._remoteBusy) return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` }
 
     this._beginCapture(command)
-    this._write(command + "\r")
+    this._write(this._composeCommand(command))
     this._startBackgroundWatch(0, command)
 
     return { ok: true, output: "", submitted: true, command, duration: 0, ...this._extraResult }
@@ -111,26 +118,30 @@ export abstract class BaseSession {
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
-    this._write(command + "\r")
+    this._write(this._composeCommand(command))
 
     const outcome = await this._waitCompletion(0, startTs)
+
+    log.info(`exec ${command} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos} (busy=${this._remoteBusy})`)
 
     switch (outcome.kind) {
       case "done": {
         this._remoteBusy = false
         const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
-        this._history.append(command, extractOutput(raw, command), this._runningStartTs, Date.now())
+        const out = this._extractOutput(raw, command)
+        this._history.append(command, out, this._runningStartTs, Date.now())
         this._clearRunningContext()
-        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), command, duration: Date.now() - startTs, ...this._extraResult }
+        return { ok: true, output: this._truncate(toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "interactive": {
         this._remoteBusy = false
         const raw = this._buffer.slice(captureStart)
         this._cursor = this._buffer.length
-        this._history.append(command, extractOutput(raw, command), this._runningStartTs, Date.now())
+        const out = this._extractOutput(raw, command)
+        this._history.append(command, out, this._runningStartTs, Date.now())
         this._clearRunningContext()
-        return { ok: true, output: this._truncate(toModelText(extractOutput(raw, command))), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
+        return { ok: true, output: this._truncate(toModelText(out)), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "running": {
         this._runningStartPos = 0
@@ -239,7 +250,9 @@ export abstract class BaseSession {
     }
     const raw = this._buffer.slice(this._streamPos, windowEnd)
     this._streamPos = windowEnd
-    return { data: stripMarkers(raw), done: marker.done }
+    let data = stripMarkers(raw)
+    if (this._adapter) data = data.replace(this._adapter.markerCmd, "")
+    return { data, done: marker.done }
   }
 
   /** 关闭终端，清理会话态（幂等） */
@@ -262,6 +275,43 @@ export abstract class BaseSession {
 
   /** 是否连接且传输层就绪（子类检查自身传输对象） */
   protected abstract _ready(): boolean
+
+  /**
+   * 组合写入命令：命令后追加独立一行的完成标记命令（免疫 prompt 框架覆盖）。
+   * bash/zsh/sh：printf '\n<SSH_DONE:%s>' $?；pwsh：Write-Host
+   * 已知交互程序（python/node/bash 等 REPL）不吃追加行——它们作为 stdin 消费，
+   * 对这类命令不追加 marker，靠 INTERACTIVE_RE + send 交互。
+   * @param command 原始命令（history 存干净版本）
+   * @returns 实际写入 PTY 的文本
+   */
+  private _composeCommand(command: string): string {
+    const marker = this._adapter ? this._adapter.markerCmd : "printf '\\n<SSH_DONE:%s>' $?"
+    const head = command.trim().split(/[\s;|&]+/)[0] ?? ""
+    if (INTERACTIVE_PROGRAMS.has(head.toLowerCase())) return `${command}\r`
+    return `${command}\r\n${marker}\r`
+  }
+
+  /**
+   * 提取命令纯输出：从命令回显后切到完成标记（无标记则切到中断回显 ^C 处），
+   * 顺带去掉追加的标记命令回显行。
+   * @param raw 本次执行窗口原始字节流
+   * @param command 原始命令（历史用）
+   * @returns 纯程序输出原始流
+   */
+  private _extractOutput(raw: string, command: string): string {
+    const end = extractOutputStart(raw, command)
+    if (end <= 0) return stripMarkers(raw)
+    let out: string
+    const marker = detectLastDoneMarker(raw, end)
+    if (marker.done) {
+      out = raw.slice(end, marker.pos)
+    } else {
+      const intr = detectInterrupt(raw, end)
+      out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
+    }
+    if (this._adapter) out = out.replace(this._adapter.markerCmd, "")
+    return stripMarkers(out.replace(/^[\r\n]+/, ""))
+  }
 
   /** 命令执行/提交前准备：裁剪已消费缓冲 + 丢弃上一条命令的迟到残留标记 */
   private _beginCapture(command: string): void {
@@ -333,44 +383,6 @@ export abstract class BaseSession {
     return this._buffer.length > 0 ? this._buffer : null
   }
 
-  /**
- * deadline 内循环注入+等待确认，成功返回 true，超时返回 false
- * 逐行发送避免因 shell 未就绪导致的整块丢失；每轮等待最大 3s
- * 注入命令原样回显（不抑制），确认以 echo 唯一标识为准，避免与后续命令时序混淆
- */
-protected async _injectAndSettle(deadline: number): Promise<boolean> {
-  const TOKEN = "__SSH_INJECT_DONE__"
-  const line = this._adapter!.buildInjectScript().trim()
-  if (!line) return true
-  while (Date.now() < deadline) {
-    this._write(line + "\r")
-    if (await this._waitForBufferToken(line, TOKEN, Math.min(SETTLE_TIMEOUT_MS, deadline - Date.now()))) {
-      await new Promise((r) => setTimeout(r, 100))
-      this._buffer = ""
-      this._cursor = 0
-      return true
-    }
-    log.info("注入标识未确认，重试")
-    this._buffer = ""
-    this._cursor = 0
-  }
-  return false
-}
-
-/** 等待缓冲中出现指定文本（最多 maxMs）
- * 注入脚本很长时 ConPTY 会在 120 列处自动换行，输出流在换行处插入新行；
- * 且 bash 可能对命令回显着色（readline 在字符间插 ANSI），整行/前缀精确匹配都会失败。
- * token __SSH_INJECT_DONE__ 极独特且执行输出为独立行，直接查 token 即可。
- */
-private async _waitForBufferToken(_line: string, token: string, maxMs: number): Promise<boolean> {
-  const startTime = Date.now()
-  while (Date.now() - startTime < maxMs) {
-    if (this._buffer.includes(token)) return true
-    await new Promise((r) => setTimeout(r, 50))
-  }
-  return false
-}
-
   private _waitCompletion(
     startPos: number,
     startTs: number,
@@ -391,9 +403,9 @@ private async _waitForBufferToken(_line: string, token: string, maxMs: number): 
           const end = extractOutputStart(this._buffer.slice(startPos), this._runningCommand)
           if (end > 0) echoEnd = startPos + end
         }
-        // 完成标记（精确权威）：命令结束时 shell 重绘提示符前必输出 <SSH_DONE>，
-        // 下载/编译等静默期不会误判完成，中断（Ctrl-C 回到提示符）同样会输出标记。
-        // 必须等命令回显出现后才检测：回显前的标记只可能是上一条命令的迟到残留。
+        // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，
+        // 或 Ctrl-C 中断时 TTY 回显 ^C。均与环境/框架无关。
+        // 必须等命令回显出现后才检测：回显前的标记只可能是上一条的迟到残留。
         if (echoEnd > 0) {
           const marker = detectLastDoneMarker(this._buffer, echoEnd)
           if (marker.done) {
@@ -401,8 +413,14 @@ private async _waitForBufferToken(_line: string, token: string, maxMs: number): 
             resolve({ kind: "done", markerPos: marker.pos })
             return
           }
+          const intr = detectInterrupt(this._buffer, echoEnd)
+          if (intr.interrupted) {
+            clearInterval(timer)
+            resolve({ kind: "done", markerPos: intr.pos })
+            return
+          }
         }
-        // 超过动画窗口仍未出现完成标记 → 交给后台 watch 继续监听（不设硬超时）
+        // 超过动画窗口仍未出现完成信号 → 交给后台 watch 继续监听（不设硬超时）
         if (now - startTs >= ANIMATION_WINDOW_MS) {
           clearInterval(timer)
           resolve({ kind: "running" })
@@ -412,7 +430,7 @@ private async _waitForBufferToken(_line: string, token: string, maxMs: number): 
     })
   }
 
-  /** 后台监听：轮询 done 标记 → 收集输出进 history + busy=false */
+  /** 后台监听：轮询 done 标记 / ^C 中断 → 收集输出进 history + busy=false */
   private _startBackgroundWatch(startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
     const born = Date.now()
@@ -429,11 +447,12 @@ private async _waitForBufferToken(_line: string, token: string, maxMs: number): 
         if (end > 0) echoEnd = startPos + end
       }
       if (echoEnd <= 0) return
-const marker = detectLastDoneMarker(this._buffer, echoEnd)
-      if (marker.done) {
-        const raw = this._buffer.slice(startPos, marker.pos)
-        this._history.append(command, extractOutput(raw, command), this._runningStartTs)
-        this._cursor = Math.max(startPos, marker.pos)
+      const marker = detectLastDoneMarker(this._buffer, echoEnd)
+      const end = marker.done ? marker.pos : detectInterrupt(this._buffer, echoEnd).pos
+      if (marker.done || detectInterrupt(this._buffer, echoEnd).interrupted) {
+        const raw = this._buffer.slice(startPos, end)
+        this._history.append(command, this._extractOutput(raw, command), this._runningStartTs)
+        this._cursor = Math.max(startPos, end)
         this._remoteBusy = false
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
