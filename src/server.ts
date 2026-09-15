@@ -323,7 +323,9 @@ export function startServer(
         const existing = streamBuf.get(k)
         if (command) {
           // 新执行开始（无论是否已有 entry）：重置数据+游标+通知前端
-          streamBuf.set(k, { data, done, ts: Date.now() })
+          // 但保留已有 done=true（防止 stream {command} 后于 done 消息到达把 done 踩回 false）
+          const wasDone = existing && existing.done
+          streamBuf.set(k, { data, done: done || !!wasDone, ts: Date.now() })
           for (const c of wss.clients as Set<WsClient>) {
             if (c.readyState !== WebSocket.OPEN || !c._sub || c._sub.sid !== sid || c._sub.name !== name) continue
             c._bufPos = 0
