@@ -47,6 +47,41 @@ const MAX_WATCH_LEN = 10 * 60_000
 const PROBE_TIMEOUT_MS = 5_000
 
 /**
+ * 剥离命令尾部注释：仅当 `#` 在行首或前有空白、且不在单双引号内（支持反斜杠转义）时视为注释，
+ * 避免 `echo "a#b"` / `echo 'a#b'` 引号内的 # 被误剥，也避免 marker 被真注释吞掉。
+ * @param s 命令文本
+ * @returns 剥离尾注释（若有）后的文本
+ */
+function stripTrailingComment(s: string): string {
+  let inSingle = false
+  let inDouble = false
+  let escaped = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (c === "\\") {
+      escaped = true
+      continue
+    }
+    if (c === "'" && !inDouble) {
+      inSingle = !inSingle
+      continue
+    }
+    if (c === '"' && !inSingle) {
+      inDouble = !inDouble
+      continue
+    }
+    if (c === "#" && !inSingle && !inDouble && (i === 0 || /\s/.test(s[i - 1]))) {
+      return s.slice(0, i).trimEnd()
+    }
+  }
+  return s.trimEnd()
+}
+
+/**
  * 剥离命令尾部注释与尾部运算符，避免拼装 `;marker` 时：
  * - 尾注释 `# xxx` 把 marker 整行吞掉 → 检测不到完成
  * - 尾运算符 `&`、`;`、`&&`、`||` 与拼接的 `;` 形成 `&;`/`;;` 等语法错误
@@ -54,8 +89,7 @@ const PROBE_TIMEOUT_MS = 5_000
  * @returns 可安全拼装 marker 的命令体
  */
 function stripCommandTail(command: string): string {
-  let s = command.trimEnd()
-  s = s.replace(/\s+#[\s\S]*$/, "")
+  let s = stripTrailingComment(command)
   s = s.replace(/(?:&&|\|\||[;&|])[\s]*$/, "")
   return s.trimEnd()
 }
