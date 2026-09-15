@@ -292,7 +292,8 @@ export abstract class BaseSession {
     const marker = this._adapter ? this._adapter.markerCmd(this._runningSeq) : `printf '\\n<SSH_DONE:${this._runningSeq}:%s>' $?`
     const head = command.trim().split(/[\s;|&]+/)[0] ?? ""
     if (INTERACTIVE_PROGRAMS.has(head.toLowerCase())) return `${command}\r`
-    return `${command}\r\n${marker}\r`
+    // 用 \r 分隔（Enter）而非 \r\n：\n 会被当作空行，导致 bash 多读一行空命令回显错位
+    return `${command}\r${marker}\r`
   }
 
   /**
