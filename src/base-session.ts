@@ -11,7 +11,6 @@ import {
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart, extractOutput } from "./utils.js"
-import { findLastEndOf } from "./last-match.js"
 import { detectLastDoneMarker, stripMarkers, resolveByProbe, type ShellAdapter } from "./shell-adapter.js"
 
 /** 命令执行结果 */
@@ -359,16 +358,14 @@ protected async _injectAndSettle(deadline: number): Promise<boolean> {
 }
 
 /** 等待缓冲中出现指定文本（最多 maxMs）
- * 注入脚本很长时 ConPTY 会在 120 列处自动换行，输出流在换行处插入新行，
- * 整行精确匹配会失败导致无限重试；改用"脚本前缀 + 其后 TOKEN"判定
+ * 注入脚本很长时 ConPTY 会在 120 列处自动换行，输出流在换行处插入新行；
+ * 且 bash 可能对命令回显着色（readline 在字符间插 ANSI），整行/前缀精确匹配都会失败。
+ * token __SSH_INJECT_DONE__ 极独特且执行输出为独立行，直接查 token 即可。
  */
-private async _waitForBufferToken(line: string, token: string, maxMs: number): Promise<boolean> {
+private async _waitForBufferToken(_line: string, token: string, maxMs: number): Promise<boolean> {
   const startTime = Date.now()
-  // 前缀取脚本开头 40 字符（不会触及终端列宽换行点），作为注入脚本确实被回显的锚点
-  const prefix = line.slice(0, 40)
   while (Date.now() - startTime < maxMs) {
-    const prefixEnd = findLastEndOf(prefix, this._buffer)
-    if (prefixEnd >= 0 && this._buffer.includes(token, prefixEnd + 1)) return true
+    if (this._buffer.includes(token)) return true
     await new Promise((r) => setTimeout(r, 50))
   }
   return false
