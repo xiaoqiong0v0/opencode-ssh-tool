@@ -2,7 +2,7 @@
 // 标记格式：<SSH_DONE:<退出码>>  —— 可见文本便于 web Raw 模式直接调试；
 // 展示给用户/模型的输出会在上层剥离标记（用户实际看不到，与不可见标记等效）
 
-import { DONE_TAG, INJECT_TOKEN, SHELL_ID_PREFIX, VAR_LAST_HIST, VAR_NESTED, VAR_ORIG_RL, VAR_PENDING, VAR_HID } from "./constants.js"
+import { DONE_TAG, INJECT_TOKEN, SHELL_ID_PREFIX, VAR_NESTED, VAR_ORIG_RL, VAR_PENDING, VAR_HID } from "./constants.js"
 import { findLastMatch } from "./last-match.js"
 
 /** Shell 适配器接口 */
@@ -48,7 +48,9 @@ class BashAdapter implements ShellAdapter {
     return new RegExp(`${SHELL_ID_PREFIX}(bash|sh)\\b|(?:^|\\W)(bash|sh)(?:\\W|$)`, "i").test(output)
   }
   buildInjectScript(): string {
-    return `__ssh_prompt() { local ec=$?; if [ "\${HISTCMD:-}" != "\${${VAR_LAST_HIST}:-}" ]; then printf '\\n${DONE_TAG}%s>' "$ec"; ${VAR_LAST_HIST}=$HISTCMD; fi; }; PROMPT_COMMAND=__ssh_prompt; echo ${INJECT_TOKEN}`
+    // 追加链式不覆盖 PROMPT_COMMAND（避免 p10k 等框架重置后失效）；
+    // 不用 HISTCMD 守卫（kali 下不可靠），重复标记由检测端取最后一个兼容
+    return `__ssh_prompt() { local ec=$?; printf '\\n${DONE_TAG}%s>' "$ec"; }; __ssh_pc="\${PROMPT_COMMAND:-}"; PROMPT_COMMAND="__ssh_prompt\${__ssh_pc:+; }\$__ssh_pc"; echo ${INJECT_TOKEN}`
   }
 }
 
