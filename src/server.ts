@@ -258,15 +258,19 @@ export function startServer(
       }
 
       if (buf) {
-        const newData = client._bufPos !== undefined ? buf.data.slice(client._bufPos) : buf.data
-        client._bufPos = buf.data.length
-        if (newData) send(client, { type: "run", data: newData })
-        // done 转变：只发一次 runEnd（新命令开始时在 stream {command} 处理里重置 _sentDone）
-        if (buf.done && !client._sentDone) {
-          client._sentDone = true
-          send(client, { type: "runEnd" })
-          client._forceSnap = true
-          client._snapBase = Date.now()
+        // raw 模式：画面由 raw 连续流恢复，run/runEnd 冗余（web 端 debugMode 下本就忽略）→ 跳过
+        const rawMode = client._rawPos !== undefined
+        if (!rawMode) {
+          const newData = client._bufPos !== undefined ? buf.data.slice(client._bufPos) : buf.data
+          client._bufPos = buf.data.length
+          if (newData) send(client, { type: "run", data: newData })
+          // done 转变：只发一次 runEnd（新命令开始时在 stream {command} 处理里重置 _sentDone）
+          if (buf.done && !client._sentDone) {
+            client._sentDone = true
+            send(client, { type: "runEnd" })
+            client._forceSnap = true
+            client._snapBase = Date.now()
+          }
         }
         if (client._forceSnap && Date.now() - (client._snapBase ?? 0) >= SNAP_STABLE_MS) {
           client._forceSnap = false
@@ -274,7 +278,7 @@ export function startServer(
           const key = JSON.stringify(snap)
           if (key !== client._lastKey) {
             client._lastKey = key
-            if (client._rawPos !== undefined) {
+            if (rawMode) {
               // raw 模式：不推 pairs 全量，仅发轻量命令计数
               send(client, { type: "meta", sessionID: sub.sid, name: sub.name, commands: snap.pairs.filter((p) => p.type === "cmd").length })
             } else {
