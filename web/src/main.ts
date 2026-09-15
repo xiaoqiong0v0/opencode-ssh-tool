@@ -274,6 +274,7 @@ function connectWs(): void {
     switch (msg.type) {
       case "sessions": updateSessions(msg as unknown as { sessions: SessionStatus[] }); break
       case "snapshot": handleSnapshot(msg as unknown as { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }); break
+      case "meta": handleMeta(msg as unknown as { sessionID: string; name: string; commands: number }); break
       case "run": handleRun(msg as unknown as { data: string }); break
       case "runEnd": /* 等待后续 snapshot */ break
       case "cmdStart": handleCmdStart(msg as unknown as { command: string }); break
@@ -433,6 +434,11 @@ function handleRun(msg: { data: string }): void {
 
 /** Raw 连续流 TermScreen（debug 模式下模拟终端渲染） */
 let rawScreen: TermScreen | null = null
+
+// ===== 轻量 meta 处理（raw 模式：只有命令计数，无 pairs 全量） =====
+function handleMeta(msg: { sessionID: string; name: string; commands: number }): void {
+  if (typeof msg.commands === "number") updateMetaFromSessions(msg.commands)
+}
 
 // ===== Raw 连续流处理 =====
 function handleRaw(msg: { data: string; reset?: boolean }): void {
@@ -596,10 +602,10 @@ function onDebugModeChange(): void {
   debugMode = el.checked
   localStorage.setItem("debugMode", el.checked ? "1" : "0")
   document.body.classList.toggle("debug", el.checked)
-  // 立即重渲染：重新订阅当前终端，触发 snapshot 重推
-  subSid = ""
-  subName = ""
-  subscribe()
+  // 只切换 raw 推流开关，不重新订阅（避免重发 snapshot / pairs 全量）
+  if (ws && ws.readyState === WebSocket.OPEN && subSid && subName) {
+    ws.send(JSON.stringify({ type: "setRaw", on: debugMode }))
+  }
 }
 
 function deleteTerminal(): void {

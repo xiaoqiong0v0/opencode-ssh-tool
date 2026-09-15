@@ -272,7 +272,15 @@ export function startServer(
           client._forceSnap = false
           const snap = buildSnapshot(sub.sid, sub.name)
           const key = JSON.stringify(snap)
-          if (key !== client._lastKey) { client._lastKey = key; send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...snap }) }
+          if (key !== client._lastKey) {
+            client._lastKey = key
+            if (client._rawPos !== undefined) {
+              // raw 模式：不推 pairs 全量，仅发轻量命令计数
+              send(client, { type: "meta", sessionID: sub.sid, name: sub.name, commands: snap.pairs.filter((p) => p.type === "cmd").length })
+            } else {
+              send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...snap })
+            }
+          }
         }
         if (client._rawPos !== undefined) {
           const r = rawBuf.get(sKey)
@@ -388,8 +396,18 @@ export function startServer(
         ws._sub = { sid, name }
         ws._lastKey = JSON.stringify(snap)
         ws._forceSnap = false
-        send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
         const wantRaw = msg.raw === true
+        if (!wantRaw) {
+          // 非 raw：发完整 snapshot（renderTranscript 依赖 pairs）
+          send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
+        } else if (snap.notFound) {
+          // raw 但会话不存在：仍需发 notFound 提示
+          send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
+        } else {
+          // raw：raw 连续流已含完整画面，不重发 pairs 全量，只发轻量命令计数
+          const cmdCount = snap.pairs.filter((p) => p.type === "cmd").length
+          send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount })
+        }
         if (wantRaw) {
           if (entry) {
             const r = entry.session.readRawStream(0)
@@ -401,6 +419,35 @@ export function startServer(
             if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
           } else { ws._rawPos = 0 }
         } else { ws._rawPos = undefined }
+        return
+      }
+
+      if (t === "setRaw") {
+        // Raw 开关切换：不重新订阅（避免重发 snapshot），只切换 raw 推流
+        if (!ws._sub) return
+        const on = msg.on === true
+        if (!on) {
+          ws._rawPos = undefined
+          // 关 raw：raw 期间未推 snapshot，补发完整 pairs（renderTranscript 需渲染）
+          const { sid: s2, name: n2 } = ws._sub
+          const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
+          const snap = buildSnapshot(s2, n2, entry)
+          ws._lastKey = JSON.stringify(snap)
+          send(ws, { type: "snapshot", sessionID: s2, name: n2, ...snap })
+          return
+        }
+        // 开 raw：清空历史画面，从当前 raw 全量重放
+        const { sid: s2, name: n2 } = ws._sub
+        const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
+        if (entry) {
+          const r = entry.session.readRawStream(0)
+          ws._rawPos = r.pos
+          send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+        } else if (agentBySession.has(sessionKey(s2, n2))) {
+          const r = rawBuf.get(sessionKey(s2, n2))
+          ws._rawPos = r?.pos ?? 0
+          if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+        } else { ws._rawPos = 0 }
         return
       }
 
