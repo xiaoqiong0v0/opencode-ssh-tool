@@ -48,6 +48,8 @@ interface WsClient extends WebSocket {
   _regSessions?: Set<string>
   /** 代理 buf 流的消费游标（独立进程模式，按字节跟踪已推给客户端的量） */
   _bufPos?: number
+  /** 本次命令是否已发过 runEnd（done 转变只发一次，新命令开始重置） */
+  _sentDone?: boolean
 }
 
 export interface TranscriptPair {
@@ -259,7 +261,9 @@ export function startServer(
         const newData = client._bufPos !== undefined ? buf.data.slice(client._bufPos) : buf.data
         client._bufPos = buf.data.length
         if (newData) send(client, { type: "run", data: newData })
-        if (buf.done && !client._forceSnap) {
+        // done 转变：只发一次 runEnd（新命令开始时在 stream {command} 处理里重置 _sentDone）
+        if (buf.done && !client._sentDone) {
+          client._sentDone = true
           send(client, { type: "runEnd" })
           client._forceSnap = true
           client._snapBase = Date.now()
@@ -329,6 +333,9 @@ export function startServer(
           for (const c of wss.clients as Set<WsClient>) {
             if (c.readyState !== WebSocket.OPEN || !c._sub || c._sub.sid !== sid || c._sub.name !== name) continue
             c._bufPos = 0
+            c._sentDone = false
+            c._forceSnap = false
+            c._snapBase = 0
             send(c, { type: "cmdStart", command })
           }
         } else if (existing && done) { existing.done = true; existing.ts = Date.now(); if (data) existing.data = (existing.data || "") + data }
@@ -429,9 +436,14 @@ export function startServer(
         if (agent) {
           const reqId = `${sid}:${name}:${Date.now()}`
           streamBuf.set(sessionKey(sid, name), { data: "", done: false, ts: Date.now() })
-          // 新命令开始：重置各订阅者 buf 流游标
+          // 新命令开始：重置各订阅者 buf 流游标与 done 状态
           for (const c of wss.clients as Set<WsClient>) {
-            if (c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name) c._bufPos = 0
+            if (c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name) {
+              c._bufPos = 0
+              c._sentDone = false
+              c._forceSnap = false
+              c._snapBase = 0
+            }
           }
           send(agent, { type: "run-exec", reqId, sessionID: sid, name, command })
           const payload = buildSessions()
