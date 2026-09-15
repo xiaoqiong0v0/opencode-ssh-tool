@@ -13,6 +13,8 @@ const ECHO_WIDE = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\
  * 定位命令回显行在原始流中的结束位置（供流式增量定位使用）：
  * 丢弃窗口开头到"命令回显行结束"之前的一切内容（提示符、PS1 填充、光标定位噪音均在内）。
  * 命令回显行 = 命令文本首次出现所在行（命令本身可能含 \033 等转义）。
+ * 命令文本后允许任意行内字符直到行尾：命令可能被追加完成标记（如 `cmd ;printf '<SSH_DONE…>'`），
+ * 此时回显是整行拼接，不能要求命令后紧跟换行。
  * @param raw 原始终端流（含 ANSI）
  * @param command 本次执行的命令文本
  * @returns 命令回显结束后的字节偏移；未命中命令文本返回 0（此时应视作输出尚未开始）
@@ -20,13 +22,14 @@ const ECHO_WIDE = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\
 export function extractOutputStart(raw: string, command: string): number {
   const cmd = command.trim()
   if (!cmd) return 0
-  // 单条宽松正则一次性匹配命令回显（命令文本 + 字符间 ANSI 间隙）：
-  // 1) 字符间容忍 ANSI 间隙（WIDE）2) 命令字面 \033 回显可能变真实 ESC（二选一）
+  // 单条宽松正则一次性匹配命令回显：
+  // 1) 命令字符间容忍 ANSI 间隙（ECHO_WIDE）
+  // 2) 命令字面 \033 回显可能变真实 ESC（二选一）
+  // 3) 命令文本后允许任意行内字符直到行尾（[^\r\n]*），兼容追加的完成标记命令
   const norm = cmd.replace(/\\033/gi, "\x1b")
   const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
-  // 要求命令文本（及尾部 ANSI 重置序列）后紧跟行尾（\r?\n 或串尾），避免子 shell 输出内命令字（如 zsh: not found）误匹配
   const TAIL_ANSI = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[^\\x1b])*"
-  const re = new RegExp(frags.join(ECHO_WIDE) + TAIL_ANSI + "(?=\\r?\\n|$)", "g")
+  const re = new RegExp(frags.join(ECHO_WIDE) + TAIL_ANSI + "[^\\r\\n]*" + "(?=\\r?\\n|$)", "g")
   // 取最后一次匹配：备屏退出（如 cmatrix）会重放主屏历史，其中含旧命令回显，
   // 只有最后一次出现的回显之后才是本次命令的真实输出
   return findLastEndOf(re, raw)
