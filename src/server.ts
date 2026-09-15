@@ -403,6 +403,9 @@ export function startServer(
         const wantRaw = msg.raw === true
         if (!wantRaw) {
           // 非 raw：发完整 snapshot（renderTranscript 依赖 pairs）
+          // snapshot 已包含 buf 当前全部内容（history 落盘 + 运行中增量），
+          // _bufPos 初始化为 buf 末尾，避免 streamTimer 把整段旧 buf 再当 run 增量重放
+          ws._bufPos = streamBuf.get(sessionKey(sid, name))?.data.length ?? 0
           send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
         } else if (snap.notFound) {
           // raw 但会话不存在：仍需发 notFound 提示
@@ -432,17 +435,22 @@ export function startServer(
         const on = msg.on === true
         if (!on) {
           ws._rawPos = undefined
-          // 关 raw：raw 期间未推 snapshot，补发完整 pairs（renderTranscript 需渲染）
+          // 关 raw：raw 期间未推 snapshot，补发完整 pairs（renderTranscript 需渲染）；
+          // _bufPos 对齐 buf 末尾，避免旧 buf 数据作为 run 增量重复
           const { sid: s2, name: n2 } = ws._sub
+          ws._bufPos = streamBuf.get(sessionKey(s2, n2))?.data.length ?? 0
           const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
           const snap = buildSnapshot(s2, n2, entry)
           ws._lastKey = JSON.stringify(snap)
           send(ws, { type: "snapshot", sessionID: s2, name: n2, ...snap })
           return
         }
-        // 开 raw：清空历史画面，从当前 raw 全量重放
+        // 开 raw：清空历史画面，从当前 raw 全量重放，同步轻量命令计数
         const { sid: s2, name: n2 } = ws._sub
         const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
+        const metaSnap = buildSnapshot(s2, n2, entry)
+        ws._lastKey = JSON.stringify(metaSnap)
+        send(ws, { type: "meta", sessionID: s2, name: n2, commands: metaSnap.pairs.filter((p) => p.type === "cmd").length })
         if (entry) {
           const r = entry.session.readRawStream(0)
           ws._rawPos = r.pos
