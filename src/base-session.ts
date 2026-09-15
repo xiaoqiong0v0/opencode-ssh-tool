@@ -46,6 +46,20 @@ const MAX_WATCH_LEN = 10 * 60_000
 /** Shell 探测等待超时 */
 const PROBE_TIMEOUT_MS = 5_000
 
+/**
+ * 剥离命令尾部注释与尾部运算符，避免拼装 `;marker` 时：
+ * - 尾注释 `# xxx` 把 marker 整行吞掉 → 检测不到完成
+ * - 尾运算符 `&`、`;`、`&&`、`||` 与拼接的 `;` 形成 `&;`/`;;` 等语法错误
+ * @param command 原始命令
+ * @returns 可安全拼装 marker 的命令体
+ */
+function stripCommandTail(command: string): string {
+  let s = command.trimEnd()
+  s = s.replace(/\s+#[\s\S]*$/, "")
+  s = s.replace(/(?:&&|\|\||[;&|])[\s]*$/, "")
+  return s.trimEnd()
+}
+
 /** 会话命令执行与读取的公共实现 */
 export abstract class BaseSession {
   protected _connected = false
@@ -281,8 +295,8 @@ export abstract class BaseSession {
   protected abstract _ready(): boolean
 
   /**
-   * 组合写入命令：命令后追加独立一行的完成标记命令（免疫 prompt 框架覆盖）。
-   * bash/zsh/sh：printf '\n<SSH_DONE:%s>' $?；pwsh：Write-Host
+   * 组合写入命令：命令后以 `;` 拼接到同一行的完成标记命令（免疫 prompt 框架覆盖）。
+   * bash/zsh/sh：printf '\n<SSH_DONE:seq:%s>' $?；pwsh：Write-Host
    * 已知交互程序（python/node/bash 等 REPL）不吃追加行——它们作为 stdin 消费，
    * 对这类命令不追加 marker，靠 INTERACTIVE_RE + send 交互。
    * @param command 原始命令（history 存干净版本）
@@ -292,8 +306,8 @@ export abstract class BaseSession {
     const marker = this._adapter ? this._adapter.markerCmd(this._runningSeq) : `printf '\\n<SSH_DONE:${this._runningSeq}:%s>' $?`
     const head = command.trim().split(/[\s;|&]+/)[0] ?? ""
     if (INTERACTIVE_PROGRAMS.has(head.toLowerCase())) return `${command}\r`
-    // 用 \r 分隔（Enter）而非 \r\n：\n 会被当作空行，导致 bash 多读一行空命令回显错位
-    return `${command}\r${marker}\r`
+    const body = stripCommandTail(command)
+    return `${body} ;${marker}\r`
   }
 
   /**
