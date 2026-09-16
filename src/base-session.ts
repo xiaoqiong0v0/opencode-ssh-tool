@@ -25,17 +25,14 @@ export interface ExecResult {
   duration?: number
 }
 
+/** 生命周期事件（命令开始/完成），供 agent 转报 server（web 与插件自身 exec 统一来源） */
+export type LifecycleEvent =
+  | { type: "start"; command: string; ts: number }
+  | { type: "done"; exitCode: number | null; endTs: number }
+
 /** 交互触发词（sudo 密码 / 分页器 / 确认提示），含中英文 */
 const INTERACTIVE_RE =
   /(\[sudo\] password for|password for \S+:|\*\*\*\s*$|Password:|密码:|--More--|\(END\)|\[y\/N\]|\[Y\/n\]|yes\/no|是\/否)/i
-
-/** 已知交互式程序（REPL/分页器），命令以它们开头时不追加完成标记行 */
-const INTERACTIVE_PROGRAMS = new Set([
-  "python", "python2", "python3", "ipython", "node", "bun", "deno", "ruby", "irb", "php",
-  "perl", "lua", "tclsh", "elixir", "iex", "psql", "mysql", "sqlite3", "mongo", "redis-cli",
-  "bash", "zsh", "sh", "ksh", "csh", "fish", "pwsh", "powershell", "cmd",
-  "top", "htop", "btop", "vim", "vi", "nvim", "less", "more", "man",
-])
 
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
@@ -124,6 +121,8 @@ export abstract class BaseSession {
   /** 累积原始字节总数（单调递增，前端增量游标） */
   private _rawTotal = 0
   protected readonly _history: SessionHistory
+  /** 生命周期监听器（命令开始/完成事件，agent 转报 server） */
+  private _lifecycle: ((ev: LifecycleEvent) => void) | null = null
 
   constructor(
     protected readonly sessionID: string,
@@ -183,16 +182,17 @@ export abstract class BaseSession {
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
         const out = this._extractOutput(raw, command)
         this._history.append(command, out, this._runningStartTs, Date.now())
+        this._emitDone(outcome.exitCode ?? null, Date.now())
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "interactive": {
-        this._remoteBusy = false
+        // 交互程序（sudo 密码 / 确认提示）：命令仍在等待用户输入，
+        // 保留 running 上下文与 busy 状态，转后台 watch 持续监听完成标记；
+        // 用户 send 输入后命令完成时由 watch 完整收集输出并翻转 busy（防新命令被当 exec 塞进运行中 shell）
         const raw = this._buffer.slice(captureStart)
-        this._cursor = this._buffer.length
         const out = this._extractOutput(raw, command)
-        this._history.append(command, out, this._runningStartTs, Date.now())
-        this._clearRunningContext()
+        this._startBackgroundWatch(captureStart, command)
         return { ok: true, output: this._truncate(toModelText(out)), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "running": {
@@ -278,6 +278,24 @@ export abstract class BaseSession {
     return this._runningStartPos !== null && this._connected ? this._runningCommand : ""
   }
 
+  /**
+   * 设置命令生命周期监听器（命令开始/完成时回调）
+   * @param listener 回调（start 携带命令，done 携带退出码与结束时刻；null 表示清除）
+   */
+  setLifecycle(listener: ((ev: LifecycleEvent) => void) | null): void {
+    this._lifecycle = listener
+  }
+
+  /** 触发命令开始事件 */
+  private _emitStart(command: string, ts: number): void {
+    try { this._lifecycle?.({ type: "start", command, ts }) } catch { /* 监听器异常不打断执行 */ }
+  }
+
+  /** 触发命令完成事件 */
+  private _emitDone(exitCode: number | null, endTs: number): void {
+    try { this._lifecycle?.({ type: "done", exitCode, endTs }) } catch { /* 同上 */ }
+  }
+
   hasRunningStream(): boolean {
     return this._runningStartPos !== null && this._connected && this._runningCommand !== ""
   }
@@ -331,15 +349,14 @@ export abstract class BaseSession {
   /**
    * 组合写入命令：命令后以 `;` 拼接到同一行的完成标记命令（免疫 prompt 框架覆盖）。
    * bash/zsh/sh：printf '\n<SSH_DONE:seq:%s>' $?；pwsh：Write-Host
-   * 已知交互程序（python/node/bash 等 REPL）不吃追加行——它们作为 stdin 消费，
-   * 对这类命令不追加 marker，靠 INTERACTIVE_RE + send 交互。
+   * 所有命令统一追加 marker：`;` 同一行拼接是 shell 命令行层解析，`python; printf ...`
+   * 中 printf 由 shell 在 python 退出后执行，不会被 REPL 当 stdin 消费（实测 top/read/python 均正常出 marker）。
+   * 交互程序（top/vi/read/python 等）期间保留 running 上下文与 busy，marker 出现即判定完成。
    * @param command 原始命令（history 存干净版本）
    * @returns 实际写入 PTY 的文本
    */
   private _composeCommand(command: string): string {
     const marker = this._adapter ? this._adapter.markerCmd(this._runningSeq) : `printf '\\n<SSH_DONE:${this._runningSeq}:%s>' $?`
-    const head = command.trim().split(/[\s;|&]+/)[0] ?? ""
-    if (INTERACTIVE_PROGRAMS.has(head.toLowerCase())) return `${command}\r`
     const body = stripCommandTail(command)
     return `${body} ;${marker}\r`
   }
@@ -385,6 +402,7 @@ export abstract class BaseSession {
     this._runningSeq = this._cmdSeq
     this._remoteBusy = true
     this._lastActive = Date.now()
+    this._emitStart(command, this._runningStartTs)
   }
 
   /** 追加输出字节：维护业务缓冲 + 连续原始流 ring */
@@ -441,7 +459,7 @@ export abstract class BaseSession {
   private _waitCompletion(
     startPos: number,
     startTs: number,
-  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number }> {
+  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number; exitCode?: number }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
       let echoEnd = 0
@@ -465,13 +483,13 @@ export abstract class BaseSession {
           const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
           if (marker.done) {
             clearInterval(timer)
-            resolve({ kind: "done", markerPos: marker.pos })
+            resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
             return
           }
           const intr = detectInterrupt(this._buffer, echoEnd)
           if (intr.interrupted) {
             clearInterval(timer)
-            resolve({ kind: "done", markerPos: intr.pos })
+            resolve({ kind: "done", markerPos: intr.pos, exitCode: 130 })
             return
           }
         }
@@ -492,6 +510,8 @@ export abstract class BaseSession {
     let echoEnd = 0
     this._watchTimer = setInterval(() => {
       if (!this._connected || Date.now() - born > MAX_WATCH_LEN) {
+        // 超时/断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
+        if (this._runningCommand) this._emitDone(null, Date.now())
         this._remoteBusy = false
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
@@ -507,7 +527,9 @@ export abstract class BaseSession {
       const end = marker.done ? marker.pos : intr.pos
       if (marker.done || intr.interrupted) {
         const raw = this._buffer.slice(startPos, end)
+        const code = marker.done ? marker.exitCode : 130
         this._history.append(command, this._extractOutput(raw, command), this._runningStartTs)
+        this._emitDone(code, Date.now())
         this._cursor = Math.max(startPos, end)
         this._remoteBusy = false
         this._clearRunningContext()

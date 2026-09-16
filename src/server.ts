@@ -1,3 +1,7 @@
+// 独立 HTTP 服务：聚合多进程会话 + WebSocket 实时流
+// 协议（统一事件流）：agent 上报 cmdStart/out/cmdDone/raw，server 按订阅者 _mode 派发 diff/raw；
+// snapshot 仅订阅/模式切换时作为基线发送，日常由 diff 增量累积渲染。
+
 import { createServer, type Server, type IncomingMessage } from "node:http"
 import { readFileSync, readdirSync, existsSync } from "node:fs"
 import { join, dirname, extname, normalize } from "node:path"
@@ -7,17 +11,11 @@ import { WebSocketServer, WebSocket } from "ws"
 import { listAllSessions, removeSessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
 import { PTY_COLS } from "./constants.js"
-import type { SessionHistory } from "./history.js"
 import log from "./log.js"
 
 export interface LiveSession {
-  getHistory(): SessionHistory
-  getRunningOutput(): string
-  getRunningCommand(): string
-  hasRunningStream(): boolean
-  getRunningStream(): { data: string; done: boolean }
+  getHistory(): { getPairs(): unknown[] }
   close(): void
-  readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
 }
 
 export interface ServerHandle {
@@ -38,18 +36,13 @@ export interface SessionEntry {
 
 interface WsClient extends WebSocket {
   _sub?: { sid: string; name: string }
-  _lastKey?: string
-  _forceSnap?: boolean
-  _snapBase?: number
-  _wasRunning?: boolean
+  /** 南面模式：transcript=diff 增量 / raw=原始字节流（独立于订阅，切换不重订阅） */
+  _mode?: "transcript" | "raw"
+  /** 命令输出已推送字节偏移（针对 streamBuf.data；订阅/重建基线对齐末尾，命令开始重置 0） */
+  _txPos?: number
   _lastSessionsJson?: string
-  _rawPos?: number
   _agentId?: string
   _regSessions?: Set<string>
-  /** 代理 buf 流的消费游标（独立进程模式，按字节跟踪已推给客户端的量） */
-  _bufPos?: number
-  /** 本次命令是否已发过 runEnd（done 转变只发一次，新命令开始重置） */
-  _sentDone?: boolean
 }
 
 export interface TranscriptPair {
@@ -57,6 +50,16 @@ export interface TranscriptPair {
   ts?: number
   endTs?: number
   text: string
+}
+
+/** transcript 通道当前命令缓冲 */
+interface StreamBufEntry {
+  data: string
+  done: boolean
+  ts: number
+  command: string
+  endTs?: number
+  exitCode?: number
 }
 
 const PAGE_KEYS: FlatKey[] = [
@@ -84,17 +87,16 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   sendCtrlC: "web_send_ctrlc",
 }
 
-const SNAP_STABLE_MS = 400
 const STATUS_PUSH_MS = 2000
 
 const sessionKey = (sid: string, name: string): string => `${sid}:${name}`
 
 export function startServer(
   port: number,
-  getSessions: () => SessionEntry[],
+  _getSessions: () => SessionEntry[],
   dir: string,
   lang: Lang = "en",
-  streamTickMs = 100,
+  _streamTickMs = 100,
 ): Promise<ServerHandle> {
   let actualPort = port
   const webDir = join(dirname(fileURLToPath(import.meta.url)), "web")
@@ -102,9 +104,9 @@ export function startServer(
 
   const agents = new Map<WsClient, Set<string>>()
   const agentBySession = new Map<string, WsClient>()
-  const streamBuf = new Map<string, { data: string; done: boolean; ts: number }>()
+  const streamBuf = new Map<string, StreamBufEntry>()
   const rawBuf = new Map<string, { data: string; pos: number }>()
-  const BUSY_TIMEOUT = 30000 // 30s 无推流更新自动清 busy
+  const cmdCount = new Map<string, number>()
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -143,15 +145,28 @@ export function startServer(
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
   }
 
+  /** 订阅指定会话的 transcript 客户端深拷贝 I/O 深处 */
+  const subscribersOf = (sid: string, name: string): WsClient[] => {
+    return [...wss.clients as Set<WsClient>].filter(
+      (c) => c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name,
+    )
+  }
+
   const buildSessions = (): Record<string, unknown> => {
     const states = listAllSessions(dir)
     const liveKey = new Set(agentBySession.keys())
     const liveBusy = new Map<string, boolean>()
     const now = Date.now()
-    for (const [key] of agentBySession) {
-      const b = streamBuf.get(key)
-      // 超过 30s 无更新且未完成则自动清为 done（防止 agent 推流竞争导致 busy 卡死）
-      if (b && !b.done && now - b.ts > BUSY_TIMEOUT) { b.done = true; b.ts = now }
+    // 兜底：streamBuf 中 agent 连接已消失的 key 强制清 busy（agent 崩溃/退出防卡死）。
+    // 注意不能用"无 out 超时"判定——交互命令（sudo/read 等输入）等待期间无输出，
+    // 但 agent 仍在，命令未完成，busy 必须保持 true（完成由 agent 生命周期钩子兜底，含 watch 超时发 done）
+    for (const [key, b] of streamBuf) {
+      if (b && !b.done && !agentBySession.has(key)) {
+        b.done = true
+        b.ts = now
+        b.endTs = now
+        finalizeCommand(key)
+      }
       liveBusy.set(key, !!b && !b.done)
     }
     for (const s of states) {
@@ -171,133 +186,43 @@ export function startServer(
     return { port: actualPort, sessions }
   }
 
-  const buildSnapshot = (sid: string, name: string, entry?: SessionEntry): { pairs: TranscriptPair[]; notFound?: boolean } => {
-    if (entry) {
-      const pairs: TranscriptPair[] = []
-      for (const pair of entry.session.getHistory().getPairs()) {
-        if (pair.command === "__SSH_SEP__") {
-          pairs.push({ type: "sep", ts: pair.ts, text: "" })
-        } else {
-          pairs.push({ type: "cmd", ts: pair.ts, endTs: pair.endTs, text: pair.command })
-          pairs.push({ type: "out", text: entry.session.getHistory().readOutput(pair) })
-        }
-      }
-      if (entry.session.hasRunningStream()) {
-        const runningCmd = entry.session.getRunningCommand()
-        if (runningCmd) pairs.push({ type: "cmd", ts: Date.now(), text: runningCmd })
-        const running = entry.session.getRunningOutput()
-        if (running) pairs.push({ type: "run", text: running })
-      }
-      return { pairs }
-    }
+  /** 组装全量历史基线（snapshot）：文件历史 + 运行中命令转成 cmd+run 对 */
+  const buildSnapshot = (sid: string, name: string): { pairs: TranscriptPair[]; notFound?: boolean } => {
     const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
     const histName = state?.kind === "local" ? `local-${name}` : name
     const pairs = readHistoryFromFile(dir, sid, histName) ?? []
     const sKey = sessionKey(sid, name)
     const buf = streamBuf.get(sKey)
-    if (buf && !buf.done) {
-      if (pairs.length > 0 && pairs[pairs.length - 1].type !== "cmd" && pairs[pairs.length - 1].type !== "sep") {
-        const last = pairs[pairs.length - 1]
-        if (last.type === "run") pairs.push({ type: "cmd", ts: Date.now(), text: "" })
-      }
+    if (buf && !buf.done && buf.command) {
+      pairs.push({ type: "cmd", ts: buf.ts, text: buf.command })
       if (buf.data) pairs.push({ type: "run", text: buf.data })
     }
     if (pairs.length === 0 && !state) return { pairs: [], notFound: true }
     return { pairs }
   }
 
-  const historyKey = (session: LiveSession): string => {
-    const hp = session.getHistory().getPairs()
-    const last = hp[hp.length - 1]
-    return `${hp.length}:${last ? `${last.seq}:${last.size}` : "-"}`
-  }
-
-  const streamTimer = setInterval(() => {
-    for (const client of wss.clients as Set<WsClient>) {
-      if (client.readyState !== WebSocket.OPEN) continue
-      const sub = client._sub
-      if (!sub) continue
-      const entry = getSessions().find((e) => e.sessionID === sub.sid && e.name === sub.name)
-      const session = entry?.session
-      const sKey = sessionKey(sub.sid, sub.name)
-      const buf = streamBuf.get(sKey)
-
-      if (!session && !buf) {
-        const snap = buildSnapshot(sub.sid, sub.name)
-        const key = JSON.stringify(snap)
-        if (key !== client._lastKey) {
-          client._lastKey = key
-          send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...snap })
-        }
-        if (client._rawPos !== undefined) client._rawPos = undefined
-        continue
-      }
-
-      if (session) {
-        const runActive = session.hasRunningStream()
-        if (runActive && !client._wasRunning) {
-          const cmd = session.getRunningCommand()
-          if (cmd) send(client, { type: "cmdStart", command: cmd })
-        }
-        client._wasRunning = runActive
-        const st = session.getRunningStream()
-        if (st.done) {
-          if (!client._forceSnap) { send(client, { type: "runEnd" }); client._forceSnap = true; client._snapBase = Date.now() }
-        } else if (st.data) { send(client, { type: "run", data: st.data }) }
-        const key = historyKey(session)
-        const forceDone = client._forceSnap && (!runActive || (client._snapBase ?? 0) > 0 && Date.now() - client._snapBase! >= SNAP_STABLE_MS)
-        if (forceDone || (!runActive && key !== client._lastKey)) {
-          client._forceSnap = false; client._lastKey = key
-          send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...buildSnapshot(sub.sid, sub.name, entry) })
-        }
-        if (client._rawPos !== undefined) {
-          const r = session.readRawStream(client._rawPos)
-          if (r.data) { client._rawPos = r.pos; send(client, { type: "raw", data: r.data, pos: r.pos, reset: !!r.reset }) }
-        }
-        continue
-      }
-
-      if (buf) {
-        // raw 模式：画面由 raw 连续流恢复，run/runEnd 冗余（web 端 debugMode 下本就忽略）→ 跳过
-        const rawMode = client._rawPos !== undefined
-        if (!rawMode) {
-          const newData = client._bufPos !== undefined ? buf.data.slice(client._bufPos) : buf.data
-          client._bufPos = buf.data.length
-          if (newData) send(client, { type: "run", data: newData })
-          // done 转变：只发一次 runEnd（新命令开始时在 stream {command} 处理里重置 _sentDone）
-          if (buf.done && !client._sentDone) {
-            client._sentDone = true
-            send(client, { type: "runEnd" })
-            client._forceSnap = true
-            client._snapBase = Date.now()
-          }
-        }
-        if (client._forceSnap && Date.now() - (client._snapBase ?? 0) >= SNAP_STABLE_MS) {
-          client._forceSnap = false
-          const snap = buildSnapshot(sub.sid, sub.name)
-          const key = JSON.stringify(snap)
-          if (key !== client._lastKey) {
-            client._lastKey = key
-            if (rawMode) {
-              // raw 模式：不推 pairs 全量，仅发轻量命令计数
-              send(client, { type: "meta", sessionID: sub.sid, name: sub.name, commands: snap.pairs.filter((p) => p.type === "cmd").length })
-            } else {
-              send(client, { type: "snapshot", sessionID: sub.sid, name: sub.name, ...snap })
-            }
-          }
-        }
-        if (client._rawPos !== undefined) {
-          const r = rawBuf.get(sKey)
-          if (r && r.pos > client._rawPos) {
-            const data = r.data.slice(client._rawPos)
-            if (data) { client._rawPos = r.pos; send(client, { type: "raw", data, pos: r.pos }) }
-          }
-        }
+  /** cmdDone 收尾：cmd 计数 + 广播 diff{done}(transcript) / meta(raw) */
+  const finalizeCommand = (sKey: string): void => {
+    const [sid, name] = splitKey(sKey)
+    const b = streamBuf.get(sKey)
+    if (!b || !b.done) return
+    cmdCount.set(sKey, (cmdCount.get(sKey) ?? 0) + 1)
+    for (const c of subscribersOf(sid, name)) {
+      if (c._mode === "raw") {
+        send(c, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
+      } else {
+        send(c, { type: "diff", sessionID: sid, name, event: "done", exitCode: b.exitCode, endTs: b.endTs })
       }
     }
-  }, streamTickMs)
+  }
 
-  const statusTimer = setInterval(() => {
+  const splitKey = (key: string): [string, string] => {
+    const sep = key.indexOf(":")
+    return [key.slice(0, sep), key.slice(sep + 1)]
+  }
+
+  /** 广播 sessions（json 变化去重；busy 翻转必然变化） */
+  const pushSessions = (): void => {
     const payload = buildSessions()
     const json = JSON.stringify(payload)
     for (const client of wss.clients as Set<WsClient>) {
@@ -306,7 +231,9 @@ export function startServer(
       client._lastSessionsJson = json
       send(client, { type: "sessions", ...payload })
     }
-  }, STATUS_PUSH_MS)
+  }
+
+  const statusTimer = setInterval(() => { pushSessions() }, STATUS_PUSH_MS)
 
   wss.on("connection", (ws: WsClient) => {
     ws.on("message", (raw) => {
@@ -314,6 +241,8 @@ export function startServer(
       try { msg = JSON.parse(raw.toString()) } catch { return }
       const t = msg.type as string | undefined
       if (!t) return
+
+      // ===== agent 上报（唯一数据源） =====
 
       if (t === "register") {
         const sessions = msg.sessions as Array<{ sessionID: string; name: string }> | undefined
@@ -328,55 +257,74 @@ export function startServer(
         return
       }
 
-      if (t === "stream") {
+      if (t === "cmdStart") {
+        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+        const name = typeof msg.name === "string" ? msg.name : ""
+        const command = typeof msg.command === "string" ? msg.command : ""
+        if (!sid || !command) return
+        const k = sessionKey(sid, name)
+        const existing = streamBuf.get(k)
+        streamBuf.set(k, {
+          data: existing && existing.done ? "" : existing?.data ?? "",
+          done: false,
+          ts: typeof msg.ts === "number" ? msg.ts : Date.now(),
+          command,
+        })
+        for (const c of subscribersOf(sid, name)) {
+          if (c._mode === "raw") continue
+          // 新命令：重置推送游标，通知命令开始
+          c._txPos = 0
+          send(c, { type: "diff", sessionID: sid, name, event: "cmd", command, ts: streamBuf.get(k)!.ts })
+        }
+        pushSessions()
+        return
+      }
+
+      if (t === "out") {
+        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+        const name = typeof msg.name === "string" ? msg.name : ""
+        const data = typeof msg.data === "string" ? msg.data : ""
+        if (!sid || !data) return
+        const k = sessionKey(sid, name)
+        const existing = streamBuf.get(k)
+        if (existing) {
+          existing.data = (existing.data || "") + data
+          existing.ts = Date.now()
+        } else {
+          streamBuf.set(k, { data, done: false, ts: Date.now(), command: "" })
+        }
+        const len = streamBuf.get(k)!.data.length
+        for (const c of subscribersOf(sid, name)) {
+          if (c._mode === "raw") continue
+          const from = c._txPos ?? len
+          const newData = streamBuf.get(k)!.data.slice(from)
+          if (newData) {
+            c._txPos = len
+            send(c, { type: "diff", sessionID: sid, name, event: "out", data: newData })
+          }
+        }
+        return
+      }
+
+      if (t === "cmdDone") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid) return
         const k = sessionKey(sid, name)
-        const data = typeof msg.data === "string" ? msg.data : ""
-        const done = msg.done === true
-        const command = typeof msg.command === "string" ? msg.command : ""
-        const existing = streamBuf.get(k)
-        if (command) {
-          // 新执行开始（无论是否已有 entry）：重置数据+游标+通知前端
-          // 但保留已有 done=true（防止 stream {command} 后于 done 消息到达把 done 踩回 false）
-          const wasDone = existing && existing.done
-          streamBuf.set(k, { data, done: done || !!wasDone, ts: Date.now() })
-          for (const c of wss.clients as Set<WsClient>) {
-            if (c.readyState !== WebSocket.OPEN || !c._sub || c._sub.sid !== sid || c._sub.name !== name) continue
-            c._bufPos = 0
-            c._sentDone = false
-            c._forceSnap = false
-            c._snapBase = 0
-            send(c, { type: "cmdStart", command })
-          }
-        } else if (existing && done) { existing.done = true; existing.ts = Date.now(); if (data) existing.data = (existing.data || "") + data }
-        else if (existing && !done) { existing.ts = Date.now(); if (data) existing.data = (existing.data || "") + data }
-        else { streamBuf.set(k, { data, done, ts: Date.now() }) }
+        const b = streamBuf.get(k)
+        if (b) {
+          if (b.done) return // 幂等：同一命令只收尾一次
+          b.done = true
+          b.endTs = typeof msg.endTs === "number" ? msg.endTs : Date.now()
+          // agent 上报退出码可能与六条退出路径不一致（无退出来源 null）
+          if (typeof msg.exitCode === "number") b.exitCode = msg.exitCode
+        } else {
+          streamBuf.set(k, { data: "", done: true, ts: Date.now(), endTs: typeof msg.endTs === "number" ? msg.endTs : Date.now(), command: "" })
+        }
+        finalizeCommand(k)
+        pushSessions()
         return
       }
-
-      if (t === "done" || t === "result") {
-        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
-        const name = typeof msg.name === "string" ? msg.name : ""
-        if (sid) {
-          const k = sessionKey(sid, name)
-          const b = streamBuf.get(k)
-          if (b) { b.done = true; b.ts = Date.now() }
-        }
-        const payload = buildSessions()
-        const json = JSON.stringify(payload)
-        for (const client of wss.clients as Set<WsClient>) {
-          if (client.readyState !== WebSocket.OPEN) continue
-          client._forceSnap = true
-          client._snapBase = Date.now()
-          client._lastSessionsJson = json
-          send(client, { type: "sessions", ...payload })
-        }
-        return
-      }
-
-      // --- 以下 web 客户端消息 ---
 
       if (t === "raw") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
@@ -388,82 +336,68 @@ export function startServer(
         const existing = rawBuf.get(k)
         if (msg.reset === true || !existing) rawBuf.set(k, { data, pos })
         else if (data) rawBuf.set(k, { data: existing.data + data, pos })
+        // 直接转发给 raw 订阅者（agent 推的已是增量、WS 保序）
+        for (const c of subscribersOf(sid, name)) {
+          if (c._mode !== "raw") continue
+          send(c, { type: "raw", data, pos, reset: msg.reset === true })
+        }
         return
       }
+
+      // ===== web 请求 =====
 
       if (t === "subscribe") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid) return
-        const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
-        const snap = buildSnapshot(sid, name, entry)
         ws._sub = { sid, name }
-        ws._lastKey = JSON.stringify(snap)
-        ws._forceSnap = false
-        const wantRaw = msg.raw === true
-        if (!wantRaw) {
-          // 非 raw：发完整 snapshot（renderTranscript 依赖 pairs）
-          // snapshot 已包含 buf 当前全部内容（history 落盘 + 运行中增量），
-          // _bufPos 初始化为 buf 末尾，避免 streamTimer 把整段旧 buf 再当 run 增量重放
-          ws._bufPos = streamBuf.get(sessionKey(sid, name))?.data.length ?? 0
+        const sKey = sessionKey(sid, name)
+        const snap = buildSnapshot(sid, name)
+        if (snap.notFound) {
           send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
-        } else if (snap.notFound) {
-          // raw 但会话不存在：仍需发 notFound 提示
-          send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
-        } else {
-          // raw：raw 连续流已含完整画面，不重发 pairs 全量，只发轻量命令计数
-          const cmdCount = snap.pairs.filter((p) => p.type === "cmd").length
-          send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount })
-        }
-        if (wantRaw) {
-          if (entry) {
-            const r = entry.session.readRawStream(0)
-            ws._rawPos = r.pos
-            send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
-          } else if (agentBySession.has(sessionKey(sid, name))) {
-            const r = rawBuf.get(sessionKey(sid, name))
-            ws._rawPos = r?.pos ?? 0
-            if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
-          } else { ws._rawPos = 0 }
-        } else { ws._rawPos = undefined }
-        return
-      }
-
-      if (t === "setRaw") {
-        // Raw 开关切换：不重新订阅（避免重发 snapshot），只切换 raw 推流
-        if (!ws._sub) return
-        const on = msg.on === true
-        if (!on) {
-          ws._rawPos = undefined
-          // 关 raw：raw 期间未推 snapshot，补发完整 pairs（renderTranscript 需渲染）；
-          // _bufPos 对齐 buf 末尾，避免旧 buf 数据作为 run 增量重复
-          const { sid: s2, name: n2 } = ws._sub
-          ws._bufPos = streamBuf.get(sessionKey(s2, n2))?.data.length ?? 0
-          const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
-          const snap = buildSnapshot(s2, n2, entry)
-          ws._lastKey = JSON.stringify(snap)
-          send(ws, { type: "snapshot", sessionID: s2, name: n2, ...snap })
+          ws._mode = "transcript"
           return
         }
-        // 开 raw：清空历史画面，从当前 raw 全量重放，同步轻量命令计数
-        const { sid: s2, name: n2 } = ws._sub
-        const entry = getSessions().find((e) => e.sessionID === s2 && e.name === n2)
-        const metaSnap = buildSnapshot(s2, n2, entry)
-        ws._lastKey = JSON.stringify(metaSnap)
-        send(ws, { type: "meta", sessionID: s2, name: n2, commands: metaSnap.pairs.filter((p) => p.type === "cmd").length })
-        if (entry) {
-          const r = entry.session.readRawStream(0)
-          ws._rawPos = r.pos
-          send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
-        } else if (agentBySession.has(sessionKey(s2, n2))) {
-          const r = rawBuf.get(sessionKey(s2, n2))
-          ws._rawPos = r?.pos ?? 0
+        const wantRaw = msg.mode === "raw" || msg.raw === true
+        if (wantRaw) {
+          // raw：不重发 pairs 全量，raw 全量(reset) 已含画面 + 轻量命令计数
+          if (!cmdCount.has(sKey)) cmdCount.set(sKey, snap.pairs.filter((p) => p.type === "cmd").length)
+          send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
+          const r = rawBuf.get(sKey)
           if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
-        } else { ws._rawPos = 0 }
+          ws._mode = "raw"
+        } else {
+          // transcript：发完整基线，游标对齐缓冲末尾（基线已含全部缓冲内容，后续 out 只推增量）
+          send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
+          ws._txPos = streamBuf.get(sKey)?.data.length ?? 0
+          ws._mode = "transcript"
+        }
         return
       }
 
-      if (t === "unsubscribe") { ws._sub = undefined; return }
+      if (t === "setMode") {
+        if (!ws._sub) return
+        const on = msg.mode === "raw"
+        const { sid, name } = ws._sub
+        const sKey = sessionKey(sid, name)
+        if (on) {
+          ws._mode = "raw"
+          const snap = buildSnapshot(sid, name)
+          cmdCount.set(sKey, snap.pairs.filter((p) => p.type === "cmd").length)
+          send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
+          const r = rawBuf.get(sKey)
+          if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+        } else {
+          // raw→transcript：补发完整快照基线，游标对齐（raw 期间未收 diff）
+          ws._mode = "transcript"
+          const snap = buildSnapshot(sid, name)
+          ws._txPos = streamBuf.get(sKey)?.data.length ?? 0
+          send(ws, { type: "snapshot", sessionID: sid, name, ...snap })
+        }
+        return
+      }
+
+      if (t === "unsubscribe") { ws._sub = undefined; ws._mode = undefined; return }
       if (t === "ping") { send(ws, { type: "pong" }); return }
 
       if (t === "exec") {
@@ -471,48 +405,11 @@ export function startServer(
         const name = typeof msg.name === "string" ? msg.name : ""
         const command = typeof msg.command === "string" ? msg.command : ""
         if (!sid || !command) return
-        const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
-        if (entry) {
-          (entry.session as any).exec(command).then(() => {
-            const payload = buildSessions()
-            const json = JSON.stringify(payload)
-            for (const client of wss.clients as Set<WsClient>) {
-              if (client.readyState !== WebSocket.OPEN) continue
-              client._lastSessionsJson = json
-              send(client, { type: "sessions", ...payload })
-            }
-          })
-          const payload = buildSessions()
-          const json = JSON.stringify(payload)
-          for (const client of wss.clients as Set<WsClient>) {
-            if (client.readyState !== WebSocket.OPEN) continue
-            client._lastSessionsJson = json
-            send(client, { type: "sessions", ...payload })
-          }
-          return
-        }
         const agent = agentBySession.get(sessionKey(sid, name))
-        if (agent) {
-          const reqId = `${sid}:${name}:${Date.now()}`
-          streamBuf.set(sessionKey(sid, name), { data: "", done: false, ts: Date.now() })
-          // 新命令开始：重置各订阅者 buf 流游标与 done 状态
-          for (const c of wss.clients as Set<WsClient>) {
-            if (c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name) {
-              c._bufPos = 0
-              c._sentDone = false
-              c._forceSnap = false
-              c._snapBase = 0
-            }
-          }
-          send(agent, { type: "run-exec", reqId, sessionID: sid, name, command })
-          const payload = buildSessions()
-          const json = JSON.stringify(payload)
-          for (const client of wss.clients as Set<WsClient>) {
-            if (client.readyState !== WebSocket.OPEN) continue
-            client._lastSessionsJson = json
-            send(client, { type: "sessions", ...payload })
-          }
-        }
+        if (!agent) return
+        streamBuf.set(sessionKey(sid, name), { data: "", done: false, ts: Date.now(), command })
+        pushSessions()
+        send(agent, { type: "run-exec", reqId: `${sid}:${name}:${Date.now()}`, sessionID: sid, name, command })
         return
       }
 
@@ -521,8 +418,6 @@ export function startServer(
         const name = typeof msg.name === "string" ? msg.name : ""
         const text = typeof msg.text === "string" ? msg.text : ""
         if (!sid || !text) return
-        const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
-        if (entry) { (entry.session as any).send(text); return }
         const agent = agentBySession.get(sessionKey(sid, name))
         if (agent) send(agent, { type: "run-send", sessionID: sid, name, text })
         return
@@ -532,14 +427,13 @@ export function startServer(
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid || !name) return
-        const entry = getSessions().find((e) => e.sessionID === sid && e.name === name)
-        if (entry) { try { entry.session.close() } catch { log.info(`删除终端 ${sid}/${name} 时 close 抛异常`) } }
-        else {
-          const agent = agentBySession.get(sessionKey(sid, name))
-          if (agent) send(agent, { type: "run-delete", sessionID: sid, name })
-        }
+        const agent = agentBySession.get(sessionKey(sid, name))
+        if (agent) send(agent, { type: "run-delete", sessionID: sid, name })
         removeSessionState(dir, sid, name)
+        streamBuf.delete(sessionKey(sid, name))
+        rawBuf.delete(sessionKey(sid, name))
         log.info(`Web 页删除终端 ${sid}/${name}`)
+        pushSessions()
         return
       }
     })
@@ -563,7 +457,7 @@ export function startServer(
         server,
         port: actualPort,
         url: `http://127.0.0.1:${actualPort}`,
-        close: () => { clearInterval(streamTimer); clearInterval(statusTimer); server.close(); wss.close() },
+        close: () => { clearInterval(statusTimer); server.close(); wss.close() },
       })
     })
   })

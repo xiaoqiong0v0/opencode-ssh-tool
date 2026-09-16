@@ -11,6 +11,8 @@ export interface AgentSession {
   hasRunningStream(): boolean
   getRunningStream(): { data: string; done: boolean }
   getRunningCommand(): string
+  /** 设置命令生命周期监听器（cmdStart/cmdDone 事件源） */
+  setLifecycle(listener: ((ev: { type: "start"; command: string; ts: number } | { type: "done"; exitCode: number | null; endTs: number }) => void) | null): void
   /** 读取原始字节流增量 */
   readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
 }
@@ -47,41 +49,40 @@ export function startAgent(
     send({ type: "register", sessions: listSessions() })
   }
 
-  const prevRunning = new Set<string>()
   const rawPosMap = new Map<string, number>()
+  /** 已挂接生命周期监听的会话对象（按对象去重：同名会话断开重建是新对象，需重新挂接） */
+  const lifeHooked = new WeakSet<object>()
+
+  /** 为某个会话挂接生命周期监听：cmdStart/cmdDone 由 BaseSession 精确发出（web exec 与插件 exec 统一来源） */
+  const hookLifecycle = (key: string, session: AgentSession): void => {
+    if (lifeHooked.has(session)) return
+    lifeHooked.add(session)
+    const sep = key.indexOf(":")
+    const sid = key.slice(0, sep), name = key.slice(sep + 1)
+    session.setLifecycle((ev) => {
+      if (ev.type === "start") {
+        send({ type: "cmdStart", sessionID: sid, name, command: ev.command, ts: ev.ts })
+      } else {
+        send({ type: "cmdDone", sessionID: sid, name, exitCode: ev.exitCode, endTs: ev.endTs })
+      }
+    })
+  }
 
   const pushStreams = (): void => {
-    const nowRunning = new Set<string>()
     for (const { sessionID, name } of listSessions()) {
       const session = resolveSession(sessionID, name)
       const key = `${sessionID}:${name}`
       if (!session) continue
+      hookLifecycle(key, session)
       const raw = session.readRawStream(rawPosMap.get(key) ?? 0)
       if (raw.data) {
         rawPosMap.set(key, raw.pos)
         send({ type: "raw", sessionID, name, data: raw.data, pos: raw.pos, reset: !!raw.reset })
       }
       if (!session.hasRunningStream()) continue
-      nowRunning.add(key)
       const st = session.getRunningStream()
-      if (st.done) {
-        send({ type: "stream", sessionID, name, data: st.data, done: true })
-        send({ type: "done", sessionID, name })
-        nowRunning.delete(key)
-      } else if (st.data) {
-        const command = !prevRunning.has(key) ? session.getRunningCommand() : undefined
-        send({ type: "stream", sessionID, name, data: st.data, command })
-      }
+      if (st.data) send({ type: "out", sessionID, name, data: st.data })
     }
-    for (const key of prevRunning) {
-      if (!nowRunning.has(key)) {
-        const sep = key.indexOf(":")
-        send({ type: "done", sessionID: key.slice(0, sep), name: key.slice(sep + 1) })
-        log.info(`agent pushStreams 转变检测发 done ${key}`)
-      }
-    }
-    prevRunning.clear()
-    for (const k of nowRunning) prevRunning.add(k)
   }
 
   const connect = (): void => {
@@ -110,16 +111,28 @@ export function startAgent(
         if (!sid || !command) return
         const session = resolveSession(sid, name)
         if (!session) {
-          send({ type: "done", sessionID: sid, name })
+          send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
+          return
+        }
+        // 决策移到 agent 端（web 的 busy/connected 判断有推送延迟）：
+        // 终端忙/交互等待（sudo 密码、vi、REPL）→ 原样发送到终端；
+        // 空闲 → 作为新命令执行（带 marker 进 history）
+        if (session.hasRunningStream()) {
+          session.send(command + "\r")
           return
         }
         void (async () => {
           try {
-            await session.exec(command)
+            const result = await session.exec(command)
+            // exec 同步等待：正常完成/动画等待均会触发生命周期 done（cmdDone）。
+            // 仅 quick-fail（busy/未连接，返回 {ok:false}）不会发 done —— 补一条兜底防 server busy 卡死
+            if (result && typeof result === "object" && "ok" in result && !(result as { ok: boolean }).ok) {
+              send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
+            }
           } catch (e) {
             log.error(`代理执行失败 ${sid}/${name}`, e instanceof Error ? e.message : String(e))
-          } finally {
-            send({ type: "done", sessionID: sid, name })
+            // 命令未运行（异常）：补充 cmdDone 兜底（正常完成由生命周期上报，server 幂等）
+            send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
           }
         })()
         return

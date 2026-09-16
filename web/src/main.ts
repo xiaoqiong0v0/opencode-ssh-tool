@@ -33,6 +33,7 @@ interface TranscriptPair {
   type: "cmd" | "out" | "run" | "sep"
   ts?: number
   endTs?: number
+  exitCode?: number
   text: string
 }
 
@@ -275,9 +276,7 @@ function connectWs(): void {
       case "sessions": updateSessions(msg as unknown as { sessions: SessionStatus[] }); break
       case "snapshot": handleSnapshot(msg as unknown as { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }); break
       case "meta": handleMeta(msg as unknown as { sessionID: string; name: string; commands: number }); break
-      case "run": handleRun(msg as unknown as { data: string }); break
-      case "runEnd": /* 等待后续 snapshot */ break
-      case "cmdStart": handleCmdStart(msg as unknown as { command: string }); break
+      case "diff": handleDiff(msg as unknown as { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number }); break
       case "raw": handleRaw(msg as unknown as { data: string; reset?: boolean }); break
     }
   }
@@ -355,6 +354,8 @@ let subSid = ""
 let subName = ""
 /** 是否已收到 raw 流（收到前可回退 snapshot 渲染，收到后 raw 拥有画面） */
 let rawActive = false
+/** 本地累积的命令/输出对（snapshot 基线 + diff 增量），transcript 渲染驱动 */
+let localPairs: TranscriptPair[] = []
 
 function subscribe(): void {
   const sid = (document.getElementById("session") as HTMLSelectElement).value
@@ -365,7 +366,7 @@ function subscribe(): void {
   subName = name
   runScreen = null
   rawActive = false
-  ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, raw: debugMode }))
+  ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, mode: debugMode ? "raw" : "transcript" }))
 }
 
 // ===== Snapshot 处理 =====
@@ -384,6 +385,7 @@ function handleSnapshot(msg: { sessionID: string; name: string; pairs: Transcrip
   document.body.classList.toggle("show-time", showTime)
   const cmdCount = pairs.filter((p) => p.type === "cmd").length
   updateMetaFromSessions(cmdCount)
+  localPairs = pairs
   // debug 模式下 raw 连续流优先：raw 数据渲染画面，snapshot 不再重建 transcript
   if (debugMode && rawActive) return
   runScreen = null
@@ -409,26 +411,81 @@ function updateMetaFromSessions(cmdCount?: number): void {
   document.getElementById("meta").textContent = sid + "/" + name + typePart + countPart
 }
 
-// ===== Run 增量处理 =====
-function handleRun(msg: { data: string }): void {
-  if (!msg.data || debugMode) return
+// ===== Diff 增量处理（transcript 模式唯一增量来源：cmd/out/done） =====
+function handleDiff(msg: { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number }): void {
+  if (debugMode) return // raw 模式画面由 raw 通道渲染，diff 忽略
   const pre = document.getElementById("term") as HTMLPreElement
   const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
-  let block = document.getElementById("runBlock") as HTMLDivElement | null
-  if (!runScreen) {
-    runScreen = new TermScreen(PTY_COLS)
-    block = document.createElement("div")
-    block.id = "runBlock"
-    pre.appendChild(block)
-  }
-  runScreen.write(stripDone(msg.data))
-  const html = runScreen.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
-  block!.innerHTML = html
-  if (stickToBottom) {
-    pre.scrollTop = pre.scrollHeight
-    toBottomBtn.style.display = "none"
-  } else {
-    toBottomBtn.style.display = "block"
+  const showTime = (document.getElementById("showTime") as HTMLInputElement).checked
+  if (msg.event === "cmd") {
+    if (!msg.command) return
+    // 清理旧 runBlock（若存在），避免残留
+    const old = document.getElementById("runBlock")
+    if (old) old.remove()
+    runScreen = null
+    // 插入命令行
+    const t = showTime ? fmtTime(Date.now()) : ""
+    const row = document.createElement("div")
+    row.className = "row cmdline"
+    row.innerHTML = '<span class="t">' + t + '</span><span class="c">' + escHtml(msg.command) + '</span>'
+    pre.appendChild(row)
+    // 本地累积：新命令对
+    localPairs.push({ type: "cmd", ts: typeof msg.ts === "number" ? msg.ts : Date.now(), text: msg.command })
+  } else if (msg.event === "out") {
+    if (!msg.data) return
+    let block = document.getElementById("runBlock") as HTMLDivElement | null
+    if (!runScreen) {
+      runScreen = new TermScreen(PTY_COLS)
+      block = document.createElement("div")
+      block.id = "runBlock"
+      pre.appendChild(block)
+    }
+    runScreen.write(stripDone(msg.data))
+    const html = runScreen.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
+    block!.innerHTML = html
+    // 本地累积：追加到当前输出块（对命令/输出对的 out 累积）
+    const last = localPairs[localPairs.length - 1]
+    if (last && last.type === "out") last.text += msg.data
+    else localPairs.push({ type: "out", text: msg.data })
+  } else if (msg.event === "done") {
+    // 当前输出块固化：补 endTs + exitCode
+    const cmdPairs = [...localPairs].reverse().find((p) => p.type === "cmd")
+    let b = document.getElementById("runBlock") as HTMLDivElement | null
+    if (!b || b.parentNode !== pre) {
+      // 无输出命令：创建占位块，让退出状态可见（与 snapshot 渲染的空行行为一致）
+      if (cmdPairs) {
+        b = document.createElement("div")
+        b.id = "runBlock"
+        pre.appendChild(b)
+      }
+    }
+    if (b && b.parentNode === pre) {
+      // 为最后一行的时列补耗时与退出状态
+      const meta = showTime ? resultMeta({ ts: cmdPairs?.ts, endTs: msg.endTs }, msg.exitCode) : ""
+      if (b.childElementCount === 0 && cmdPairs) {
+        const row = document.createElement("div")
+        row.className = "row"
+        row.innerHTML = '<span class="t">' + meta + '</span><span class="c">&nbsp;</span>'
+        b.appendChild(row)
+      } else {
+        const lastRow = b.lastElementChild as HTMLDivElement | null
+        if (lastRow) {
+          const c = lastRow.querySelector(".t")
+          if (c) c.innerHTML = meta
+        }
+      }
+    }
+    const out = localPairs[localPairs.length - 1]
+    if (out && out.type === "out") {
+      out.endTs = msg.endTs
+      out.exitCode = msg.exitCode
+    }
+    if (stickToBottom) {
+      pre.scrollTop = pre.scrollHeight
+      toBottomBtn.style.display = "none"
+    } else {
+      toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "block" : "none"
+    }
   }
 }
 
@@ -469,29 +526,6 @@ function handleRaw(msg: { data: string; reset?: boolean }): void {
   }
 }
 
-// ===== 命令开始处理 =====
-function handleCmdStart(msg: { command: string }): void {
-  if (debugMode) return // 调试模式不单独渲染 cmd，echo 已在 raw 输出中
-  if (!msg.command) return
-  const pre = document.getElementById("term") as HTMLPreElement
-  const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
-  // 清理旧 runBlock（若存在），避免残留
-  const old = document.getElementById("runBlock")
-  if (old) old.remove()
-  runScreen = null
-  // 插入命令行
-  const showTime = (document.getElementById("showTime") as HTMLInputElement).checked
-  const t = showTime ? fmtTime(Date.now()) : ""
-  const row = document.createElement("div")
-  row.className = "row cmdline"
-  row.innerHTML = '<span class="t">' + t + '</span><span class="c">' + escHtml(msg.command) + '</span>'
-  pre.appendChild(row)
-  if (stickToBottom) {
-    pre.scrollTop = pre.scrollHeight
-    toBottomBtn.style.display = "none"
-  }
-}
-
 // ===== 渲染函数 =====
 function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
@@ -526,7 +560,7 @@ function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
       const scr = new TermScreen(PTY_COLS)
       scr.write(parsed.text)
       const rows = scr.render()
-      const meta = showTime ? resultMeta(pending, parsed.exitCode) : ""
+      const meta = showTime ? resultMeta(pending, parsed.exitCode ?? p.exitCode) : ""
       const rowOf = (t: string, c: string): string => '<div class="row"><span class="t">' + t + '</span><span class="c">' + c + '</span></div>'
       if (rows.length === 0) {
         // 无输出命令：占一个空行，让输出块可见（时间列展示耗时/退出状态）
@@ -602,9 +636,9 @@ function onDebugModeChange(): void {
   debugMode = el.checked
   localStorage.setItem("debugMode", el.checked ? "1" : "0")
   document.body.classList.toggle("debug", el.checked)
-  // 只切换 raw 推流开关，不重新订阅（避免重发 snapshot / pairs 全量）
+  // 只切换输出模式，不重新订阅（避免重发 snapshot / pairs 全量）
   if (ws && ws.readyState === WebSocket.OPEN && subSid && subName) {
-    ws.send(JSON.stringify({ type: "setRaw", on: debugMode }))
+    ws.send(JSON.stringify({ type: "setMode", mode: debugMode ? "raw" : "transcript" }))
   }
 }
 
@@ -693,34 +727,20 @@ cmdInput.addEventListener("keydown", (ev) => {
   ev.preventDefault()
   const sid = (document.getElementById("session") as HTMLSelectElement).value
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
-  const s = sessionsData.find((x) => x.sessionID === sid)
-  const t = s?.terminals.find((t2) => (t2.name || "default") === name)
-  if (!t || !t.connected) return
-  if (t.busy) {
-    // 忙时（子 shell/交互程序）：Enter 发送原样文本到终端
-    const text = cmdInput.value
-    cmdInput.value = ""
-    autoGrowCmdInput()
-    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return
-    if (subSid !== sid || subName !== name) {
-      subSid = sid; subName = name
-      ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name }))
-    }
-    ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text: text + "\r" }))
-    stickToBottom = true
-    return
-  }
+  if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
   const command = cmdInput.value.trim()
-  if (!command) return
   cmdInput.value = ""
   autoGrowCmdInput()
-  cmdHistory.push(command)
-  cmdHistIdx = cmdHistory.length
-  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  if (!command) return
+  // 统一按提交意图发 exec：send/exec 决策移到 agent 端（web 的 busy/connected 判断有推送延迟，
+  // 易误判——忙时命令走 send 会真实执行但无 marker、不进 transcript；空闲误判则命令被塞进运行中 shell）
   if (subSid !== sid || subName !== name) {
-    subSid = sid; subName = name
+    subSid = sid
+    subName = name
     ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name }))
   }
+  cmdHistory.push(command)
+  cmdHistIdx = cmdHistory.length
   ws.send(JSON.stringify({ type: "exec", sessionID: sid, name, command }))
   stickToBottom = true
 })
