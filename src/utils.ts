@@ -33,7 +33,12 @@ export function extractOutputStart(raw: string, command: string, endBound = raw.
   const LINE_END = "(?:(?:\\r?" + TAIL_ANSI + ")\\r?\\n|\\r?$)"
   const lineOf = (line: string): string => {
     const frags = [...line].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
-    return frags.join(ECHO_WIDE) + TAIL_ANSI + "[^\\r\\n]*"
+    // 字符间隙：容忍 ANSI/空白；并容忍 readline 折行重绘在折行处**重复前一个字符**
+    // （超宽命令回显会多出边界字符，如 `...libayatan\r\n\x1b[39;120Hna-...`，精确匹配会失败）
+    const gap = (prev: string): string => ECHO_WIDE + "(?:\\r?\\n" + TAIL_ANSI + prev + ECHO_WIDE + ")?"
+    let out = frags[0] ?? ""
+    for (let i = 1; i < frags.length; i++) out += gap(frags[i - 1]) + frags[i]
+    return out + TAIL_ANSI + "[^\\r\\n]*"
   }
   const lines = norm.split("\n")
   // 段间匹配：容忍任意行（prompt、输出行等）直到下一段命令，再用 ECHO_WIDE 收紧命令字符间隙

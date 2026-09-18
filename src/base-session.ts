@@ -11,7 +11,7 @@ import {
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, type ShellAdapter } from "./shell-adapter.js"
+import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, hasHeredoc, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
 /** 命令执行结果 */
@@ -88,9 +88,13 @@ function stripTrailingComment(s: string): string {
  * @returns 可安全拼装 marker 的命令体
  */
 function stripCommandTail(command: string): string {
-  let s = stripTrailingComment(command)
+  // 仅处理最后一行：多行命令（如 heredoc 正文）中间的 `#` 是内容，若在此截断会把命令切断
+  const nl = command.lastIndexOf("\n")
+  const head = nl >= 0 ? command.slice(0, nl + 1) : ""
+  const last = nl >= 0 ? command.slice(nl + 1) : command
+  let s = stripTrailingComment(last)
   s = s.replace(/(?:&&|\|\||[;&|])[\s]*$/, "")
-  return s.trimEnd()
+  return (head + s).trimEnd()
 }
 
 /** 会话命令执行与读取的公共实现 */
@@ -125,6 +129,13 @@ export abstract class BaseSession {
   protected readonly _history: SessionHistory
   /** 生命周期监听器（命令开始/完成事件，agent 转报 server） */
   private _lifecycle: ((ev: LifecycleEvent) => void) | null = null
+  /**
+   * 本次命令期间是否真实发送过中断（Ctrl-C）。
+   * 中断判定不依赖"命令回显定位"：超宽命令被 readline 折行重绘时回显会多出字符，
+   * 精确匹配必然失败（echoEnd=0），若再以 echoEnd 为前置条件则 ^C 永远检测不到 → busy 卡死。
+   * 仅当确实发过 ^C 才去缓冲区找 ^C 回显，天然排除历史残留 ^C 的误判。
+   */
+  private _interruptSent = false
 
   constructor(
     protected readonly sessionID: string,
@@ -263,6 +274,8 @@ export abstract class BaseSession {
       .replace(/\\r/g, "\r")
       .replace(/\\n/g, "\r")
     log.info(`send -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
+    // 真实中断输入：标记本次命令已发过 Ctrl-C，供完成判定识别 ^C 回显（不依赖命令回显定位）
+    if (payload.includes("\x03")) this._interruptSent = true
     this._write(payload)
     this._lastActive = Date.now()
     return { ok: true }
@@ -368,25 +381,29 @@ export abstract class BaseSession {
   }
 
   /**
-   * 组合写入命令：命令后以 `;` 拼接到同一行的完成标记命令（免疫 prompt 框架覆盖）。
-   * bash/zsh/sh：printf '\n<SSH_DONE:seq:%s>' $?；pwsh：Write-Host
-   * 所有命令统一追加 marker：`;` 同一行拼接是 shell 命令行层解析，`python; printf ...`
-   * 中 printf 由 shell 在 python 退出后执行，不会被 REPL 当 stdin 消费（实测 top/read/python 均正常出 marker）。
-   * 交互程序（top/vi/read/python 等）期间保留 running 上下文与 busy，marker 出现即判定完成。
+   * 组合写入命令（实际写入 PTY 的文本，尾部带 \r 回车）
    * @param command 原始命令（history 存干净版本）
    * @returns 实际写入 PTY 的文本
    */
   private _composeCommand(command: string): string {
-    const marker = this._markerCmd(this._runningSeq)
-    const body = stripCommandTail(command)
-    return `${body} ;${marker}\r`
+    return `${this._composeEchoText(command)}\r`
   }
 
-  /** 组合命令的回显文本（无尾部 \r）：供 extractOutputStart 定位回显行结束，防止裸命令名出现在错误行被 last-match 误命中 */
+  /**
+   * 组合命令文本（无尾部 \r）：命令 + 完成标记，同时供 extractOutputStart 定位回显结束。
+   * 普通命令用 `;` 同行拼接（免疫 prompt 框架覆盖）：`python; printf ...` 中 printf 由 shell 在 python
+   * 退出后执行，不会被 REPL 当 stdin 消费（实测 top/read/python 均正常出 marker）。
+   * 含 heredoc 的命令改用换行分隔：标记若以 `;` 拼到分隔符行（`EOF ;printf ...`），
+   * heredoc 分隔符不再被识别 → 永不结束 → 卡死。
+   * 交互程序（top/vi/read/python 等）期间保留 running 上下文与 busy，marker 出现即判定完成。
+   * @param command 原始命令
+   * @returns 命令 + 标记文本（无 \r）
+   */
   private _composeEchoText(command: string): string {
     const marker = this._markerCmd(this._runningSeq)
     const body = stripCommandTail(command)
-    return `${body} ;${marker}`
+    const sep = hasHeredoc(body) ? "\n" : " ;"
+    return `${body}${sep}${marker}`
   }
 
   /**
@@ -431,6 +448,7 @@ export abstract class BaseSession {
     this._runningStartPos = 0
     this._runningCommand = command
     this._runningStartTs = Date.now()
+    this._interruptSent = false // 新命令：清除上一条/空闲期发出的 Ctrl-C 标记
     this._cmdSeq += 1
     this._runningSeq = this._cmdSeq
     this._remoteBusy = true
@@ -493,7 +511,6 @@ export abstract class BaseSession {
   ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number; exitCode?: number }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
-      let echoEnd = 0
       const timer = setInterval(() => {
         if (INTERACTIVE_RE.test(this._buffer.slice(startPos))) {
           clearInterval(timer)
@@ -503,22 +520,18 @@ export abstract class BaseSession {
         const now = Date.now()
         const curLen = this._buffer.length
         if (curLen !== lastLen) lastLen = curLen
-        if (echoEnd <= 0 && this._runningCommand) {
-          const end = extractOutputStart(this._buffer.slice(startPos), this._runningCommand)
-          if (end > 0) echoEnd = startPos + end
-        }
-        // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，
-        // 或 Ctrl-C 中断时 TTY 回显 ^C。均与环境/框架无关。
-        // marker 自带唯一 seq，从命令起点直接搜索即可（连续输入时 echoEnd 可能被后序裸命令回显带偏到 marker 之后）
+        // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，或 Ctrl-C 中断时 TTY 回显 ^C。
+        // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）
         const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
         if (marker.done) {
           clearInterval(timer)
           resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
           return
         }
-        // ^C 中断：只在命令回显定位成功后才检测（回显前出现的 ^C 只可能是残留）
-        if (echoEnd > 0) {
-          const intr = detectInterrupt(this._buffer, echoEnd)
+        // ^C 中断：仅当本次命令确实发送过 Ctrl-C 才检测（无需命令回显定位，
+        // 超宽命令折行重绘会让回显精确匹配失败；未发过 Ctrl-C 时缓冲区里的 ^C 只可能是残留）
+        if (this._interruptSent) {
+          const intr = detectInterrupt(this._buffer, startPos)
           if (intr.interrupted) {
             clearInterval(timer)
             resolve({ kind: "done", markerPos: intr.pos, exitCode: 130 })
@@ -539,7 +552,6 @@ export abstract class BaseSession {
   private _startBackgroundWatch(startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
     const born = Date.now()
-    let echoEnd = 0
     this._watchTimer = setInterval(() => {
       if (!this._connected || Date.now() - born > MAX_WATCH_LEN) {
         // 超时/断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
@@ -549,13 +561,10 @@ export abstract class BaseSession {
         if (this._watchTimer) clearInterval(this._watchTimer)
         return
       }
-      if (echoEnd <= 0 && command) {
-        const end = extractOutputStart(this._buffer.slice(startPos), command)
-        if (end > 0) echoEnd = startPos + end
-      }
-      // marker 唯一 seq，从命令起点搜索（免疫 echoEnd 被后序裸命令回显带偏）
+      // marker 唯一 seq，从命令起点搜索（不依赖命令回显定位）
       const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
-      const intr = echoEnd > 0 ? detectInterrupt(this._buffer, echoEnd) : { interrupted: false, pos: 0 }
+      // ^C 中断：仅当本次命令确实发送过 Ctrl-C 才检测（超宽命令折行重绘会让回显精确匹配失败）
+      const intr = this._interruptSent ? detectInterrupt(this._buffer, startPos) : { interrupted: false, pos: 0 }
       const end = marker.done ? marker.pos : intr.pos
       if (marker.done || intr.interrupted) {
         const raw = this._buffer.slice(startPos, end)
@@ -576,6 +585,7 @@ export abstract class BaseSession {
     this._runningCommand = ""
     this._streamPos = null
     this._runningStartTs = 0
+    this._interruptSent = false
   }
 
   private _truncate(s: string): string {

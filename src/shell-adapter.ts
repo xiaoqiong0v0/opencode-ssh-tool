@@ -69,37 +69,82 @@ export function detectInterrupt(buffer: string, fromPos: number): { interrupted:
 
 // ===== Shell 类型探测与标记命令 =====
 
-/** 按续行规则拆分多行命令为独立命令（行尾匹配续行正则时与下一行合并，避免把续行命令拆断） */
-function splitByContinuation(command: string, contRe: RegExp): string[] {
+/** 提取 POSIX heredoc 分隔符（`<<EOF` / `<<-EOF` / `<<'EOF'` / `<<"EOF"`），无则返回 null */
+function heredocDelim(line: string): string | null {
+  const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/)
+  return m ? m[2] : null
+}
+
+/**
+ * 命令是否包含 heredoc（`<<` 操作符）。
+ * 拼接完成标记时据此改用换行分隔：标记若以 `;` 拼到分隔符行（`EOF ;printf ...`），
+ * heredoc 分隔符不再被识别 → 永不结束 → 卡死。
+ * @param command 命令文本（可多行）
+ * @returns 是否包含 heredoc
+ */
+export function hasHeredoc(command: string): boolean {
+  return command.split("\n").some((l) => heredocDelim(l) !== null)
+}
+
+/**
+ * 按续行规则拆分多行命令为独立命令（行尾匹配续行正则时与下一行合并，避免把续行命令拆断）
+ * @param command 多行命令文本
+ * @param contRe 行尾续行正则
+ * @param heredoc POSIX heredoc 感知：`cmd <<EOF` 起至分隔符行的整体并入同一条命令
+ *   （否则首行单独执行会停在 heredoc 等待输入，后续行不再发送 → 卡死）
+ * @returns 拆分后的独立命令列表
+ */
+function splitByContinuation(command: string, contRe: RegExp, heredoc = false): string[] {
   const rawLines = command.split("\n")
   const cmds: string[] = []
   let buf = ""
-  for (let line of rawLines) {
-    const trailing = line.trimEnd()
+  let pending: string | null = null // 未结束的 heredoc 分隔符
+  const flush = (): void => { const c = buf.trim(); if (c) cmds.push(c); buf = "" }
+  for (const line of rawLines) {
+    if (pending !== null) {
+      buf = buf ? buf + "\n" + line : line
+      if (line.trim() === pending) { pending = null; flush() }
+      continue
+    }
     buf = buf ? buf + "\n" + line : line
-    if (contRe.test(trailing)) continue // 行尾有续行符：继续合并下一行
-    const cmd = buf.trim()
-    if (cmd) cmds.push(cmd)
-    buf = ""
+    if (heredoc) {
+      const d = heredocDelim(line)
+      if (d) { pending = d; continue }
+    }
+    if (contRe.test(line.trimEnd())) continue // 行尾有续行符：继续合并下一行
+    flush()
   }
-  const rest = buf.trim()
-  if (rest) cmds.push(rest)
+  flush()
   return cmds
 }
 
 /**
  * POSIX（bash/zsh/sh）续行检测：未闭合的单/双引号或反引号（命令替换），或行尾未转义反斜杠。
  * 单引号内反斜杠为字面量；双引号/反引号内反斜杠转义下一个字符。
+ * heredoc 正文内容任意（可能含引号，如注释里的 `don't`），不参与引号配对，否则会误判为未闭合而拒绝命令。
  * @param s 命令文本
  * @returns true 表示 shell 会等待续行
  */
 function posixOpenContinuation(s: string): boolean {
+  // 先剔除 heredoc 正文行（保留起止行），避免正文里的引号干扰配对
+  const kept: string[] = []
+  let pending: string | null = null
+  for (const line of s.split("\n")) {
+    if (pending !== null) {
+      if (line.trim() === pending) { pending = null; kept.push(line) }
+      continue // 正文行：跳过
+    }
+    kept.push(line)
+    const d = heredocDelim(line)
+    if (d) pending = d
+  }
+  const text = kept.join("\n")
   let inSingle = false
   let inDouble = false
   let inBacktick = false
   let escaped = false
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i]
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
     if (escaped) { escaped = false; continue }
     if (c === "\\" && !inSingle) { escaped = true; continue }
     if (c === "'" && !inDouble && !inBacktick) { inSingle = !inSingle; continue }
@@ -154,8 +199,8 @@ class ZshAdapter implements ShellAdapter {
     return `printf '\\n${DONE_TAG}${seq}:%s>\\n' $?`
   }
   splitCommand(command: string): string[] {
-    // zsh 沿用 POSIX 反斜杠续行；注意 zsh 中反斜杠需转义处理（这里按普通反斜杠续行判断）
-    return splitByContinuation(command, /\\\s*$/)
+    // zsh 沿用 POSIX 反斜杠续行；heredoc 感知（`cmd <<EOF ... EOF` 不可拆）
+    return splitByContinuation(command, /\\\s*$/, true)
   }
   hasOpenContinuation(command: string): boolean {
     return posixOpenContinuation(command)
@@ -175,8 +220,8 @@ class BashAdapter implements ShellAdapter {
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
   }
   splitCommand(command: string): string[] {
-    // bash/sh：反斜杠续行
-    return splitByContinuation(command, /\\\s*$/)
+    // bash/sh：反斜杠续行；heredoc 感知（`cmd <<EOF ... EOF` 不可拆）
+    return splitByContinuation(command, /\\\s*$/, true)
   }
   hasOpenContinuation(command: string): boolean {
     return posixOpenContinuation(command)
