@@ -117,7 +117,9 @@ class PwshAdapter implements ShellAdapter {
   readonly name = "pwsh"
   readonly probeCommand = `Write-Output ${SHELL_ID_PREFIX}pwsh_$PSHOME`
   markerCmd(seq: number): string {
-    return `Write-Host "${DONE_TAG}${seq}:$LASTEXITCODE>"`
+    // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
+    // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
+    return `Write-Output "${DONE_TAG}${seq}:$LASTEXITCODE>"`
   }
   splitCommand(command: string): string[] {
     // PowerShell：行尾 `|`（管道续行）、反引号（显式换行转义）、未闭合 { / ( 时续行
