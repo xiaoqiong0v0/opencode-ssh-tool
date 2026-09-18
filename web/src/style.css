@@ -27,10 +27,9 @@ body:not(.show-time) .row .t { display: none; }
 ::-webkit-scrollbar-corner { background: #161b22; }
 * { scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
 .to-bottom-btn {
-  position: fixed; right: 24px; bottom: 24px; display: none;
-  background: #238636; color: #fff; border: none; border-radius: 20px;
-  padding: 8px 16px; font-size: 13px; cursor: pointer; z-index: 10;
-  box-shadow: 0 4px 12px rgba(0,0,0,.4);
+  display: none; margin-left: auto;
+  background: #238636; color: #fff; border: none; border-radius: 6px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
 }
 .to-bottom-btn:hover { background: #2ea043; }
 .sep hr { border: none; border-top: 1px dashed #30363d; margin: 8px 0; }

@@ -47,6 +47,11 @@ export class SshSession extends BaseSession {
     this._stream!.write(data)
   }
 
+  protected _resize(cols: number, rows: number): void {
+    // ssh2 setWindow(rows, cols, height, width)
+    try { this._stream?.setWindow(rows, cols, 0, 0) } catch { /* 通道已关闭忽略 */ }
+  }
+
   protected _closeTransport(): void {
     if (this._stream) { try { this._stream.end() } catch { /* ignore */ } }
     if (this._client) { try { this._client.end() } catch { /* ignore */ } }

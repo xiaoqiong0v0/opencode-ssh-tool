@@ -22,6 +22,14 @@ export interface ShellAdapter {
    * @returns 拆分后的独立命令列表
    */
   splitCommand(command: string): string[]
+  /**
+   * 命令是否会让 shell 进入续行等待（未闭合引号/反引号、行尾续行符等）。
+   * 命中时追加的完成标记不会执行（被当续行内容）→ 检测不到完成、busy 卡死，故提交前拦截。
+   * 各 shell 语义不同：POSIX 反引号为命令替换定界符；pwsh 反引号为转义/续行符；cmd 用 `^`。
+   * @param command 命令文本
+   * @returns true 表示 shell 会等待续行
+   */
+  hasOpenContinuation(command: string): boolean
 }
 
 // ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:seq:退出码>） =====
@@ -79,6 +87,65 @@ function splitByContinuation(command: string, contRe: RegExp): string[] {
   return cmds
 }
 
+/**
+ * POSIX（bash/zsh/sh）续行检测：未闭合的单/双引号或反引号（命令替换），或行尾未转义反斜杠。
+ * 单引号内反斜杠为字面量；双引号/反引号内反斜杠转义下一个字符。
+ * @param s 命令文本
+ * @returns true 表示 shell 会等待续行
+ */
+function posixOpenContinuation(s: string): boolean {
+  let inSingle = false
+  let inDouble = false
+  let inBacktick = false
+  let escaped = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (escaped) { escaped = false; continue }
+    if (c === "\\" && !inSingle) { escaped = true; continue }
+    if (c === "'" && !inDouble && !inBacktick) { inSingle = !inSingle; continue }
+    if (c === '"' && !inSingle) { inDouble = !inDouble; continue }
+    if (c === "`" && !inSingle) { inBacktick = !inBacktick; continue }
+  }
+  // escaped 残留 = 行尾反斜杠（续行）
+  return inSingle || inDouble || inBacktick || escaped
+}
+
+/**
+ * PowerShell 续行检测：未闭合单/双引号，或行尾反引号（转义符 = 续行）。
+ * 反引号转义下一个字符；单引号内不转义、双引号内 `""` 表示一个引号（本检测按配对开关处理即可）。
+ * @param s 命令文本
+ * @returns true 表示 shell 会等待续行
+ */
+function pwshOpenContinuation(s: string): boolean {
+  let inSingle = false
+  let inDouble = false
+  let escaped = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (escaped) { escaped = false; continue }
+    if (c === "`") { escaped = true; continue }
+    if (c === "'" && !inDouble) { inSingle = !inSingle; continue }
+    if (c === '"' && !inSingle) { inDouble = !inDouble; continue }
+  }
+  // escaped 残留 = 行尾反引号（续行）
+  return inSingle || inDouble || escaped
+}
+
+/**
+ * cmd.exe 续行检测：未闭合双引号，或行尾脱字符 `^`（转义/续行）。
+ * @param s 命令文本
+ * @returns true 表示 shell 会等待续行
+ */
+function cmdOpenContinuation(s: string): boolean {
+  let inDouble = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c === "^") { i++; continue } // ^ 转义下一个字符
+    if (c === '"') { inDouble = !inDouble; continue }
+  }
+  return inDouble || /\^\s*$/.test(s)
+}
+
 class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
@@ -88,6 +155,9 @@ class ZshAdapter implements ShellAdapter {
   splitCommand(command: string): string[] {
     // zsh 沿用 POSIX 反斜杠续行；注意 zsh 中反斜杠需转义处理（这里按普通反斜杠续行判断）
     return splitByContinuation(command, /\\\s*$/)
+  }
+  hasOpenContinuation(command: string): boolean {
+    return posixOpenContinuation(command)
   }
   parseProbe(output: string): boolean {
     // login shell 的 $0 带 - 前缀（-zsh），须容忍
@@ -105,6 +175,9 @@ class BashAdapter implements ShellAdapter {
   splitCommand(command: string): string[] {
     // bash/sh：反斜杠续行
     return splitByContinuation(command, /\\\s*$/)
+  }
+  hasOpenContinuation(command: string): boolean {
+    return posixOpenContinuation(command)
   }
   parseProbe(output: string): boolean {
     // login shell 的 $0 带 - 前缀（-bash），须容忍
@@ -125,6 +198,9 @@ class PwshAdapter implements ShellAdapter {
     // PowerShell：行尾 `|`（管道续行）、反引号（显式换行转义）、未闭合 { / ( 时续行
     return splitByContinuation(command, /[|`]\s*$|[{(\s]*[{(]\s*$/)
   }
+  hasOpenContinuation(command: string): boolean {
+    return pwshOpenContinuation(command)
+  }
   parseProbe(output: string): boolean {
     // Write-Output __SHELL_ID__pwsh_$PSHOME → pwsh 展开为路径；cmd 下 $PSHOME 不被展开（字面保留 $），借此区分
     return /__SHELL_ID__pwsh_[^$]/.test(output)
@@ -141,6 +217,9 @@ class CmdAdapter implements ShellAdapter {
   splitCommand(command: string): string[] {
     // cmd：行尾 `^`（转义换行符）表示续行
     return splitByContinuation(command, /\^\s*$/)
+  }
+  hasOpenContinuation(command: string): boolean {
+    return cmdOpenContinuation(command)
   }
   parseProbe(output: string): boolean {
     // echo __SHELL_ID__%COMSPEC% → cmd 展开为 __SHELL_ID__C:\...cmd.exe（无 % 原样遗留即判为 cmd）

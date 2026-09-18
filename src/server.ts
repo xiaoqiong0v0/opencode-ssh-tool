@@ -497,6 +497,17 @@ export function startServer(
         return
       }
 
+      if (t === "resize") {
+        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
+        const name = typeof msg.name === "string" ? msg.name : ""
+        const cols = typeof msg.cols === "number" ? msg.cols : 0
+        const rows = typeof msg.rows === "number" ? msg.rows : 0
+        if (!sid || cols <= 0 || rows <= 0) return
+        const agent = agentBySession.get(sessionKey(sid, name))
+        if (agent) send(agent, { type: "run-resize", sessionID: sid, name, cols, rows })
+        return
+      }
+
       if (t === "deleteTerminal") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""

@@ -408,6 +408,8 @@ function subscribe(): void {
   subName = name
   runScreen = null
   ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, mode: debugMode ? "raw" : "transcript" }))
+  // 切换终端后把当前 xterm 尺寸同步给新会话的 PTY（raw 模式下）
+  scheduleResize()
 }
 
 // ===== Snapshot 处理 =====
@@ -456,7 +458,7 @@ function updateScrollState(pre: HTMLPreElement, toBottomBtn: HTMLButtonElement):
     pre.scrollTop = pre.scrollHeight
     toBottomBtn.style.display = "none"
   } else {
-    toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "block" : "none"
+    toBottomBtn.style.display = pre.scrollHeight > pre.clientHeight ? "inline-block" : "none"
   }
 }
 
@@ -560,6 +562,21 @@ function handleMeta(msg: { sessionID: string; name: string; commands: number }):
 let xtermInst: Terminal | null = null
 let xtResizeObserver: ResizeObserver | null = null
 let stickToBottomRaw = true
+let resizeTimer: number | null = null
+
+/** 通知 server/agent 把 PTY 尺寸调整为 xterm 实际行列（去抖，避免 ResizeObserver 抖动频繁发送） */
+function scheduleResize(): void {
+  if (resizeTimer !== null) window.clearTimeout(resizeTimer)
+  resizeTimer = window.setTimeout(() => {
+    resizeTimer = null
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const sid = (document.getElementById("session") as HTMLSelectElement | null)?.value ?? ""
+    const name = (document.getElementById("terminal") as HTMLSelectElement | null)?.value ?? ""
+    const rows = xtermInst?.rows ?? 0
+    if (!sid || !name || rows <= 0) return
+    ws.send(JSON.stringify({ type: "resize", sessionID: sid, name, cols: PTY_COLS, rows }))
+  }, 150)
+}
 
 /** 懒创建/挂载 xterm 实例到容器（容器缺失时动态补建，兼容旧模板缓存） */
 function ensureXterm(): Terminal {
@@ -607,6 +624,7 @@ function ensureXterm(): Terminal {
   const fitRows = (): void => {
     const dim = fitAddon.proposeDimensions()
     if (dim && dim.rows !== t.rows) t.resize(PTY_COLS, dim.rows)
+    scheduleResize()
   }
   // open 后等渲染就绪再精确测量（行高未就绪时 proposeDimensions 会返回 NaN）
   setTimeout(fitRows, 50)

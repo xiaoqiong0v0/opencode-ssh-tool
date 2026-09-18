@@ -42,6 +42,10 @@ export class LocalSession extends BaseSession {
     this._term!.write(data)
   }
 
+  protected _resize(cols: number, rows: number): void {
+    try { this._term?.resize(cols, rows) } catch { /* 终端已关闭忽略 */ }
+  }
+
   protected _closeTransport(): void {
     try { this._term?.close() } catch { /* ignore */ }
     try { this._proc?.kill() } catch { /* ignore */ }

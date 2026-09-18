@@ -15,10 +15,10 @@
   <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> {{web_time}}</label>
   <label class="tgl" id="rawToggle"><input type="checkbox" id="debugMode" onchange="onDebugModeChange()"> {{web_raw}}</label>
   <span id="meta"></span>
+  <button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
 </header>
 <pre id="term">{{web_loading}}</pre>
 <div id="xt"></div>
-<button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
 <div id="cmdbar">
   <span id="cmdKey" title="{{web_send_ctrlc}}"></span>
   <textarea id="cmdInput" rows="1" placeholder="{{web_cmd_placeholder}}"></textarea>

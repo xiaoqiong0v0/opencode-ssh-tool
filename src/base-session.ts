@@ -150,6 +150,7 @@ export abstract class BaseSession {
   async submit(command: string): Promise<ExecResult> {
     if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
     if (this._remoteBusy) return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` }
+    if (this._adapter?.hasOpenContinuation(command)) return { ok: false, output: "", error: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted" }
 
     this._beginCapture(command)
     this._write(this._composeCommand(command))
@@ -167,6 +168,7 @@ export abstract class BaseSession {
     const startTs = Date.now()
     if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
     if (this._remoteBusy) { log.info(`exec quick-fail busy: ${command} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` } }
+    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation: ${command}`); return { ok: false, output: "", error: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted" } }
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
@@ -276,6 +278,18 @@ export abstract class BaseSession {
   getRunningCommand(): string {
     return this._runningStartPos !== null && this._connected ? this._runningCommand : ""
   }
+
+  /**
+   * 调整 PTY/终端尺寸以匹配前端 xterm 实际行列（避免 shell 绝对定位按固定行数错位）
+   * @param cols 列数
+   * @param rows 行数
+   */
+  resize(cols: number, rows: number): void {
+    this._resize(cols, rows)
+  }
+
+  /** 传输层 resize（子类覆盖：SSH setWindow / 本地 term.resize）；默认无操作 */
+  protected _resize(_cols: number, _rows: number): void { /* 默认无操作 */ }
 
   /**
    * 按当前 shell 的行续行规则拆分多行命令为独立命令（供 agent 端多行命令拆条执行）
