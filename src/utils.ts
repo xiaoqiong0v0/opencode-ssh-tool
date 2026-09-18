@@ -1,7 +1,7 @@
 // 工具函数：命令回显定位、模型文本清理、ANSI 清洗、CR 覆盖合并、完成标记剥离
 
 import { stripMarkers } from "./shell-adapter.js"
-import { findLastEndOf } from "./last-match.js"
+import { findLastEndOfBefore } from "./last-match.js"
 
 /** 正则转义文本 */
 const escRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
@@ -19,20 +19,30 @@ const ECHO_WIDE = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\
  * @param command 本次执行的命令文本
  * @returns 命令回显结束后的字节偏移；未命中命令文本返回 0（此时应视作输出尚未开始）
  */
-export function extractOutputStart(raw: string, command: string): number {
+export function extractOutputStart(raw: string, command: string, endBound = raw.length): number {
   const cmd = command.trim()
   if (!cmd) return 0
-  // 单条宽松正则一次性匹配命令回显：
+  // 单条宽松正则一次性匹配命令回显（支持多行命令）：
   // 1) 命令字符间容忍 ANSI 间隙（ECHO_WIDE）
   // 2) 命令字面 \033 回显可能变真实 ESC（二选一）
-  // 3) 命令文本后允许任意行内字符直到行尾（[^\r\n]*），兼容追加的完成标记命令
+  // 3) 每段命令文本后允许任意行内字符直到行尾（[^\r\n]*），兼容追加的完成标记命令
+  // 4) 多行命令：bash 逐行回显，行间可能夹 prompt 文本与 ANSI，用宽松段间匹配连接
   const norm = cmd.replace(/\\033/gi, "\x1b")
-  const frags = [...norm].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
   const TAIL_ANSI = "(?:\\x1b\\[[0-9;?]*[a-zA-Z]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[^\\x1b])*"
-  const re = new RegExp(frags.join(ECHO_WIDE) + TAIL_ANSI + "[^\\r\\n]*" + "(?=\\r?\\n|$)", "g")
-  // 取最后一次匹配：备屏退出（如 cmatrix）会重放主屏历史，其中含旧命令回显，
-  // 只有最后一次出现的回显之后才是本次命令的真实输出
-  return findLastEndOf(re, raw)
+  // 行尾：容忍 \r 后跟 ANSI（如 bracketed paste off \x1b[?2004l）再换行，或直接 \n/字符串末尾
+  const LINE_END = "(?:(?:\\r?" + TAIL_ANSI + ")\\r?\\n|\\r?$)"
+  const lineOf = (line: string): string => {
+    const frags = [...line].map((c) => (c === "\x1b" ? "(?:\\x1b|\\\\033)" : escRe(c)))
+    return frags.join(ECHO_WIDE) + TAIL_ANSI + "[^\\r\\n]*"
+  }
+  const lines = norm.split("\n")
+  // 段间匹配：容忍任意行（prompt、输出行等）直到下一段命令，再用 ECHO_WIDE 收紧命令字符间隙
+  const BETWEEN = "[\\s\\S]*?"
+  const re = new RegExp(lines.map(lineOf).join(BETWEEN + ECHO_WIDE) + "(?:" + LINE_END + ")", "g")
+  // 取 [0, endBound) 范围内最后一次匹配：备屏退出（如 cmatrix）会重放主屏历史，
+  // 其中含旧命令回显，只有最后一次出现的回显之后才是本次命令的真实输出；
+  // endBound 限到完成标记之前，避免连续输入时后续裸命令回显把定位带偏
+  return findLastEndOfBefore(re, raw, 0, endBound)
 }
 
 /**

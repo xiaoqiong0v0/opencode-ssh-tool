@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>{{web_title}}</title>
 <link rel="stylesheet" href="/web/app.css">
+<link rel="stylesheet" href="/web/xterm.css">
 </head>
 <body>
 <header>
@@ -12,13 +13,14 @@
   <select id="terminal" onchange="onSessionChange(true)"></select>
   <button id="delTerm" class="del-btn" onclick="deleteTerminal()" title="{{web_delete_terminal}}">×</button>
   <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> {{web_time}}</label>
-  <label class="tgl"><input type="checkbox" id="debugMode" onchange="onDebugModeChange()"> Raw</label>
+  <label class="tgl" id="rawToggle"><input type="checkbox" id="debugMode" onchange="onDebugModeChange()"> {{web_raw}}</label>
   <span id="meta"></span>
 </header>
 <pre id="term">{{web_loading}}</pre>
+<div id="xt"></div>
 <button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
 <div id="cmdbar">
-  <span id="cmdKey" title="{{web_send_ctrlc}}">Ctrl-C</span>
+  <span id="cmdKey" title="{{web_send_ctrlc}}"></span>
   <textarea id="cmdInput" rows="1" placeholder="{{web_cmd_placeholder}}"></textarea>
 </div>
 <script>window.__I18N__ = __I18N_JSON__;</script>

@@ -3,7 +3,7 @@
 // snapshot 仅订阅/模式切换时作为基线发送，日常由 diff 增量累积渲染。
 
 import { createServer, type Server, type IncomingMessage } from "node:http"
-import { readFileSync, readdirSync, existsSync } from "node:fs"
+import { readFileSync, readdirSync, existsSync, rmSync, statSync } from "node:fs"
 import { join, dirname, extname, normalize } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { AddressInfo } from "node:net"
@@ -72,6 +72,7 @@ const PAGE_KEYS: FlatKey[] = [
   "web_delete_terminal",
   "web_cmd_placeholder",
   "web_send_ctrlc",
+  "web_raw",
 ]
 
 const JS_I18N_KEYS: Record<string, FlatKey> = {
@@ -154,6 +155,28 @@ export function startServer(
 
   const buildSessions = (): Record<string, unknown> => {
     const states = listAllSessions(dir)
+    // 补：state 文件可能被清理（重启/断线），但 history 目录仍在——扫描发现离线历史终端
+    const histTerms: { sessionID: string; name: string; kind: string }[] = []
+    for (const sidDir of readdirSync(dir)) {
+      const sidPath = join(dir, sidDir)
+      let st: ReturnType<typeof statSync> | null = null
+      try { st = statSync(sidPath) } catch { /* 不存在 */ }
+      if (!st?.isDirectory()) continue // 跳过 server.json 等根级文件
+      let subs: string[]
+      try { subs = readdirSync(sidPath) } catch { continue }
+      if (!subs.length) continue
+      for (const sub of subs) {
+        try {
+          const subPath = join(sidPath, sub)
+          const subSt = statSync(subPath)
+          if (subSt.isDirectory() && readdirSync(subPath).some((f) => f.endsWith(".json"))) {
+            if (sub.startsWith("local-")) histTerms.push({ sessionID: sidDir, name: sub.slice(6), kind: "local" })
+            else histTerms.push({ sessionID: sidDir, name: sub, kind: "ssh" })
+          }
+        } catch { /* 跳过 */ }
+      }
+    }
+    const seen = new Set<string>()
     const liveKey = new Set(agentBySession.keys())
     const liveBusy = new Map<string, boolean>()
     const now = Date.now()
@@ -176,20 +199,46 @@ export function startServer(
       const lk = sessionKey(s.sessionID, s.name)
       const busy = liveBusy.get(lk)
       if (busy !== undefined) s.busy = busy
+      seen.add(sessionKey(s.sessionID, s.name))
     }
     const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
     for (const s of states) {
       if (!bySession.has(s.sessionID)) bySession.set(s.sessionID, { title: s.title, directory: s.directory, terminals: [] })
       bySession.get(s.sessionID)!.terminals.push({ name: s.name, kind: s.kind, host: s.host, user: s.user, port: s.port, program: s.program, connected: s.connected, busy: s.busy, pending: s.pending })
     }
+    // 补：history 目录里存在但 state 缺失的历史终端（离线展示）
+    for (const h of histTerms) {
+      const k = sessionKey(h.sessionID, h.name)
+      if (seen.has(k)) continue
+      seen.add(k)
+      if (!bySession.has(h.sessionID)) bySession.set(h.sessionID, { terminals: [] })
+      bySession.get(h.sessionID)!.terminals.push({ name: h.name, kind: h.kind, connected: false, busy: false, pending: 0 })
+    }
     const sessions = [...bySession.entries()].map(([sessionID, v]) => ({ sessionID, title: v.title, directory: v.directory, terminals: v.terminals }))
     return { port: actualPort, sessions }
   }
 
   /** 组装全量历史基线（snapshot）：文件历史 + 运行中命令转成 cmd+run 对 */
+  const resolveHistName = (sid: string, name: string): string => {
+    // 不依赖 state 文件（断线/重启后 state 可能已清理）：直接探测 local 前缀目录
+    const base = join(dir, sid)
+    // local 终端历史存 `local-${name}`，ssh 存 `${name}`；两者目录名称不能并存取其一
+    const localDir = join(base, `local-${name}`)
+    const plainDir = join(base, name)
+    let hasLocal = false
+    let hasPlain = false
+    try { hasLocal = readdirSync(localDir).some((f) => f.endsWith(".json")) } catch { /* 目录不存在 */ }
+    try { hasPlain = readdirSync(plainDir).some((f) => f.endsWith(".json")) } catch { /* 目录不存在 */ }
+    if (hasLocal && !hasPlain) return `local-${name}`
+    if (hasPlain && !hasLocal) return name
+    // 两者都不存在 → 沿用 state 判定（在线 local 会话刚建历史未落盘时）
+    const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
+    return state?.kind === "local" ? `local-${name}` : name
+  }
+
   const buildSnapshot = (sid: string, name: string): { pairs: TranscriptPair[]; notFound?: boolean } => {
     const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
-    const histName = state?.kind === "local" ? `local-${name}` : name
+    const histName = resolveHistName(sid, name)
     const pairs = readHistoryFromFile(dir, sid, histName) ?? []
     const sKey = sessionKey(sid, name)
     const buf = streamBuf.get(sKey)
@@ -286,8 +335,18 @@ export function startServer(
         const data = typeof msg.data === "string" ? msg.data : ""
         if (!sid || !data) return
         const k = sessionKey(sid, name)
+        const isFinal = msg.final === true
         const existing = streamBuf.get(k)
-        if (existing) {
+        if (isFinal) {
+          // 命令完成时 agent 补推的"处理后完整输出"：替换（而非追加）避免与已推增量重复，
+          // 并强制推给所有 transcript 订阅者（重置游标 = 丢弃动画帧累积，用干净结果重建块）
+          streamBuf.set(k, { data, done: false, ts: Date.now(), command: existing?.command ?? "" })
+          for (const c of subscribersOf(sid, name)) {
+            if (c._mode === "raw") continue
+            c._txPos = data.length
+            send(c, { type: "diff", sessionID: sid, name, event: "out", data, final: true })
+          }
+        } else if (existing) {
           existing.data = (existing.data || "") + data
           existing.ts = Date.now()
         } else {
@@ -365,6 +424,11 @@ export function startServer(
           send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
           const r = rawBuf.get(sKey)
           if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+          else {
+            // 离线历史会话无实时 rawBuf：用 history 重建原始流供 raw 视图（rawActive 后画面即它）
+            const hist = buildRawFromHistory(snap.pairs)
+            if (hist) send(ws, { type: "raw", data: hist, pos: hist.length, reset: true })
+          }
           ws._mode = "raw"
         } else {
           // transcript：发完整基线，游标对齐缓冲末尾（基线已含全部缓冲内容，后续 out 只推增量）
@@ -387,6 +451,11 @@ export function startServer(
           send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
           const r = rawBuf.get(sKey)
           if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+          else {
+            // 离线历史会话无实时 rawBuf：用 history 重建原始流供 raw 视图
+            const hist = buildRawFromHistory(snap.pairs)
+            if (hist) send(ws, { type: "raw", data: hist, pos: hist.length, reset: true })
+          }
         } else {
           // raw→transcript：补发完整快照基线，游标对齐（raw 期间未收 diff）
           ws._mode = "transcript"
@@ -407,7 +476,12 @@ export function startServer(
         if (!sid || !command) return
         const agent = agentBySession.get(sessionKey(sid, name))
         if (!agent) return
-        streamBuf.set(sessionKey(sid, name), { data: "", done: false, ts: Date.now(), command })
+        // 保留运行中流的累积输出：REPL 交互场景下 web 每次回车仍发 exec（非独立命令，无 cmdStart 重置游标），
+        // 无条件清空 streamBuf 会让订阅者 _txPos 超出新流长度，后续增量 slice 为空 → transcript 输出丢失。
+        // 与 cmdStart 语义一致：仅上一条已完成时清空，进行中（REPL 交互等待）保留累积。
+        const k = sessionKey(sid, name)
+        const existing = streamBuf.get(k)
+        streamBuf.set(k, { data: existing && existing.done ? "" : existing?.data ?? "", done: false, ts: Date.now(), command })
         pushSessions()
         send(agent, { type: "run-exec", reqId: `${sid}:${name}:${Date.now()}`, sessionID: sid, name, command })
         return
@@ -430,6 +504,12 @@ export function startServer(
         const agent = agentBySession.get(sessionKey(sid, name))
         if (agent) send(agent, { type: "run-delete", sessionID: sid, name })
         removeSessionState(dir, sid, name)
+        // 删除该终端的 history 目录：buildSessions 会按 history 目录兜底列出离线历史终端，
+        // 只删 state 文件不清目录会导致"删除后页面仍在"（残留被兜底扫描重新发现）
+        try {
+          const histName = resolveHistName(sid, name)
+          rmSync(join(dir, sid, histName), { recursive: true, force: true })
+        } catch { /* 目录不存在忽略 */ }
         streamBuf.delete(sessionKey(sid, name))
         rawBuf.delete(sessionKey(sid, name))
         log.info(`Web 页删除终端 ${sid}/${name}`)
@@ -544,4 +624,26 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
     }
   }
   return out
+}
+
+/**
+ * 从历史消息对重建原始字节流（raw 视图）：拼接所有命令对为 `命令\n输出` 流。
+ * 离线历史会话无实时 rawBuf 时供 raw 模式显示。
+ * @param pairs 历史命令/输出对（snapshot 基线）
+ * @returns 重建的原始流
+ */
+function buildRawFromHistory(pairs: TranscriptPair[]): string {
+  let raw = ""
+  for (const p of pairs) {
+    if (p.type === "cmd") {
+      raw += p.text + "\r\n"
+    } else if (p.type === "out" || p.type === "run") {
+      raw += p.text
+      // 输出末段若未换行则补一个换行，分隔下一条命令
+      if (!p.text.endsWith("\n") && !p.text.endsWith("\r")) raw += "\r\n"
+    } else if (p.type === "sep") {
+      raw += "\r\n"
+    }
+  }
+  return raw
 }

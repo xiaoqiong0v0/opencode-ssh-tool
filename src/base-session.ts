@@ -6,11 +6,12 @@ import {
   ANIMATION_WINDOW_MS,
   MAX_OUTPUT_LEN,
   RAW_LOG_MAX,
+  DONE_TAG,
 } from "./constants.js"
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, resolveByProbe, detectInterrupt, type ShellAdapter } from "./shell-adapter.js"
+import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, type ShellAdapter } from "./shell-adapter.js"
 
 /** 命令执行结果 */
 export interface ExecResult {
@@ -28,7 +29,7 @@ export interface ExecResult {
 /** 生命周期事件（命令开始/完成），供 agent 转报 server（web 与插件自身 exec 统一来源） */
 export type LifecycleEvent =
   | { type: "start"; command: string; ts: number }
-  | { type: "done"; exitCode: number | null; endTs: number }
+  | { type: "done"; exitCode: number | null; endTs: number; output?: string }
 
 /** 交互触发词（sudo 密码 / 分页器 / 确认提示），含中英文 */
 const INTERACTIVE_RE =
@@ -165,7 +166,7 @@ export abstract class BaseSession {
   async exec(command: string): Promise<ExecResult> {
     const startTs = Date.now()
     if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
-    if (this._remoteBusy) return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` }
+    if (this._remoteBusy) { log.info(`exec quick-fail busy: ${command} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` } }
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
@@ -182,7 +183,7 @@ export abstract class BaseSession {
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
         const out = this._extractOutput(raw, command)
         this._history.append(command, out, this._runningStartTs, Date.now())
-        this._emitDone(outcome.exitCode ?? null, Date.now())
+        this._emitDone(outcome.exitCode ?? null, Date.now(), out)
         this._clearRunningContext()
         return { ok: true, output: this._truncate(toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -226,10 +227,7 @@ export abstract class BaseSession {
     if (!this._connected) return { ok: false, output: "", error: "Not connected" }
     let out: string
     if (this._runningStartPos !== null && this._runningCommand) {
-      const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
-      const marker = end > 0
-        ? detectLastDoneMarker(this._buffer, this._runningStartPos + end, this._runningSeq)
-        : { done: false, exitCode: 0, pos: 0 }
+      const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
       if (marker.done) {
         const raw = this._buffer.slice(this._runningStartPos, marker.pos)
         this._buffer = this._buffer.slice(marker.pos)
@@ -262,6 +260,7 @@ export abstract class BaseSession {
       .replace(/\\x1a/gi, "\x1a")
       .replace(/\\r/g, "\r")
       .replace(/\\n/g, "\r")
+    log.info(`send -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
     this._write(payload)
     this._lastActive = Date.now()
     return { ok: true }
@@ -279,6 +278,15 @@ export abstract class BaseSession {
   }
 
   /**
+   * 按当前 shell 的行续行规则拆分多行命令为独立命令（供 agent 端多行命令拆条执行）
+   * @param command 可能含换行的命令文本
+   * @returns 拆分后的独立命令列表；未识别 shell 时按普通换行拆分
+   */
+  splitCommand(command: string): string[] {
+    return this._adapter ? this._adapter.splitCommand(command) : command.split("\n").map((l) => l.trim()).filter(Boolean)
+  }
+
+  /**
    * 设置命令生命周期监听器（命令开始/完成时回调）
    * @param listener 回调（start 携带命令，done 携带退出码与结束时刻；null 表示清除）
    */
@@ -292,8 +300,8 @@ export abstract class BaseSession {
   }
 
   /** 触发命令完成事件 */
-  private _emitDone(exitCode: number | null, endTs: number): void {
-    try { this._lifecycle?.({ type: "done", exitCode, endTs }) } catch { /* 同上 */ }
+  private _emitDone(exitCode: number | null, endTs: number, output?: string): void {
+    try { this._lifecycle?.({ type: "done", exitCode, endTs, output }) } catch { /* 同上 */ }
   }
 
   hasRunningStream(): boolean {
@@ -310,10 +318,12 @@ export abstract class BaseSession {
       this._streamPos = null
       return { data: "", done: false }
     }
-    const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._runningCommand)
+    // 完成标记先定位（marker 唯一 seq，从命令起点搜索，免疫 echoEnd 被后序回显带偏）
+    const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
+    const markerEnd = marker.done ? marker.pos : this._buffer.length
+    const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._composeEchoText(this._runningCommand), markerEnd - this._runningStartPos)
     if (end <= 0) return { data: "", done: false }
     const echoEnd = this._runningStartPos + end
-    const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
     const windowEnd = marker.done ? marker.pos : this._buffer.length
     if (this._streamPos === null) {
       this._streamPos = echoEnd
@@ -321,7 +331,7 @@ export abstract class BaseSession {
     const raw = this._buffer.slice(this._streamPos, windowEnd)
     this._streamPos = windowEnd
     let data = stripMarkers(raw)
-    if (this._adapter) data = data.replace(this._adapter.markerCmd(this._runningSeq), "")
+    if (this._adapter) data = data.replace(this._markerCmd(this._runningSeq), "")
     return { data, done: marker.done }
   }
 
@@ -347,6 +357,15 @@ export abstract class BaseSession {
   protected abstract _ready(): boolean
 
   /**
+   * 本会话当前命令的完成标记命令（adapter 负责各自的标记语法，无 adapter 时用 POSIX 默认）
+   * @param seq 命令序号
+   * @returns 标记命令文本
+   */
+  private _markerCmd(seq: number): string {
+    return this._adapter ? this._adapter.markerCmd(seq) : `printf '\\n${DONE_TAG}${seq}:%s>' $?`
+  }
+
+  /**
    * 组合写入命令：命令后以 `;` 拼接到同一行的完成标记命令（免疫 prompt 框架覆盖）。
    * bash/zsh/sh：printf '\n<SSH_DONE:seq:%s>' $?；pwsh：Write-Host
    * 所有命令统一追加 marker：`;` 同一行拼接是 shell 命令行层解析，`python; printf ...`
@@ -356,30 +375,42 @@ export abstract class BaseSession {
    * @returns 实际写入 PTY 的文本
    */
   private _composeCommand(command: string): string {
-    const marker = this._adapter ? this._adapter.markerCmd(this._runningSeq) : `printf '\\n<SSH_DONE:${this._runningSeq}:%s>' $?`
+    const marker = this._markerCmd(this._runningSeq)
     const body = stripCommandTail(command)
     return `${body} ;${marker}\r`
+  }
+
+  /** 组合命令的回显文本（无尾部 \r）：供 extractOutputStart 定位回显行结束，防止裸命令名出现在错误行被 last-match 误命中 */
+  private _composeEchoText(command: string): string {
+    const marker = this._markerCmd(this._runningSeq)
+    const body = stripCommandTail(command)
+    return `${body} ;${marker}`
   }
 
   /**
    * 提取命令纯输出：从命令回显后切到完成标记（无标记则切到中断回显 ^C 处），
    * 顺带去掉追加的标记命令回显行。
+   * 回显定位使用组合命令文本（command + 标记段）而非裸命令：裸命令可能出现在程序错误输出中
+   * （如 `pw` 的错误行 `bash: pw: command not found`），而组合命令整行回显是唯一的，
+   * 可避免 last-match 误命中错误行导致输出被裁空。
    * @param raw 本次执行窗口原始字节流
    * @param command 原始命令（历史用）
    * @returns 纯程序输出原始流
    */
   private _extractOutput(raw: string, command: string): string {
-    const end = extractOutputStart(raw, command)
+    // 完成标记先定位：marker 自带唯一 seq，从窗口起点搜索即可（echoEnd 可能被连续输入的后序回显带偏）
+    const marker = detectLastDoneMarker(raw, 0, this._runningSeq)
+    const echoText = this._composeEchoText(command)
+    const end = marker.done ? extractOutputStart(raw, echoText, marker.pos) : extractOutputStart(raw, echoText)
     if (end <= 0) return stripMarkers(raw)
     let out: string
-    const marker = detectLastDoneMarker(raw, end, this._runningSeq)
     if (marker.done) {
       out = raw.slice(end, marker.pos)
     } else {
       const intr = detectInterrupt(raw, end)
       out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
     }
-    if (this._adapter) out = out.replace(this._adapter.markerCmd(this._runningSeq), "")
+    if (this._adapter) out = out.replace(this._markerCmd(this._runningSeq), "")
     return stripMarkers(out.replace(/^[\r\n]+/, ""))
   }
 
@@ -424,18 +455,16 @@ export abstract class BaseSession {
     }
   }
 
-  /** 探测 shell 类型：deadline 内循环发送探测命令并解析输出（shell 慢启动时也能等到就绪） */
+  /** 探测 shell 类型：按各适配器 probeCommand 逐个探测（POSIX 系优先，pwsh/cmd 用各自独有命令），
+   *  login shell 的 $0 带 - 前缀（-bash/-zsh）由对应 parseProbe 容忍 */
   protected async _probeShell(deadline: number): Promise<ShellAdapter | null> {
     while (Date.now() < deadline) {
-      this._write("echo __SHELL_ID__$0\r")
-      const output = await this._waitProbeOutput(Math.min(PROBE_TIMEOUT_MS, deadline - Date.now()))
-      // __SHELL_ID__ 后须有 shell 名称（避免命令回显 echo __SHELL_ID__$0 提前误匹配）
-      if (output !== null && /__SHELL_ID__[a-zA-Z]/.test(output)) {
-        const adapter = resolveByProbe(output)
+      for (const candidate of adapters) {
+        this._write(candidate.probeCommand + "\r")
+        const output = await this._waitProbeOutput(Math.min(PROBE_TIMEOUT_MS, deadline - Date.now()))
         this._buffer = ""
-        return adapter
+        if (output !== null && candidate.parseProbe(output)) return candidate
       }
-      this._buffer = ""
     }
     return null
   }
@@ -478,14 +507,15 @@ export abstract class BaseSession {
         }
         // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，
         // 或 Ctrl-C 中断时 TTY 回显 ^C。均与环境/框架无关。
-        // 必须等命令回显出现后才检测：回显前的标记只可能是上一条的迟到残留。
+        // marker 自带唯一 seq，从命令起点直接搜索即可（连续输入时 echoEnd 可能被后序裸命令回显带偏到 marker 之后）
+        const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
+        if (marker.done) {
+          clearInterval(timer)
+          resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
+          return
+        }
+        // ^C 中断：只在命令回显定位成功后才检测（回显前出现的 ^C 只可能是残留）
         if (echoEnd > 0) {
-          const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
-          if (marker.done) {
-            clearInterval(timer)
-            resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
-            return
-          }
           const intr = detectInterrupt(this._buffer, echoEnd)
           if (intr.interrupted) {
             clearInterval(timer)
@@ -521,15 +551,16 @@ export abstract class BaseSession {
         const end = extractOutputStart(this._buffer.slice(startPos), command)
         if (end > 0) echoEnd = startPos + end
       }
-      if (echoEnd <= 0) return
-      const marker = detectLastDoneMarker(this._buffer, echoEnd, this._runningSeq)
-      const intr = detectInterrupt(this._buffer, echoEnd)
+      // marker 唯一 seq，从命令起点搜索（免疫 echoEnd 被后序裸命令回显带偏）
+      const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
+      const intr = echoEnd > 0 ? detectInterrupt(this._buffer, echoEnd) : { interrupted: false, pos: 0 }
       const end = marker.done ? marker.pos : intr.pos
       if (marker.done || intr.interrupted) {
         const raw = this._buffer.slice(startPos, end)
         const code = marker.done ? marker.exitCode : 130
-        this._history.append(command, this._extractOutput(raw, command), this._runningStartTs)
-        this._emitDone(code, Date.now())
+        const out = this._extractOutput(raw, command)
+        this._history.append(command, out, this._runningStartTs)
+        this._emitDone(code, Date.now(), out)
         this._cursor = Math.max(startPos, end)
         this._remoteBusy = false
         this._clearRunningContext()

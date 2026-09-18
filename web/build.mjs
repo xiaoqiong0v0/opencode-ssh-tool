@@ -22,6 +22,9 @@ await build({
 // CSS 直接复制（字体 url 为 /web/fonts/... 运行时路径，不经 esbuild 解析/改写）
 copyFileSync(join(src, "style.css"), join(out, "app.css"))
 
+// xterm.js 主题样式
+copyFileSync(join(root, "node_modules", "@xterm", "xterm", "css", "xterm.css"), join(out, "xterm.css"))
+
 copyFileSync(join(src, "index.html"), join(out, "index.html"))
 copyFileSync(
   join(root, "web", "assets", "fonts", "CaskaydiaCoveNerdFontMono-Regular.ttf"),

@@ -249,13 +249,13 @@ export const OpenCodeSshTool: Plugin = async () => {
 
   // 加载配置并启动 HTTP 终端记录服务（默认开启；端口 0=自动分配）
   const cfg = loadConfig()
-  // 语言：环境变量 SSH_TOOL_LANG 优先，否则配置文件 toolLang（默认 en）
-  const lang = getLang(cfg.toolLang)
+  // 语言：环境变量 SSH_TOOL_LANG 优先，否则配置文件 lang（默认 en，工具与 Web 界面统一）
+  const lang = getLang(cfg.lang)
   // 权限判定器：内置正则 + 配置自定义 deny/allow 正则
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
   if (cfg.server.enabled) {
     try {
-      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), getLang(cfg.webLang))
+      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), lang)
       if (sr.url) {
         httpUrl = sr.url
         log.info(`HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`)

@@ -61,3 +61,26 @@ export function findLastMatch(pattern: RegExp, text: string, fromPos = 0): RegEx
   }
   return last
 }
+
+/**
+ * 返回正则模式在 [fromPos, endPos) 范围内最后一次匹配的结束位置。
+ * 用于命令回显定位：连续输入时后续裸命令回显会出现在当前命令 marker 之后，
+ * 全局"最后匹配"会错位到 marker 之后；限制上界为 marker 位置可避免干扰。
+ * @param pattern 正则
+ * @param text 目标文本
+ * @param fromPos 搜索起点
+ * @param endPos 搜索上界（不含）
+ * @returns 匹配结束位置（不含）；未找到返回 -1
+ */
+export function findLastEndOfBefore(pattern: RegExp, text: string, fromPos: number, endPos: number): number {
+  const g = pattern.global ? pattern : new RegExp(pattern.source, pattern.flags + "g")
+  g.lastIndex = fromPos
+  let last = -1
+  let m: RegExpExecArray | null
+  while ((m = g.exec(text)) !== null) {
+    if (m.index >= endPos) break
+    last = m.index + m[0].length
+    if (m[0].length === 0) g.lastIndex++
+  }
+  return last
+}

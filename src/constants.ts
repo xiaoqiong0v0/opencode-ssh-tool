@@ -17,6 +17,12 @@ export const EXEC_TIMEOUT_MS = 30_000
 /** 静默窗口阈值：输出停止增长超过此时长视为命令完成 */
 export const QUIET_WINDOW_MS = 500
 
+/**
+ * 交互模式判定阈值（毫秒）：命令提交时终端仍 busy，距上次提交不足此时长视为连续快速命令（排队等待执行），
+ * 超过此时长仍 busy 视为用户正在给运行中的交互程序输入（sudo 密码/REPL 等），按交互输入原样 send。
+ */
+export const INTERACTIVE_BUSY_MS = 500
+
 /** 动画检测阈值：连续输出超过此时长仍无哨兵/静默 → 判定仍在运行 */
 export const ANIMATION_WINDOW_MS = 5_000
 
@@ -47,9 +53,6 @@ export const CACHE_DIR = ".opencode/plugins-cache/opencode-ssh-tool"
 /** 完成标记前缀（后续跟退出码 + ">"，如 <SSH_DONE:0>） */
 export const DONE_TAG = "<SSH_DONE:"
 
-/** 完成标记字符串：给定退出码 */
-export const doneTag = (ec: number | string): string => `<SSH_DONE:${ec}>`
-
 /** shell 类型探测前缀：probeCommand 回显 <前缀>$0 */
 export const SHELL_ID_PREFIX = "__SHELL_ID__"
 
@@ -61,4 +64,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  */
-export const SERVER_PROTO_VERSION = 4
+export const SERVER_PROTO_VERSION = 9

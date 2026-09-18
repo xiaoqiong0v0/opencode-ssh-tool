@@ -14,16 +14,24 @@ export interface ShellAdapter {
   parseProbe(output: string): boolean
   /** 每条命令后追加的完成标记命令（seq 为命令序号，独立一行执行） */
   markerCmd(seq: number): string
+  /**
+   * 将用户提交的多行命令按本 shell 的行续行规则拆分为独立命令：
+   * 行尾带续行符（bash/sh/zsh 的 `\`，pwsh 的 `|`/反引号/未闭合花括号）时与下一行合并，
+   * 其余行各自独立成命令；空行/纯空白行剔除。
+   * @param command 可能含换行的原始命令文本
+   * @returns 拆分后的独立命令列表
+   */
+  splitCommand(command: string): string[]
 }
 
 // ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:seq:退出码>） =====
 
-/** 匹配任意完成标记（含序号式 <SSH_DONE:seq:code> 与无序号 <SSH_DONE:code>，退出码在末尾） */
-const DONE_RE = /<SSH_DONE:(?:\d+:)?(-?\d+)>/g
+/** 匹配任意完成标记（含序号式 <SSH_DONE:seq:code> 与无序号 <SSH_DONE:code>，退出码在末尾）；前缀取自 DONE_TAG，< 与 : 在正则中均为字面量 */
+const DONE_RE = new RegExp(DONE_TAG + "(?:\\d+:)?(-?\\d+)>", "g")
 
 /** 检测指定序号命令的完成标记 */
 function doneSeqRe(seq: number): RegExp {
-  return new RegExp(`<SSH_DONE:${seq}:(-?\\d+)>`, "g")
+  return new RegExp(`${DONE_TAG}${seq}:(-?\\d+)>`, "g")
 }
 
 /** 终端中断回显：Ctrl-C 由 TTY 层回显为 ^C（ECHOCTL 开启），与 shell 框架无关 */
@@ -52,14 +60,38 @@ export function detectInterrupt(buffer: string, fromPos: number): { interrupted:
 }
 
 // ===== Shell 类型探测与标记命令 =====
+
+/** 按续行规则拆分多行命令为独立命令（行尾匹配续行正则时与下一行合并，避免把续行命令拆断） */
+function splitByContinuation(command: string, contRe: RegExp): string[] {
+  const rawLines = command.split("\n")
+  const cmds: string[] = []
+  let buf = ""
+  for (let line of rawLines) {
+    const trailing = line.trimEnd()
+    buf = buf ? buf + "\n" + line : line
+    if (contRe.test(trailing)) continue // 行尾有续行符：继续合并下一行
+    const cmd = buf.trim()
+    if (cmd) cmds.push(cmd)
+    buf = ""
+  }
+  const rest = buf.trim()
+  if (rest) cmds.push(rest)
+  return cmds
+}
+
 class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   markerCmd(seq: number): string {
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
   }
+  splitCommand(command: string): string[] {
+    // zsh 沿用 POSIX 反斜杠续行；注意 zsh 中反斜杠需转义处理（这里按普通反斜杠续行判断）
+    return splitByContinuation(command, /\\\s*$/)
+  }
   parseProbe(output: string): boolean {
-    return new RegExp(`${SHELL_ID_PREFIX}zsh|(?:^|\\W)zsh(?:\\W|$)`, "i").test(output)
+    // login shell 的 $0 带 - 前缀（-zsh），须容忍
+    return new RegExp(`${SHELL_ID_PREFIX}-?zsh|(?:^|\\W)zsh(?:\\W|$)`, "i").test(output)
   }
 }
 
@@ -70,28 +102,56 @@ class BashAdapter implements ShellAdapter {
   markerCmd(seq: number): string {
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
   }
+  splitCommand(command: string): string[] {
+    // bash/sh：反斜杠续行
+    return splitByContinuation(command, /\\\s*$/)
+  }
   parseProbe(output: string): boolean {
-    return new RegExp(`${SHELL_ID_PREFIX}(bash|sh)\\b|(?:^|\\W)(bash|sh)(?:\\W|$)`, "i").test(output)
+    // login shell 的 $0 带 - 前缀（-bash），须容忍
+    return new RegExp(`${SHELL_ID_PREFIX}-?(?:bash|sh)\\b|(?:^|\\W)(?:bash|sh)(?:\\W|$)`, "i").test(output)
   }
 }
 
 // ===== PowerShell =====
 class PwshAdapter implements ShellAdapter {
   readonly name = "pwsh"
-  readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
+  readonly probeCommand = `Write-Output ${SHELL_ID_PREFIX}pwsh_$PSHOME`
   markerCmd(seq: number): string {
     return `Write-Host "${DONE_TAG}${seq}:$LASTEXITCODE>"`
   }
-  parseProbe(_output: string): boolean {
-    return true
+  splitCommand(command: string): string[] {
+    // PowerShell：行尾 `|`（管道续行）、反引号（显式换行转义）、未闭合 { / ( 时续行
+    return splitByContinuation(command, /[|`]\s*$|[{(\s]*[{(]\s*$/)
+  }
+  parseProbe(output: string): boolean {
+    // Write-Output __SHELL_ID__pwsh_$PSHOME → pwsh 展开为路径；cmd 下 $PSHOME 不被展开（字面保留 $），借此区分
+    return /__SHELL_ID__pwsh_[^$]/.test(output)
   }
 }
 
-/** 注册表（按优先级排列） */
-const adapters: ShellAdapter[] = [
+// ===== Windows cmd.exe =====
+class CmdAdapter implements ShellAdapter {
+  readonly name = "cmd"
+  readonly probeCommand = `echo ${SHELL_ID_PREFIX}%COMSPEC%`
+  markerCmd(seq: number): string {
+    return `echo ${DONE_TAG}${seq}:%errorlevel%>`
+  }
+  splitCommand(command: string): string[] {
+    // cmd：行尾 `^`（转义换行符）表示续行
+    return splitByContinuation(command, /\^\s*$/)
+  }
+  parseProbe(output: string): boolean {
+    // echo __SHELL_ID__%COMSPEC% → cmd 展开为 __SHELL_ID__C:\...cmd.exe（无 % 原样遗留即判为 cmd）
+    return /__SHELL_ID__(?!%)\S*cmd\.exe/i.test(output)
+  }
+}
+
+/** 注册表（探测顺序：先 POSIX 系，后 pwsh/cmd；resolveByProbe 由 _probeShell 改用各适配器 probeCommand 逐个探测） */
+export const adapters: ShellAdapter[] = [
   new ZshAdapter(),
   new BashAdapter(),
   new PwshAdapter(),
+  new CmdAdapter(),
 ]
 
 /**

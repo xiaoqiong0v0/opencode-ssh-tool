@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   const portArg = arg("port")
   const port = portArg ? parseInt(portArg, 10) : cfg.server.port
   const dir = arg("dir") ?? ""
-  const lang = arg("lang") === "zh" ? "zh" : getLang(cfg.webLang)
+  const lang = arg("lang") === "zh" ? "zh" : arg("lang") === "en" ? "en" : getLang(cfg.lang)
   const streamTickMs = cfg.server.streamTickMs ?? 100
   const idleShutdownMs = cfg.server.idleShutdownMs ?? 0
 

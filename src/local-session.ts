@@ -60,9 +60,18 @@ export class LocalSession extends BaseSession {
         rows: PTY_ROWS,
         name: "xterm-256color",
         data: (_t, d) => this._appendBuffer(new TextDecoder().decode(d)),
-        exit: () => { this._connected = false; this._remoteBusy = false },
+        exit: (_t, exitCode, signal) => {
+          this._connected = false
+          this._remoteBusy = false
+          log.warn(`本地终端 PTY 退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, exit=${exitCode}, signal=${signal})`)
+        },
       })
       const proc = Bun.spawn(splitCommand(opts.command), { terminal: term, cwd: opts.cwd })
+      // 监听子进程退出：docker exec/wsl 前端进程退出时此回调触发，用于定位"无 close() 日志却掉线"的场景
+      const bootAt = Date.now()
+      proc.exited.then((code) => {
+        log.error(`本地终端子进程退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, code=${code}, boot2exit=${Date.now() - bootAt}ms)`)
+      }).catch(() => { /* ignore */ })
       this._term = term
       this._proc = proc
       this._program = opts.command

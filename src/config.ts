@@ -32,10 +32,8 @@ export interface PermissionConfig {
 export interface ToolConfig {
   server: ServerConfig
   history: HistoryConfig
-  /** 工具描述语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
-  toolLang: Lang
-  /** Web 界面语言（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
-  webLang: Lang
+  /** 全局语言（工具描述与 Web 界面统一，默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
+  lang: Lang
   permission: PermissionConfig
 }
 
@@ -51,8 +49,7 @@ const DEFAULT_CONFIG: ToolConfig = {
     // 保留的消息对数（最小 1，保留最新）
     maxMessages: 100,
   },
-  toolLang: "en",
-  webLang: "en",
+  lang: "en",
   permission: {
     deny: [],
     allow: [],
@@ -82,10 +79,8 @@ const CONFIG_TEMPLATE = `{
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
     "maxMessages": 100
   },
-  // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
-  "toolLang": "en",
-  // Web 界面语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
-  "webLang": "en",
+  // 全局语言（工具描述与 Web 界面统一）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  "lang": "en",
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
@@ -132,8 +127,8 @@ export function loadConfig(): ToolConfig {
     const server = (raw.server ?? {}) as Partial<ServerConfig>
     const history = (raw.history ?? {}) as Partial<HistoryConfig>
     const permission = (raw.permission ?? {}) as Partial<PermissionConfig>
-    const toolLang = raw.toolLang === "zh" ? "zh" : "en"
-    const webLang = raw.webLang === "zh" ? "zh" : "en"
+    // 全局语言：优先新字段 lang，向后兼容旧字段 toolLang/webLang
+    const lang = raw.lang === "zh" ? "zh" : raw.lang === "en" ? "en" : (raw.toolLang === "zh" || raw.webLang === "zh" ? "zh" : "en")
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
@@ -144,8 +139,7 @@ export function loadConfig(): ToolConfig {
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
       },
-      toolLang,
-      webLang,
+      lang,
       permission: {
         deny: Array.isArray(permission.deny) ? permission.deny : [],
         allow: Array.isArray(permission.allow) ? permission.allow : [],

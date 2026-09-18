@@ -5,10 +5,14 @@
 }
 
 html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; }
-header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
+body { display: flex; flex-direction: column; }
+header { position: sticky; top: 0; flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
 header h1 { margin: 0; font-size: 14px; color: #e6edf3; font-weight: 600; }
 select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 6px; }
-pre { margin: 0; padding: 16px 16px 52px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; height: calc(100% - 52px); box-sizing: border-box; color: #c9d1d9; }
+pre { margin: 0; padding: 16px; flex: 1 1 auto; min-height: 0; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow: auto; box-sizing: border-box; color: #c9d1d9; }
+#xt { display: none; padding: 8px 12px; flex: 1 1 auto; min-height: 0; box-sizing: border-box; overflow: hidden; }
+body.debug #xt { display: block; }
+body.debug #term { display: none; }
 .row { display: flex; align-items: stretch; }
 .row .t { box-sizing: border-box; flex: 0 0 172px; color: #8b949e; padding: 0 10px 0 6px; border-right: 1px solid #30363d; white-space: pre; }
 .row .c { flex: 1; padding-left: 12px; white-space: pre; }
@@ -33,11 +37,12 @@ body:not(.show-time) .row .t { display: none; }
 .del-btn { background: none; border: 1px solid #30363d; color: #f85149; border-radius: 4px; cursor: pointer; padding: 2px 8px; font-size: 14px; line-height: 1; display: none; }
 .del-btn:hover { background: #f85149; color: #fff; }
 .del-btn.show { display: inline-block; }
-#cmdbar { position: fixed; bottom: 8px; left: 16px; right: 16px; display: flex; gap: 6px; }
+#cmdbar { flex: 0 0 auto; display: flex; gap: 6px; padding: 8px 16px; border-top: 1px solid #30363d; }
 #cmdInput { flex: 1; box-sizing: border-box; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; outline: none; resize: none; max-height: 120px; overflow-y: auto; }
 #cmdInput:focus { border-color: #58a6ff; }
 #cmdInput:disabled { opacity: 0.4; }
 #cmdKey { flex: 0 0 auto; width: 72px; text-align: center; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 6px; font-size: 12px; white-space: nowrap; overflow: hidden; cursor: crosshair; user-select: none; display: flex; align-items: center; justify-content: center; transition: border-color .15s; }
 #cmdKey.capture { border-color: #e67e22; animation: pulse 0.6s ease-in-out infinite alternate; }
 #cmdKey.disabled { opacity: 0.35; cursor: default; }
+.tgl.disabled { opacity: 0.35; pointer-events: none; }
 @keyframes pulse { from { opacity: 0.6; } to { opacity: 1; } }

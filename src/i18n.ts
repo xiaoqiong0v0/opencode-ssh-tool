@@ -9,7 +9,7 @@ export type FlatKey = { [K in keyof typeof T]: (typeof T)[K] extends Record<Lang
 
 /**
  * 读取当前语言：环境变量 SSH_TOOL_LANG 优先，否则用配置语言（默认 en）
- * @param configured 配置文件 toolLang 值
+ * @param configured 配置文件 lang 值
  * @returns 语言标识
  */
 export function getLang(configured: Lang = "en"): Lang {
@@ -249,6 +249,7 @@ Examples:
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
 web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
   web_send_ctrlc: { en: "Keystroke", zh: "快捷键" },
+  web_raw: { en: "Raw", zh: "原始" },
   disconnected_ok: {
     en: "Terminal closed ({host}).",
     zh: "终端已断开（{host}）。",
