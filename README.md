@@ -7,10 +7,11 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **长驻会话**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
-- **命令完成判定**：哨兵标记 + 静默窗口 + 超时三重兜底，动画输出（进度条等）自动识别
+- **命令完成判定**：完成标记法（`<SSH_DONE:seq:退出码>`）+ 静默窗口 + 超时三重兜底，动画输出（进度条等）自动识别；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截
+- **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），重启不丢、会话关闭清理
-- **HTTP 终端查看**：默认开启本地服务，浏览器打开可滚动、自动刷新的终端记录页面
-- **多语言**：工具描述默认英文，`SSH_TOOL_LANG=zh` 切中文
+- **HTTP 终端查看**：默认开启本地服务，浏览器打开可查看终端记录（WebSocket 实时推送，无轮询）
+- **多语言**：`toolLang`（工具描述/CLI/session 文案）与 `webLang`（页面 UI）独立配置，默认英文；环境变量 `SSH_TOOL_LANG` / `SSH_WEB_LANG` 分别覆盖
 
 ## 安装
 
@@ -59,8 +60,10 @@ term_cli help                                                     # 完整用法
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
     "maxMessages": 100
   },
-  // 工具描述语言："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  // 工具语言（工具描述 / CLI / agent·session 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
+  // Web 界面语言（仅浏览器页面 UI 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_WEB_LANG 覆盖）
+  "webLang": "en",
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝）：
@@ -79,7 +82,7 @@ term_cli help                                                     # 完整用法
 }
 ```
 
-多语言优先级：环境变量 `SSH_TOOL_LANG` > 配置文件 `toolLang` > 默认 `en`。
+多语言：`toolLang` 控制工具侧全部文案（工具描述、CLI 输出、agent/session 回传消息），`webLang` 仅控制浏览器页面 UI。优先级均为「环境变量 > 配置文件 > 默认 `en`」：工具用 `SSH_TOOL_LANG`，Web 用 `SSH_WEB_LANG`。
 
 权限自定义正则**追加**到内置默认（`DENY` 黑名单 + `ALLOW_READONLY` 白名单），`deny`/`allow` 为空数组时仅用内置默认规则，可自行补充扩展。
 
@@ -116,19 +119,20 @@ term_cli exec(command)
 服务默认开启（配置 `server.enabled`）。`term_cli status` / `term_cli read`（history 模式）会返回实际地址（端口 0 时自动分配，避免冲突）：
 
 ```
-浏览器访问 http://127.0.0.1:<port> 查看可滚动、每 2s 自动刷新的终端记录
+浏览器访问 http://127.0.0.1:<port> 查看终端记录（WebSocket 实时推送）
 ```
 
-页面按会话切换，展示「命令 + 输出」历史对。
+页面按会话/终端切换，transcript 展示「命令 + 输出」历史对，raw 展示 xterm.js 实时画面。
 
 ## 架构
 
 ```
 opencode（插件进程）
-  ├─ ssh2 客户端：长驻连接 + PTY shell（每个 opencode 会话一个）
-  │    └─ 哨兵法执行命令（combo; echo __SSH_DONE_<rand>__）
-  ├─ SessionHistory：命令+输出 消息对（按对数限制，超大落盘）
-  └─ HTTP 服务：127.0.0.1 随机端口，浏览器查看终端记录
+  ├─ agent：每会话多个命名终端，PTY 固定 120×40
+  │    ├─ SSH（ssh2 PTY shell）/ 本地·容器（Bun.Terminal）
+  │    └─ 完成标记法执行命令（`command ;markerCmd` → `<SSH_DONE:seq:退出码>`）
+  ├─ server：独立 HTTP 子进程（WS 统一事件流，proto 版本校验）
+  └─ web：transcript（消息对）/ raw（xterm.js）双视图，浏览器实时查看
 ```
 
 ## 开发
@@ -171,5 +175,7 @@ npm publish      # 只发布 dist/
 - `docs/requirements/需求说明.md` — 原始需求
 - `docs/design/方案分析.md` — 技术分析、决策、风险
 - `docs/design/结构设计.md` — 编码依据
+- `docs/design/消息协议重构设计.md` — WS 统一事件流协议
+- `docs/design/终端渲染与尺寸固定说明.md` — 终端尺寸固定、续行检测、渲染修复
 
 

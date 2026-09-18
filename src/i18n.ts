@@ -1,6 +1,7 @@
 // 多语言：工具描述与参数说明的 en/zh 字典，默认英文
+// 语言分两类：工具语言（工具描述/CLI/agent·session 文案）与 Web 界面语言（仅页面 UI 文案）
 
-import { LANG_ENV } from "./constants.js"
+import { LANG_ENV, WEB_LANG_ENV } from "./constants.js"
 
 export type Lang = "en" | "zh"
 
@@ -8,15 +9,32 @@ export type Lang = "en" | "zh"
 export type FlatKey = { [K in keyof typeof T]: (typeof T)[K] extends Record<Lang, string> ? K : never }[keyof typeof T]
 
 /**
- * 读取当前语言：环境变量 SSH_TOOL_LANG 优先，否则用配置语言（默认 en）
- * @param configured 配置文件 lang 值
+ * 环境变量取值优先于配置（仅接受 en/zh，非法值回退配置）
+ * @param env 环境变量原始值
+ * @param configured 配置文件语言值
  * @returns 语言标识
  */
-export function getLang(configured: Lang = "en"): Lang {
-  const env = process.env[LANG_ENV]
-  if (env === "zh") return "zh"
-  if (env === "en") return "en"
+function readLang(env: string | undefined, configured: Lang): Lang {
+  if (env === "zh" || env === "en") return env
   return configured
+}
+
+/**
+ * 读取工具语言：环境变量 SSH_TOOL_LANG 优先，否则配置 toolLang（默认 en）
+ * @param configured 配置文件 toolLang 值
+ * @returns 语言标识
+ */
+export function getToolLang(configured: Lang = "en"): Lang {
+  return readLang(process.env[LANG_ENV], configured)
+}
+
+/**
+ * 读取 Web 界面语言：环境变量 SSH_WEB_LANG 优先，否则配置 webLang（默认 en）
+ * @param configured 配置文件 webLang 值
+ * @returns 语言标识
+ */
+export function getWebLang(configured: Lang = "en"): Lang {
+  return readLang(process.env[WEB_LANG_ENV], configured)
 }
 
 /** 工具描述与参数说明字典 */
@@ -236,15 +254,12 @@ Examples:
   },
   web_title: { en: "Terminal Records", zh: "终端记录" },
   web_loading: { en: "Loading...", zh: "加载中..." },
-  web_load_failed: { en: "Failed to load records", zh: "记录加载失败" },
   web_session_gone: { en: "Session not found or disconnected", zh: "会话不存在或已断开" },
   web_time: { en: "Time", zh: "时间" },
   web_terminals: { en: "terminals", zh: "终端" },
   web_local: { en: "local", zh: "本地" },
   web_commands: { en: "commands", zh: "条命令" },
-  web_auto_refresh: { en: "auto-refresh every 2s", zh: "每 2s 自动刷新" },
   web_no_session: { en: "No terminal. Use term_cli connect (SSH) or term_cli local first.", zh: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。" },
-  web_running: { en: "[running] ", zh: "[运行中] " },
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
 web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
@@ -269,6 +284,18 @@ web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入�
   err_not_connected: {
     en: "Not connected",
     zh: "未连接",
+  },
+  cmd_busy: {
+    en: "Previous command still running; poll with `term_cli status` first",
+    zh: "上一条命令仍在运行，请先用 `term_cli status` 查询状态",
+  },
+  cmd_continuation: {
+    en: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted",
+    zh: "命令会导致 shell 进入续行等待（引号/反引号/转义未闭合），已中止",
+  },
+  shell_probe_timeout: {
+    en: "Shell probe timed out (shell not ready within 30s); connection aborted",
+    zh: "Shell 探测超时（30s 内 shell 未就绪），连接终止",
   },
 } as const
 

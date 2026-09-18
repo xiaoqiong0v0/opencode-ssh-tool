@@ -150,7 +150,8 @@ class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   markerCmd(seq: number): string {
-    return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
+    // 结尾补换行：否则 zsh 判定"上条输出未以换行结束"，会补印 PROMPT_EOL_MARK（root 为 #）污染画面
+    return `printf '\\n${DONE_TAG}${seq}:%s>\\n' $?`
   }
   splitCommand(command: string): string[] {
     // zsh 沿用 POSIX 反斜杠续行；注意 zsh 中反斜杠需转义处理（这里按普通反斜杠续行判断）
@@ -170,6 +171,7 @@ class BashAdapter implements ShellAdapter {
   readonly name = "bash"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   markerCmd(seq: number): string {
+    // bash 无 PROMPT_EOL_MARK，标记无需补尾换行（补了反而在 raw 里多顶一行）
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
   }
   splitCommand(command: string): string[] {

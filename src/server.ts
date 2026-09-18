@@ -10,7 +10,7 @@ import type { AddressInfo } from "node:net"
 import { WebSocketServer, WebSocket } from "ws"
 import { listAllSessions, removeSessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
-import { PTY_COLS } from "./constants.js"
+import { PTY_COLS, PTY_ROWS } from "./constants.js"
 import log from "./log.js"
 
 export interface LiveSession {
@@ -76,12 +76,9 @@ const PAGE_KEYS: FlatKey[] = [
 ]
 
 const JS_I18N_KEYS: Record<string, FlatKey> = {
-  run: "web_running",
   commands: "web_commands",
-  autoRefresh: "web_auto_refresh",
   sessionGone: "web_session_gone",
   noSession: "web_no_session",
-  loadFailed: "web_load_failed",
   local: "web_local",
   terminals: "web_terminals",
   cmdPlaceholder: "web_cmd_placeholder",
@@ -497,17 +494,6 @@ export function startServer(
         return
       }
 
-      if (t === "resize") {
-        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
-        const name = typeof msg.name === "string" ? msg.name : ""
-        const cols = typeof msg.cols === "number" ? msg.cols : 0
-        const rows = typeof msg.rows === "number" ? msg.rows : 0
-        if (!sid || cols <= 0 || rows <= 0) return
-        const agent = agentBySession.get(sessionKey(sid, name))
-        if (agent) send(agent, { type: "run-resize", sessionID: sid, name, cols, rows })
-        return
-      }
-
       if (t === "deleteTerminal") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
@@ -566,6 +552,7 @@ function renderPage(lang: Lang, template: string): string {
   }
   out = out.replaceAll("__I18N_JSON__", JSON.stringify(i18nObj))
   out = out.replaceAll("__PTY_COLS_VAL__", String(PTY_COLS))
+  out = out.replaceAll("__PTY_ROWS_VAL__", String(PTY_ROWS))
   return out
 }
 

@@ -14,8 +14,6 @@ export interface AgentSession {
   getRunningCommand(): string
   /** 按当前 shell 续行规则拆分多行命令为独立命令 */
   splitCommand(command: string): string[]
-  /** 调整 PTY 尺寸以匹配前端 xterm 实际行列 */
-  resize(cols: number, rows: number): void
   /** 设置命令生命周期监听器（cmdStart/cmdDone 事件源） */
   setLifecycle(listener: ((ev: { type: "start"; command: string; ts: number } | { type: "done"; exitCode: number | null; endTs: number; output?: string }) => void) | null): void
   /** 读取原始字节流增量 */
@@ -224,15 +222,6 @@ export function startAgent(
         const name = typeof msg.name === "string" ? msg.name : ""
         const session = resolveSession(sid, name)
         if (session) session.close()
-        return
-      }
-      if (t === "run-resize") {
-        const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
-        const name = typeof msg.name === "string" ? msg.name : ""
-        const cols = typeof msg.cols === "number" ? msg.cols : 0
-        const rows = typeof msg.rows === "number" ? msg.rows : 0
-        const session = resolveSession(sid, name)
-        if (session && cols > 0 && rows > 0) session.resize(cols, rows)
         return
       }
     }

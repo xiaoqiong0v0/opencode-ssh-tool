@@ -2,6 +2,7 @@
 // 连接建立与传输层实现；命令执行/后台监听/标记检测继承自 BaseSession
 
 import { INJECT_TIMEOUT_MS, PTY_COLS, PTY_ROWS } from "./constants.js"
+import { tr } from "./i18n.js"
 import type { ExecResult } from "./base-session.js"
 import { BaseSession } from "./base-session.js"
 import log from "./log.js"
@@ -30,8 +31,6 @@ export class LocalSession extends BaseSession {
   private _proc: Bun.Subprocess | null = null
   private _program = ""
 
-  protected _statusCmd = "local_status"
-
   protected get _extraResult(): Partial<ExecResult> { return {} }
 
   protected _ready(): boolean {
@@ -40,10 +39,6 @@ export class LocalSession extends BaseSession {
 
   protected _write(data: string): void {
     this._term!.write(data)
-  }
-
-  protected _resize(cols: number, rows: number): void {
-    try { this._term?.resize(cols, rows) } catch { /* 终端已关闭忽略 */ }
   }
 
   protected _closeTransport(): void {
@@ -95,7 +90,7 @@ export class LocalSession extends BaseSession {
       if (!adapter) {
         log.error("Shell 探测超时，连接终止")
         this.close()
-        return { ok: false, error: "Shell 探测超时（30s 内 shell 未就绪），连接终止" }
+        return { ok: false, error: tr("shell_probe_timeout", this._lang) }
       }
       this._adapter = adapter
       log.info(`Shell 探测结果: ${this._adapter.name}`)

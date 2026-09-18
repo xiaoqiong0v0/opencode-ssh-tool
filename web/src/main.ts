@@ -1,17 +1,15 @@
 // 前端入口：纯 WebSocket 驱动（无 HTTP 轮询/断线重连），raw 模式 xterm.js 渲染、transcript 用 TermScreen
 
 import { Terminal } from "@xterm/xterm"
-import { FitAddon } from "@xterm/addon-fit"
 
 interface I18n {
-  run: string
   commands: string
-  autoRefresh: string
   sessionGone: string
   noSession: string
-  loadFailed: string
   terminals: string
   local: string
+  cmdPlaceholder: string
+  sendCtrlC: string
 }
 
 interface TerminalInfo {
@@ -60,6 +58,7 @@ interface GridCell {
 
 const I18N: I18n = (window as unknown as { __I18N__: I18n }).__I18N__
 const PTY_COLS: number = (window as unknown as { __PTY_COLS__: number }).__PTY_COLS__ || 120
+const PTY_ROWS: number = (window as unknown as { __PTY_ROWS__: number }).__PTY_ROWS__ || 40
 
 const ANSI_BASE = ["#010101", "#de382b", "#39b54a", "#ffc005", "#006fb8", "#762671", "#2cb3e9", "#c9d1d9"]
 const ANSI_BRIGHT = ["#666666", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#f0f6fc"]
@@ -408,8 +407,6 @@ function subscribe(): void {
   subName = name
   runScreen = null
   ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, mode: debugMode ? "raw" : "transcript" }))
-  // 切换终端后把当前 xterm 尺寸同步给新会话的 PTY（raw 模式下）
-  scheduleResize()
 }
 
 // ===== Snapshot 处理 =====
@@ -560,22 +557,17 @@ function handleMeta(msg: { sessionID: string; name: string; commands: number }):
 
 // ===== Raw 连续流处理（xterm.js 忠实渲染，天然支持跨行光标定位/交互程序） =====
 let xtermInst: Terminal | null = null
-let xtResizeObserver: ResizeObserver | null = null
 let stickToBottomRaw = true
-let resizeTimer: number | null = null
+/** 容器比终端矮时是否贴底（用户上滚后不强制拉回） */
+let stickToBottomBox = true
+/** 窗口尺寸变化时重算贴底（raw 展示期间注册，隐藏时移除） */
+let boxResizeHandler: (() => void) | null = null
 
-/** 通知 server/agent 把 PTY 尺寸调整为 xterm 实际行列（去抖，避免 ResizeObserver 抖动频繁发送） */
-function scheduleResize(): void {
-  if (resizeTimer !== null) window.clearTimeout(resizeTimer)
-  resizeTimer = window.setTimeout(() => {
-    resizeTimer = null
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
-    const sid = (document.getElementById("session") as HTMLSelectElement | null)?.value ?? ""
-    const name = (document.getElementById("terminal") as HTMLSelectElement | null)?.value ?? ""
-    const rows = xtermInst?.rows ?? 0
-    if (!sid || !name || rows <= 0) return
-    ws.send(JSON.stringify({ type: "resize", sessionID: sid, name, cols: PTY_COLS, rows }))
-  }, 150)
+/** 终端固定 PTY_ROWS 行，窗口过矮时容器滚动并贴底，保证命令行/光标可见 */
+function stickBoxToBottom(): void {
+  const el = document.getElementById("xt")
+  if (!el || !stickToBottomBox) return
+  if (el.scrollHeight > el.clientHeight) el.scrollTop = el.scrollHeight
 }
 
 /** 懒创建/挂载 xterm 实例到容器（容器缺失时动态补建，兼容旧模板缓存） */
@@ -590,7 +582,7 @@ function ensureXterm(): Terminal {
   }
   const t = new Terminal({
     cols: PTY_COLS,
-    rows: 30,
+    rows: PTY_ROWS,
     scrollback: 2000,
     fontFamily: '"CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace',
     fontSize: 13,
@@ -617,24 +609,18 @@ function ensureXterm(): Terminal {
       brightWhite: "#f0f6fc",
     },
   })
-  const fitAddon = new FitAddon()
-  t.loadAddon(fitAddon)
   t.open(el)
-  // 高度自适应：容器尺寸变化时按行高精确计算行数（列宽保持 PTY_COLS，与 server 侧保持一致）
-  const fitRows = (): void => {
-    const dim = fitAddon.proposeDimensions()
-    if (dim && dim.rows !== t.rows) t.resize(PTY_COLS, dim.rows)
-    scheduleResize()
+  // 容器滚动监听：窗口过矮时保持贴底，用户上滚后不强制拉回
+  el.addEventListener("scroll", () => {
+    stickToBottomBox = el.scrollTop + el.clientHeight >= el.scrollHeight - 2
+  })
+  boxResizeHandler = () => {
+    stickToBottomBox = true
+    stickBoxToBottom()
+    if (stickToBottomRaw) t.scrollToBottom()
   }
-  // open 后等渲染就绪再精确测量（行高未就绪时 proposeDimensions 会返回 NaN）
-  setTimeout(fitRows, 50)
-  if (typeof ResizeObserver !== "undefined") {
-    xtResizeObserver = new ResizeObserver(() => {
-      fitRows()
-    })
-    xtResizeObserver.observe(el)
-  }
-  // 滚动监听：贴底由 raw 流刷新时维持，用户上滚后不强制拉回
+  window.addEventListener("resize", boxResizeHandler)
+  // 终端滚动监听：贴底由 raw 流刷新时维持，用户上滚后不强制拉回
   t.onScroll(() => {
     const vp = t.buffer.active.viewportY
     stickToBottomRaw = vp >= t.buffer.active.baseY
@@ -650,14 +636,15 @@ function showRawUi(): void {
   const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
   toBottomBtn.style.display = "none"
   if (stickToBottomRaw) t.scrollToBottom()
+  stickBoxToBottom()
 }
 
 /** 离开 raw 展示（恢复 transcript pre） */
 function hideRawUi(): void {
   document.body.classList.remove("debug")
-  if (xtResizeObserver) {
-    xtResizeObserver.disconnect()
-    xtResizeObserver = null
+  if (boxResizeHandler) {
+    window.removeEventListener("resize", boxResizeHandler)
+    boxResizeHandler = null
   }
   if (xtermInst) {
     xtermInst.dispose()
@@ -676,8 +663,8 @@ function handleRaw(msg: { data: string; reset?: boolean }): void {
     t.write(msg.data)
   }
   if (stickToBottomRaw) t.scrollToBottom()
+  stickBoxToBottom()
 }
-
 // ===== 渲染函数 =====
 function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")

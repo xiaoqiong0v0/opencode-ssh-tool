@@ -32,8 +32,10 @@ export interface PermissionConfig {
 export interface ToolConfig {
   server: ServerConfig
   history: HistoryConfig
-  /** 全局语言（工具描述与 Web 界面统一，默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
-  lang: Lang
+  /** 工具语言：工具描述 / CLI / agent·session 文案（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
+  toolLang: Lang
+  /** Web 界面语言：仅页面 UI 文案（默认 en，可用环境变量 SSH_WEB_LANG 覆盖） */
+  webLang: Lang
   permission: PermissionConfig
 }
 
@@ -49,7 +51,8 @@ const DEFAULT_CONFIG: ToolConfig = {
     // 保留的消息对数（最小 1，保留最新）
     maxMessages: 100,
   },
-  lang: "en",
+  toolLang: "en",
+  webLang: "en",
   permission: {
     deny: [],
     allow: [],
@@ -79,8 +82,10 @@ const CONFIG_TEMPLATE = `{
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
     "maxMessages": 100
   },
-  // 全局语言（工具描述与 Web 界面统一）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
-  "lang": "en",
+  // 工具语言（工具描述 / CLI / agent·session 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
+  "toolLang": "en",
+  // Web 界面语言（仅页面 UI 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_WEB_LANG 覆盖）
+  "webLang": "en",
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
@@ -127,8 +132,10 @@ export function loadConfig(): ToolConfig {
     const server = (raw.server ?? {}) as Partial<ServerConfig>
     const history = (raw.history ?? {}) as Partial<HistoryConfig>
     const permission = (raw.permission ?? {}) as Partial<PermissionConfig>
-    // 全局语言：优先新字段 lang，向后兼容旧字段 toolLang/webLang
-    const lang = raw.lang === "zh" ? "zh" : raw.lang === "en" ? "en" : (raw.toolLang === "zh" || raw.webLang === "zh" ? "zh" : "en")
+    // 语言：toolLang（工具）/ webLang（Web 界面）独立配置；向后兼容旧字段 lang（同时作为两者）
+    const legacyLang: Lang | undefined = raw.lang === "zh" ? "zh" : raw.lang === "en" ? "en" : undefined
+    const toolLang: Lang = raw.toolLang === "zh" ? "zh" : raw.toolLang === "en" ? "en" : legacyLang ?? "en"
+    const webLang: Lang = raw.webLang === "zh" ? "zh" : raw.webLang === "en" ? "en" : legacyLang ?? "en"
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
@@ -139,7 +146,8 @@ export function loadConfig(): ToolConfig {
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
       },
-      lang,
+      toolLang,
+      webLang,
       permission: {
         deny: Array.isArray(permission.deny) ? permission.deny : [],
         allow: Array.isArray(permission.allow) ? permission.allow : [],

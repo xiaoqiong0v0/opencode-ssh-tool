@@ -42,8 +42,11 @@ export const MAX_OUTPUT_LEN = 50_000
 /** 会话连续原始字节流上限（超过裁剪最旧部分） */
 export const RAW_LOG_MAX = 1_048_576
 
-/** 工具描述语言环境变量（en | zh，默认 en） */
+/** 工具语言环境变量（工具描述/CLI/session 文案，en | zh，默认 en） */
 export const LANG_ENV = "SSH_TOOL_LANG"
+
+/** Web 界面语言环境变量（仅页面 UI 文案，en | zh，默认 en） */
+export const WEB_LANG_ENV = "SSH_WEB_LANG"
 
 /** 插件缓存根目录（历史消息对存文件，随会话清理） */
 export const CACHE_DIR = ".opencode/plugins-cache/opencode-ssh-tool"
@@ -64,4 +67,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  */
-export const SERVER_PROTO_VERSION = 10
+export const SERVER_PROTO_VERSION = 12

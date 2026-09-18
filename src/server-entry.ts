@@ -4,7 +4,7 @@
 import { startServer, type SessionEntry } from "./server.js"
 import { listAllSessions } from "./session-store.js"
 import { loadConfig } from "./config.js"
-import { getLang } from "./i18n.js"
+import { getWebLang } from "./i18n.js"
 import { SERVER_PROTO_VERSION } from "./constants.js"
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -23,7 +23,8 @@ async function main(): Promise<void> {
   const portArg = arg("port")
   const port = portArg ? parseInt(portArg, 10) : cfg.server.port
   const dir = arg("dir") ?? ""
-  const lang = arg("lang") === "zh" ? "zh" : arg("lang") === "en" ? "en" : getLang(cfg.lang)
+  // Web 界面语言：--lang（插件传入的 webLang）优先，否则 SSH_WEB_LANG / 配置 webLang
+  const lang = arg("lang") === "zh" ? "zh" : arg("lang") === "en" ? "en" : getWebLang(cfg.webLang)
   const streamTickMs = cfg.server.streamTickMs ?? 100
   const idleShutdownMs = cfg.server.idleShutdownMs ?? 0
 

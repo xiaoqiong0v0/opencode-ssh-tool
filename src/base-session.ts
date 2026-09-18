@@ -12,6 +12,7 @@ import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart } from "./utils.js"
 import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, type ShellAdapter } from "./shell-adapter.js"
+import { tr, type Lang } from "./i18n.js"
 
 /** 命令执行结果 */
 export interface ExecResult {
@@ -129,6 +130,7 @@ export abstract class BaseSession {
     protected readonly sessionID: string,
     history: SessionHistory,
     protected readonly name = "default",
+    protected readonly _lang: Lang = "en",
   ) {
     this._history = history
   }
@@ -139,8 +141,6 @@ export abstract class BaseSession {
   protected abstract _closeTransport(): void
   /** 结果中的类型专属字段（SSH 附加 host，本地为空） */
   protected get _extraResult(): Partial<ExecResult> { return {} }
-  /** 忙碌提示中的状态命令名（ssh_status / local_status） */
-  protected abstract _statusCmd: string
 
   /**
    * 异步提交命令：立即返回，命令后台执行，输出由后台监听收集进 history
@@ -148,9 +148,9 @@ export abstract class BaseSession {
    * @returns 提交结果（立即返回，不等待命令完成）
    */
   async submit(command: string): Promise<ExecResult> {
-    if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
-    if (this._remoteBusy) return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` }
-    if (this._adapter?.hasOpenContinuation(command)) return { ok: false, output: "", error: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted" }
+    if (!this._ready()) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
+    if (this._remoteBusy) return { ok: false, output: "", error: tr("cmd_busy", this._lang) }
+    if (this._adapter?.hasOpenContinuation(command)) return { ok: false, output: "", error: tr("cmd_continuation", this._lang) }
 
     this._beginCapture(command)
     this._write(this._composeCommand(command))
@@ -166,9 +166,9 @@ export abstract class BaseSession {
    */
   async exec(command: string): Promise<ExecResult> {
     const startTs = Date.now()
-    if (!this._ready()) return { ok: false, output: "", error: "Not connected" }
-    if (this._remoteBusy) { log.info(`exec quick-fail busy: ${command} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: `Previous command still running, poll with ${this._statusCmd} first` } }
-    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation: ${command}`); return { ok: false, output: "", error: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted" } }
+    if (!this._ready()) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
+    if (this._remoteBusy) { log.info(`exec quick-fail busy: ${command} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: tr("cmd_busy", this._lang) } }
+    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation: ${command}`); return { ok: false, output: "", error: tr("cmd_continuation", this._lang) } }
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
@@ -226,7 +226,7 @@ export abstract class BaseSession {
    * @returns 未消费输出
    */
   async readBuffer(): Promise<{ ok: boolean; output: string; error?: string }> {
-    if (!this._connected) return { ok: false, output: "", error: "Not connected" }
+    if (!this._connected) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
     let out: string
     if (this._runningStartPos !== null && this._runningCommand) {
       const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
@@ -254,7 +254,7 @@ export abstract class BaseSession {
    * @returns 是否发送成功
    */
   send(text: string): { ok: boolean; error?: string } {
-    if (!this._connected) return { ok: false, error: "Not connected" }
+    if (!this._connected) return { ok: false, error: tr("err_not_connected", this._lang) }
     const payload = text
       .replace(/\\x1b/gi, "\x1b")
       .replace(/\\x03/gi, "\x03")
@@ -278,18 +278,6 @@ export abstract class BaseSession {
   getRunningCommand(): string {
     return this._runningStartPos !== null && this._connected ? this._runningCommand : ""
   }
-
-  /**
-   * 调整 PTY/终端尺寸以匹配前端 xterm 实际行列（避免 shell 绝对定位按固定行数错位）
-   * @param cols 列数
-   * @param rows 行数
-   */
-  resize(cols: number, rows: number): void {
-    this._resize(cols, rows)
-  }
-
-  /** 传输层 resize（子类覆盖：SSH setWindow / 本地 term.resize）；默认无操作 */
-  protected _resize(_cols: number, _rows: number): void { /* 默认无操作 */ }
 
   /**
    * 按当前 shell 的行续行规则拆分多行命令为独立命令（供 agent 端多行命令拆条执行）

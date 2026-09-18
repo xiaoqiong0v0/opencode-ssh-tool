@@ -4,6 +4,7 @@
 import { Client, type ConnectConfig } from "ssh2"
 import log from "./log.js"
 import { INJECT_TIMEOUT_MS, PTY_COLS, PTY_ROWS, READY_TIMEOUT_MS } from "./constants.js"
+import { tr } from "./i18n.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import type { ExecResult } from "./base-session.js"
 import { BaseSession } from "./base-session.js"
@@ -35,8 +36,6 @@ export class SshSession extends BaseSession {
   private _user = ""
   private _port = 22
 
-  protected _statusCmd = "ssh_status"
-
   protected get _extraResult(): Partial<ExecResult> { return { host: this._host } }
 
   protected _ready(): boolean {
@@ -45,11 +44,6 @@ export class SshSession extends BaseSession {
 
   protected _write(data: string): void {
     this._stream!.write(data)
-  }
-
-  protected _resize(cols: number, rows: number): void {
-    // ssh2 setWindow(rows, cols, height, width)
-    try { this._stream?.setWindow(rows, cols, 0, 0) } catch { /* 通道已关闭忽略 */ }
   }
 
   protected _closeTransport(): void {
@@ -140,7 +134,7 @@ export class SshSession extends BaseSession {
               if (!adapter) {
                 log.error(`Shell 探测超时，终止连接 ${opts.user}@${opts.host}`)
                 this.close()
-                resolve({ ok: false, host: opts.user, user: opts.user, port, error: "Shell 探测超时（30s 内 shell 未就绪），连接终止" })
+                resolve({ ok: false, host: opts.user, user: opts.user, port, error: tr("shell_probe_timeout", this._lang) })
                 return
               }
               this._adapter = adapter
