@@ -11,7 +11,7 @@ import {
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, hasHeredoc, type ShellAdapter } from "./shell-adapter.js"
+import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
 /** 命令执行结果 */
@@ -101,6 +101,11 @@ function stripCommandTail(command: string): string {
 export abstract class BaseSession {
   protected _connected = false
   protected _remoteBusy = false
+  /**
+   * 是否保持 busy：排队命令顺序执行时，中间某条完成也不清 busy，
+   * 直到序列最后一条完成（否则 web/status 会在中间命令间隙闪 busy=false）。
+   */
+  private _holdBusy = false
   protected _buffer = ""
   protected _connectedAt = 0
   protected _lastActive = 0
@@ -117,6 +122,8 @@ export abstract class BaseSession {
   protected _streamPos: number | null = null
   /** Shell 适配器（探测后确定） */
   protected _adapter: ShellAdapter | null = null
+  /** 多行命令写入 PTY 的行分隔符：Unix PTY 用 \n；Windows ConPTY（本地会话）用 \r（裸 \n 不提交行） */
+  protected _lineSep = "\n"
   protected _closed = false
   /** 当前运行命令的输入时刻（history 记录展示命令发起时间用） */
   private _runningStartTs = 0
@@ -191,7 +198,7 @@ export abstract class BaseSession {
 
     switch (outcome.kind) {
       case "done": {
-        this._remoteBusy = false
+        this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
         const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
         const out = this._extractOutput(raw, command)
@@ -293,20 +300,21 @@ export abstract class BaseSession {
   }
 
   /**
-   * 按当前 shell 的行续行规则拆分多行命令为独立命令（供 agent 端多行命令拆条执行）
-   * @param command 可能含换行的命令文本
-   * @returns 拆分后的独立命令列表；未识别 shell 时按普通换行拆分
-   */
-  splitCommand(command: string): string[] {
-    return this._adapter ? this._adapter.splitCommand(command) : command.split("\n").map((l) => l.trim()).filter(Boolean)
-  }
-
-  /**
    * 设置命令生命周期监听器（命令开始/完成时回调）
    * @param listener 回调（start 携带命令，done 携带退出码与结束时刻；null 表示清除）
    */
   setLifecycle(listener: ((ev: LifecycleEvent) => void) | null): void {
     this._lifecycle = listener
+  }
+
+  /**
+   * 设置是否保持 busy（排队命令序列期间为 true）：
+   * true 时中间命令完成不清 busy；置 false 时立即清 busy。
+   * @param hold 是否保持
+   */
+  setHoldBusy(hold: boolean): void {
+    this._holdBusy = hold
+    if (!hold) this._remoteBusy = false
   }
 
   /** 触发命令开始事件 */
@@ -381,29 +389,43 @@ export abstract class BaseSession {
   }
 
   /**
-   * 组合写入命令（实际写入 PTY 的文本，尾部带 \r 回车）
+   * 组合实际写入 PTY 的命令：在规范形式（`_composeEchoText`）基础上把换行改写为会话行分隔符并补尾部回车。
+   * 行分隔符按会话类型：Unix PTY 用 `\n`（正常提交行），Windows ConPTY 用 `\r`（实测裸 `\n` 不提交行，
+   * pwsh 会停在续行 `>>`、行序错乱）。
    * @param command 原始命令（history 存干净版本）
-   * @returns 实际写入 PTY 的文本
+   * @returns 实际写入 PTY 的文本（尾部带 \r，行分隔已按会话类型规范化）
    */
   private _composeCommand(command: string): string {
-    return `${this._composeEchoText(command)}\r`
+    return this._composeEchoText(command).replace(/\n/g, this._lineSep) + "\r"
   }
 
   /**
-   * 组合命令文本（无尾部 \r）：命令 + 完成标记，同时供 extractOutputStart 定位回显结束。
-   * 普通命令用 `;` 同行拼接（免疫 prompt 框架覆盖）：`python; printf ...` 中 printf 由 shell 在 python
-   * 退出后执行，不会被 REPL 当 stdin 消费（实测 top/read/python 均正常出 marker）。
-   * 含 heredoc 的命令改用换行分隔：标记若以 `;` 拼到分隔符行（`EOF ;printf ...`），
-   * heredoc 分隔符不再被识别 → 永不结束 → 卡死。
+   * 组合命令文本（规范/匹配用形式，始终以 `\n` 分隔行、无尾部回车）：命令 + 完成标记。
+   * 该形式供 `extractOutputStart` 按 `\n` 切行并做段间宽松匹配（跳过 `>>` 续行提示），
+   * 故不可改写为 `_lineSep`——否则本地会话（`\r`）下整段回显变一行、段间匹配失效、回显剥离失败。
+   * 完成标记用当前 shell 的语句分隔符同行拼接（POSIX/pwsh 为 `;`，cmd 为 `&`），免疫 prompt 框架覆盖：
+   * `python; printf ...` 中 printf 由 shell 在 python 退出后执行，不会被 REPL 当 stdin 消费
+   * （实测 top/read/python 均正常出 marker）。
+   * 多行命令用 shell 组语法（groupWrap）包裹成**一条**命令：一次输入 = 一条命令 = 一段输出，
+   * 避免 shell 逐行执行导致回显与输出交错、中间输出被 extractOutputStart 丢掉
+   * （如 `cd /tmp` 之后的 `echo AAA`/`echo BBB` 输出丢失）；heredoc 分隔符行必须独占一行，
+   * 若标记直接拼上去（`EOF ;printf ...`）会让分隔符失效 → heredoc 永不结束 → 卡死，
+   * 故含 heredoc 的多行命令也必须包组。
+   * cmd 无法安全包组（组内 `%errorlevel%` 为解析期展开、退出码失真）或无 adapter 时回退原样拼接。
    * 交互程序（top/vi/read/python 等）期间保留 running 上下文与 busy，marker 出现即判定完成。
    * @param command 原始命令
-   * @returns 命令 + 标记文本（无 \r）
+   * @returns 命令 + 标记文本（规范 `\n` 形式，无尾部回车）
    */
   private _composeEchoText(command: string): string {
     const marker = this._markerCmd(this._runningSeq)
     const body = stripCommandTail(command)
-    const sep = hasHeredoc(body) ? "\n" : " ;"
-    return `${body}${sep}${marker}`
+    const sep = this._adapter?.stmtSep ?? ";"
+    // 多行命令：尝试包组（cmd 返回 null → 回退原样拼接），使整段作为一条命令执行
+    if (body.includes("\n")) {
+      const grouped = this._adapter?.groupWrap(body)
+      return grouped ? `${grouped} ${sep}${marker}` : `${body} ${sep}${marker}`
+    }
+    return `${body} ${sep}${marker}`
   }
 
   /**
@@ -573,7 +595,7 @@ export abstract class BaseSession {
         this._history.append(command, out, this._runningStartTs)
         this._emitDone(code, Date.now(), out)
         this._cursor = Math.max(startPos, end)
-        this._remoteBusy = false
+        this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
       }

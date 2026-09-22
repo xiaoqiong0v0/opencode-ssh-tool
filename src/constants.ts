@@ -67,4 +67,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  */
-export const SERVER_PROTO_VERSION = 12
+export const SERVER_PROTO_VERSION = 13

@@ -2,7 +2,7 @@
 // 服务不随任何 opencode 插件进程退出而关闭，多进程共享同一服务。
 // 服务版本由 server.json 的 proto 字段标识，版本不符时杀掉旧进程重启，防止持久进程跑旧代码。
 
-import { mkdirSync, readFileSync, rmSync } from "node:fs"
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawn, type ChildProcess } from "node:child_process"
@@ -33,6 +33,12 @@ interface ServerInfo {
 
 const LOCK_DIR = "server.lock"
 const INFO_FILE = "server.json"
+/** 锁目录内的属主信息文件名（pid + 创建时间，用于判定陈旧锁） */
+const LOCK_OWNER = "owner.json"
+/** 锁存在但无属主信息（崩溃于 mkdir 与写属主之间）时，超过此毫秒视为陈旧 */
+const LOCK_NOINFO_STALE_MS = 5_000
+/** 锁存在且有属主信息、但持有者长时间未完成启动时的绝对陈旧上限（启动上限 SPAWN_WAIT_MAX=15s） */
+const LOCK_ABS_STALE_MS = 60_000
 const PROBE_TIMEOUT = 800
 const LOCK_WAIT_MAX = 5000
 /** 子进程启动后等待端口就绪的上限 */
@@ -65,6 +71,92 @@ function readInfo(dir: string): ServerInfo | null {
 /** 该服务实例代码/协议是否与当前版本一致（无 proto 字段视为旧实例） */
 function isCurrentVersion(info: ServerInfo | null): boolean {
   return info != null && info.proto === SERVER_PROTO_VERSION
+}
+
+/** 锁属主信息（进程 pid + 创建时间） */
+interface LockOwner {
+  pid: number
+  ts: number
+}
+
+/**
+ * 进程是否存活（signal 0 探测；EPERM 表示存在但无权限，视为存活）
+ * @param pid 进程号
+ * @returns 是否存活
+ */
+function isAlive(pid: number): boolean {
+  if (!pid || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/** 读取锁属主信息（缺失/损坏返回 null） */
+function readLockOwner(lockPath: string): LockOwner | null {
+  try {
+    const o = JSON.parse(readFileSync(join(lockPath, LOCK_OWNER), "utf8")) as LockOwner
+    return typeof o?.pid === "number" ? o : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 清理陈旧服务锁：持有者崩溃/被 kill 不会走 finally 释放锁，必须能自愈，
+ * 否则残留的 server.lock 目录会让后续 ensureServer 永远拿不到锁、服务再也起不来。
+ * 判定：有属主信息 → 属主进程已死或锁超绝对上限；无属主信息 → 超过 LOCK_NOINFO_STALE_MS。
+ * @param lockPath 锁目录路径
+ * @returns 是否已清理（锁不存在也返回 false，交由调用方重试 mkdir）
+ */
+function clearStaleLock(lockPath: string): boolean {
+  let mtime = 0
+  try {
+    mtime = statSync(lockPath).mtimeMs
+  } catch {
+    return false // 锁已不存在
+  }
+  const owner = readLockOwner(lockPath)
+  const age = Date.now() - (owner?.ts ?? mtime)
+  const stale = owner
+    ? !isAlive(owner.pid) || age > LOCK_ABS_STALE_MS
+    : age > LOCK_NOINFO_STALE_MS
+  if (!stale) return false
+  try {
+    rmSync(lockPath, { recursive: true, force: true })
+  } catch {
+    return false
+  }
+  log.info(`清理陈旧服务锁 server.lock（属主 pid=${owner?.pid ?? "?"}，age=${Math.round(age / 1000)}s）`)
+  return true
+}
+
+/**
+ * 尝试获取服务锁（mkdir 原子）：创建成功则写入属主信息；
+ * 失败先尝试清理陈旧锁再重试一次（持有者崩溃的场景）。
+ * @param dir 缓存目录
+ * @returns 是否拿到锁
+ */
+function acquireLock(dir: string): boolean {
+  const lockPath = join(dir, LOCK_DIR)
+  const create = (): boolean => {
+    try {
+      mkdirSync(lockPath)
+    } catch {
+      return false
+    }
+    try {
+      writeFileSync(join(lockPath, LOCK_OWNER), JSON.stringify({ pid: process.pid, ts: Date.now() }), "utf8")
+    } catch {
+      /* 属主信息写失败不影响持锁，仅失去陈旧判定依据 */
+    }
+    return true
+  }
+  if (create()) return true
+  if (!clearStaleLock(lockPath)) return false
+  return create()
 }
 
 /**
@@ -122,14 +214,13 @@ export async function ensureServer(
     }
   }
 
-  // 2. 尝试拿锁（mkdir 原子操作：谁先创建成功谁启动）
+  // 2. 尝试拿锁（mkdir 原子操作：谁先创建成功谁启动）；陈旧锁（持有者崩溃残留）自动清理后重试
   const lockPath = join(dir, LOCK_DIR)
-  try {
-    mkdirSync(lockPath)
-  } catch {
-    // 锁被占用：等待后探测；若发现旧版本实例先杀掉，等待持有者 spawn 新版
+  let acquired = acquireLock(dir)
+  if (!acquired) {
+    // 锁被活跃持有者占用：等待其启动服务；期间锁若变陈旧（持有者退出）则抢占
     const deadline = Date.now() + LOCK_WAIT_MAX
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !acquired) {
       await new Promise((r) => setTimeout(r, 200))
       const info = readInfo(dir)
       if (info && isCurrentVersion(info) && (await probe(info.port))) {
@@ -138,8 +229,9 @@ export async function ensureServer(
       if (info && !isCurrentVersion(info) && (await probe(info.port))) {
         await killStale(info)
       }
+      acquired = acquireLock(dir)
     }
-    return { server: null, url: "", port: 0, reused: false }
+    if (!acquired) return { server: null, url: "", port: 0, reused: false }
   }
 
   try {

@@ -12,8 +12,8 @@ export interface AgentSession {
   hasRunningStream(): boolean
   getRunningStream(): { data: string; done: boolean }
   getRunningCommand(): string
-  /** 按当前 shell 续行规则拆分多行命令为独立命令 */
-  splitCommand(command: string): string[]
+  /** 设置是否保持 busy（排队序列期间为 true，最后一条完成才清） */
+  setHoldBusy(hold: boolean): void
   /** 设置命令生命周期监听器（cmdStart/cmdDone 事件源） */
   setLifecycle(listener: ((ev: { type: "start"; command: string; ts: number } | { type: "done"; exitCode: number | null; endTs: number; output?: string }) => void) | null): void
   /** 读取原始字节流增量 */
@@ -76,7 +76,9 @@ export function startAgent(
         if (ev.output) {
           send({ type: "out", sessionID: sid, name, data: ev.output, final: true })
         }
-        send({ type: "cmdDone", sessionID: sid, name, exitCode: ev.exitCode, endTs: ev.endTs })
+        // 排队序列：队列里还有后续命令 → more=true，server 据此保持 busy=true（中间不闪 false）
+        const more = (execQueue.get(key)?.length ?? 0) > 0
+        send({ type: "cmdDone", sessionID: sid, name, exitCode: ev.exitCode, endTs: ev.endTs, more })
         // 出队下一条命令由 execQueued 在 promise resolve 后处理（见上），此处不再重复出队
       }
     })
@@ -91,6 +93,8 @@ export function startAgent(
       return Promise.resolve()
     }
     const key = `${sid}:${name}`
+    /** 队列是否还有后续命令（排队命令）→ 决定 server 是否保持 busy */
+    const hasMore = (): boolean => (execQueue.get(key)?.length ?? 0) > 0
     return session.exec(command).then((result) => {
       // exec 同步等待：正常完成/动画等待均会触发生命周期 done（cmdDone）。
       // 仅 quick-fail（busy/未连接，返回 {ok:false}）不会发 done —— 补一条兜底防 server busy 卡死
@@ -98,23 +102,26 @@ export function startAgent(
         // 失败（busy/未连接/引号不闭合等）：把错误文本作为输出回传，web 端可见失败原因
         const err = (result as { error?: string }).error
         if (err) send({ type: "out", sessionID: sid, name, data: err, final: true })
-        send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
+        send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now(), more: hasMore() })
       }
       // 出队下一条：此刻上一条已完成，running context 已清理（resolve 在 lifecycle done 之后）
       const q = execQueue.get(key)
       const next = q?.shift()
       if (q && q.length === 0) execQueue.delete(key)
       if (next) { log.info(`agent 队列出队执行 ${sid}/${name}: ${next}`); return execQueued(sid, name, next) }
+      // 队列已空：排队序列结束，放开 busy 保持
+      resolveSession(sid, name)?.setHoldBusy(false)
       return
     }).catch((e) => {
       log.error(`代理执行失败 ${sid}/${name}`, e instanceof Error ? e.message : String(e))
       // 命令未运行（异常）：补充 cmdDone 兜底（正常完成由生命周期上报，server 幂等）
-      send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
+      send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now(), more: hasMore() })
       // 异常也应继续出队下一条，避免队列卡死
       const q = execQueue.get(key)
       const next = q?.shift()
       if (q && q.length === 0) execQueue.delete(key)
       if (next) { log.info(`agent 队列异常后出队 ${sid}/${name}: ${next}`); return execQueued(sid, name, next) }
+      resolveSession(sid, name)?.setHoldBusy(false)
       return
     })
   }
@@ -173,6 +180,13 @@ export function startAgent(
         const now = Date.now()
         const last = lastSubmitTs.get(key) ?? 0
         lastSubmitTs.set(key, now)
+        // 排队序列执行中（队列非空）：新命令排队，等序列结束再执行；
+        // 不能走 send（那是给交互程序的输入），也不能直接 exec（hold busy 会 quick-fail）
+        if ((execQueue.get(key)?.length ?? 0) > 0) {
+          execQueue.get(key)!.push(command)
+          log.info(`agent run-exec 序列中排队 ${sid}/${name}: ${command} (队列 ${execQueue.get(key)!.length})`)
+          return
+        }
         if (session.hasRunningStream()) {
           if (now - last < INTERACTIVE_BUSY_MS) {
             const q = execQueue.get(key)
@@ -183,23 +197,6 @@ export function startAgent(
           }
           log.info(`agent run-exec busy 超阈值按交互输入 ${sid}/${name}: ${command}`)
           session.send(command + "\r")
-          return
-        }
-        // 多行命令：终端空闲（非交互）时按 shell 续行规则拆成多个独立命令逐条执行（每条独立注入 marker
-        // 进 history，避免整段作为一条执行导致多行回显/多行 marker 剥离困难）；busy（交互中）则不拆，
-        // 整体交给上面的分流逻辑原样处理。
-        const lines = session.splitCommand(command)
-        if (!session.hasRunningStream() && lines.length > 1) {
-          log.info(`agent run-exec 多行拆分 ${sid}/${name}: ${command.split("\n").length} 行 → ${lines.length} 条`)
-          for (const [i, c] of lines.entries()) {
-            if (i === 0) void execQueued(sid, name, c)
-            else {
-              // 循环内每次重新取队列引用：首次用 set 建数组后，后续用 push 追加（避免 set 覆盖丢命令）
-              const q = execQueue.get(key)
-              if (q) q.push(c)
-              else execQueue.set(key, [c])
-            }
-          }
           return
         }
         log.info(`agent run-exec 直接执行 ${sid}/${name}: ${command}`)

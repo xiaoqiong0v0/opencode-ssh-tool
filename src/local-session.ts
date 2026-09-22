@@ -31,6 +31,9 @@ export class LocalSession extends BaseSession {
   private _proc: Bun.Subprocess | null = null
   private _program = ""
 
+  /** Windows ConPTY（本地/容器会话）裸 \n 不提交行，多行命令须用 \r 分隔 */
+  protected override _lineSep = "\r"
+
   protected get _extraResult(): Partial<ExecResult> { return {} }
 
   protected _ready(): boolean {

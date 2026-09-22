@@ -105,6 +105,8 @@ export function startServer(
   const streamBuf = new Map<string, StreamBufEntry>()
   const rawBuf = new Map<string, { data: string; pos: number }>()
   const cmdCount = new Map<string, number>()
+  /** 排队序列保持 busy 的 key（agent 报 more=true 加入，最后一条 done 移除） */
+  const seqHold = new Set<string>()
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -187,7 +189,8 @@ export function startServer(
         b.endTs = now
         finalizeCommand(key)
       }
-      liveBusy.set(key, !!b && !b.done)
+      if (!agentBySession.has(key)) seqHold.delete(key) // agent 已消失：清排队序列 busy 保持
+      liveBusy.set(key, (!!b && !b.done) || seqHold.has(key))
     }
     for (const s of states) {
       if (s.connected && !liveKey.has(sessionKey(s.sessionID, s.name))) {
@@ -309,6 +312,7 @@ export function startServer(
         const command = typeof msg.command === "string" ? msg.command : ""
         if (!sid || !command) return
         const k = sessionKey(sid, name)
+        seqHold.delete(k) // 新命令开始：本条正在运行，busy 由 streamBuf 反映
         const existing = streamBuf.get(k)
         streamBuf.set(k, {
           data: existing && existing.done ? "" : existing?.data ?? "",
@@ -367,6 +371,9 @@ export function startServer(
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid) return
         const k = sessionKey(sid, name)
+        // 排队序列：agent 报 more=true（队列还有后续命令）→ 保持 busy，直到最后一条 done
+        if (msg.more === true) seqHold.add(k)
+        else seqHold.delete(k)
         const b = streamBuf.get(k)
         if (b) {
           if (b.done) return // 幂等：同一命令只收尾一次
@@ -625,8 +632,10 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
 }
 
 /**
- * 从历史消息对重建原始字节流（raw 视图）：拼接所有命令对为 `命令\n输出` 流。
+ * 从历史消息对重建原始字节流（raw 视图）：拼接所有命令对为 `命令\r\n输出` 流。
  * 离线历史会话无实时 rawBuf 时供 raw 模式显示。
+ * 注意：命令文本（`command` 字段）换行是裸 `\n`，须规范成 `\r\n`，否则 xterm 只换行不复位、渲染成阶梯错位；
+ * 输出（`output` 字段）是原始字节本就带 `\r\n`，保持保真不改写。
  * @param pairs 历史命令/输出对（snapshot 基线）
  * @returns 重建的原始流
  */
@@ -634,7 +643,7 @@ function buildRawFromHistory(pairs: TranscriptPair[]): string {
   let raw = ""
   for (const p of pairs) {
     if (p.type === "cmd") {
-      raw += p.text + "\r\n"
+      raw += p.text.replace(/\r?\n/g, "\r\n") + "\r\n"
     } else if (p.type === "out" || p.type === "run") {
       raw += p.text
       // 输出末段若未换行则补一个换行，分隔下一条命令
