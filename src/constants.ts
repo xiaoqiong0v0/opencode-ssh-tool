@@ -36,6 +36,9 @@ export const INJECT_TIMEOUT_MS = 30_000
 export const PTY_ROWS = 40
 export const PTY_COLS = 120
 
+/** 屏幕模拟保留的 scrollback 行数（模型侧 toModelText 与浏览器侧 headless 渲染一致） */
+export const TERM_SCROLLBACK_LINES = 2000
+
 /** 单次工具返回输出上限（字节） */
 export const MAX_OUTPUT_LEN = 50_000
 

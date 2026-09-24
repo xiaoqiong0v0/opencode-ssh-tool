@@ -391,7 +391,10 @@ export const OpenCodeSshTool: Plugin = async () => {
     const direction = values.head ? "head" : "tail"
     const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
     const includeCommand = values.includeCommand ?? false
-    const text = selected.map((p) => (includeCommand ? `$ ${p.command}\n` : "") + toModelText(history.readOutput(p))).join("\n")
+    // 逐条顺序处理（toModelText 内部 headless write 为异步，不能放在同步 map 中）
+    const parts: string[] = []
+    for (const p of selected) parts.push((includeCommand ? `$ ${p.command}\n` : "") + await toModelText(history.readOutput(p)))
+    const text = parts.join("\n")
     const browserLine = httpUrl ? tr("browser_full_record", toolLang).replace("{url}", httpUrl) : tr("server_not_enabled", toolLang)
     return `${tr(direction === "tail" ? "history_title" : "history_title_head", toolLang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
   }

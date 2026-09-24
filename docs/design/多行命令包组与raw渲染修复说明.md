@@ -1,7 +1,8 @@
 # 多行命令包组与 raw 渲染修复说明
 
 > 本文件为变更说明文档，记录五项改动：多行命令统一包组（删除多行拆分）、离线会话 raw 阶梯错位修复、
-> 本地/容器会话（Windows ConPTY）多行命令乱序修复、续行/完整性检测修正、服务锁陈旧自愈。
+> 多行命令写入行分隔符按探测到的 shell 类型/平台修复（ConPTY 用 `\r`，含 SSH→Windows pwsh/cmd）、
+> 续行/完整性检测修正、服务锁陈旧自愈。
 > 基线文档 `结构设计.md` / `方案分析.md` 按本文件回填；`终端渲染与尺寸固定说明.md` 的 **G10「heredoc 感知拆分」做法已被本文件 §2 取代**（详见 §9）。
 
 ## 1. 背景
@@ -92,33 +93,43 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 
 `SERVER_PROTO_VERSION` **12 → 13**。server 代码变更须提升协议版本，`ensureServer` 才会替换旧 server 进程，否则改动不生效。
 
-## 4. 本地/容器会话（Windows ConPTY）多行命令乱序修复
+## 4. 多行命令行分隔符：按探测到的 shell 类型/平台（Windows ConPTY）
 
 ### 现象
 
-本地 pwsh 会话里多行命令行序错乱、停在 `>>` 续行提示、随后被中断。
+本地 pwsh 会话里多行命令行序错乱、停在 `>>` 续行提示、随后被中断；
+同一问题也出现在 **SSH 连到 Windows 上的 pwsh/cmd**（实测：多行命令逆序执行并卡在 `>>`）。
 
 ### 根因
 
-**ConPTY 下裸 `\n` 不提交行**（需 `\r`）；而 SSH 的 Unix PTY 下裸 `\n` 可以正常提交。已实测两者行为差异。
+**ConPTY 下裸 `\n` 不提交行**（需 `\r`）；而 **Unix PTY**（POSIX shell）下裸 `\n` 可以正常提交。已实测两者行为差异。
 §2 包组后，组语法内部依赖换行真正提交行，ConPTY 场景下 `\n` 不提交 → 包组失效并错乱。
 
-### 修复：匹配形式与写入形式解耦
+关键点：行分隔符取决于 **shell 运行在哪种控制台（ConPTY 还是 Unix PTY）**，即**按探测到的 shell 类型/平台**决定，
+而**非按传输类型（本地 / SSH）**。初版把规则写成「本地 → `\r`、SSH → `\n`」，导致 **SSH→Windows pwsh/cmd 被判成 `\n`**
+→ 与本地 ConPTY 一样不提交行 → 多行逆序卡死。
 
-组合文本分两种形式，`_lineSep` 改写**只发生在写入形式**：
+### 修复：匹配形式与写入形式解耦 + 按 shell 类型选写入分隔符
+
+组合文本分两种形式，行分隔符改写**只发生在写入形式**：
 
 | 成员 | 位置 | 职责 |
 |---|---|---|
-| `_composeEchoText(command)` | `src/base-session.ts` | **规范形式（恒 `\n` 分行、无尾部回车）**：包组 + 标记同行拼接；供 `extractOutputStart` 按 `\n` 切行、段间宽松匹配跳过 `>>` / `>` 续行提示 |
-| `_composeCommand(command)` | `src/base-session.ts` | **写入 PTY 形式**：`_composeEchoText(...).replace(/\n/g, this._lineSep) + "\r"` |
-| `_lineSep` | `BaseSession` 默认 `"\n"`（Unix PTY） | 写入 PTY 的行分隔符；`src/local-session.ts` 覆盖为 `"\r"`（Windows ConPTY） |
+| `_composeEchoText(command)` | `src/base-session.ts` | **规范形式（恒 `\n` 分行、无尾部回车）**：包组 + 标记同行拼接；供 `extractOutputStart` 按 `\n` 切行、段间宽松匹配跳过 `>>` / `>` 续行提示。**不随 shell 类型改变**（匹配用） |
+| `_composeCommand(command)` | `src/base-session.ts` | **写入 PTY 形式**：`const sep = this._adapter?.windowsShell ? "\r" : this._lineSep`，再 `_composeEchoText(...).replace(/\n/g, sep) + "\r"` |
+| `ShellAdapter.windowsShell` | `src/shell-adapter.ts` | 该 shell 是否运行在 Windows 控制台（ConPTY）：pwsh / cmd → `true`（写入须 `\r`）；zsh / bash → `false`（`\n` 可正常提交） |
+| `_lineSep` | `BaseSession` 默认 `"\n"` | **回退值**（无 `windowsShell` 判定时用）：SSH + POSIX 走 Unix PTY → `\n`；`src/local-session.ts` 覆盖为 `"\r"`（本地 ConPTY，adapter 尚未探测/为 null 时兜底） |
 
-**为何必须解耦（实测）**：初版实现是在 `_composeEchoText` 返回前把 `\n` 替换为 `_lineSep`——
-本地会话（`\r`）下组合文本不含任何 `\n`，`extractOutputStart` 按 `\n` 切行时整段成为一行，
+**行分隔符判定规则（最终）**：Windows shell（pwsh/cmd，ConPTY）→ `\r`；本地会话（ConPTY）→ `\r`；SSH + POSIX（Unix PTY）→ `\n`。
+
+**为何必须解耦（实测）**：初版实现是在 `_composeEchoText` 返回前把 `\n` 替换为行分隔符——
+`\r` 场景下组合文本不含任何 `\n`，`extractOutputStart` 按 `\n` 切行时整段成为一行，
 段间宽松匹配失效 → **命令回显剥离失败**（本地 pwsh 多行命令的 history 里带着整段回显与会话残留噪音）。
 解耦后实测：本地 pwsh 多行命令返回纯 `x=7 loc=D:\tmp`，history 记一条。
 
 实测：本地 pwsh 用 `\r` 后行序正确、组内作用域保留、marker 正常。
+实测（SSH→Windows pwsh）：用 `\n` 分隔时命令逆序卡死；改按 `windowsShell` 选 `\r` 后行序正确、组内作用域保留、输出正常。
+脚本 `.tmp/check-winshell.mjs` 断言 15 项全 PASS（adapter 取值 + `_composeCommand` 分隔符）。
 
 ## 5. 续行/完整性检测修正
 
@@ -186,7 +197,8 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 | 项 | 值 | 说明 |
 |---|---|---|
 | `SERVER_PROTO_VERSION` | `12` → `13` | server 代码变更（§3），须提升版本以触发旧 server 进程替换 |
-| `_lineSep`（`BaseSession`） | `"\n"`（SSH）/ `"\r"`（`LocalSession`） | 写入 PTY 的行分隔符，仅 `_composeCommand` 使用；`_composeEchoText` 恒为规范 `\n`（§4） |
+| `ShellAdapter.windowsShell` | `true`（pwsh/cmd）/ `false`（zsh/bash） | 该 shell 是否运行在 Windows 控制台（ConPTY）；`_composeCommand` 据此决定写入行分隔符 |
+| `_lineSep`（`BaseSession`） | 默认 `"\n"`（SSH+POSIX）/ `"\r"`（`LocalSession` 覆盖） | 行分隔符**回退值**：仅当 `windowsShell` 不为 `true` 时由 `_composeCommand` 采用；`_composeEchoText` 恒为规范 `\n`（§4） |
 | `LOCK_OWNER` | `owner.json` | 锁属主文件名（`pid` + `ts`） |
 | `LOCK_NOINFO_STALE_MS` | `5_000` | 无属主信息的锁视为陈旧的空闲时长 |
 | `LOCK_ABS_STALE_MS` | `60_000` | 有属主信息的锁的绝对上限 |
@@ -195,8 +207,8 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 
 | 文件 | 改动 |
 |---|---|
-| `src/base-session.ts` | 新增 `_composeEchoText`（多行包组 + 标记同行拼接，恒返回规范 `\n` 匹配形式）；新增 `_composeCommand`（写入形式：`\n` → `_lineSep` + 尾 `\r`）；新增 `protected _lineSep`；删除 `splitCommand` |
-| `src/shell-adapter.ts` | 接口新增 `stmtSep` / `groupWrap`，4 个适配器实现；删除 `splitCommand`、`splitByContinuation`、`hasHeredoc`；重写 3 个 `*OpenContinuation` 检测（注释 / heredoc 闭合 / 括号深度 / here-string，见 §5），`heredocDelim` 改逐字符引号感知，新增 `isPosixCommentStart`、`pwshHereStringStart` |
+| `src/base-session.ts` | 新增 `_composeEchoText`（多行包组 + 标记同行拼接，恒返回规范 `\n` 匹配形式）；新增 `_composeCommand`（写入形式：行分隔符 `= windowsShell ? "\r" : _lineSep`，`\n` → 该分隔符 + 尾 `\r`）；新增 `protected _lineSep`；删除 `splitCommand` |
+| `src/shell-adapter.ts` | 接口新增 `stmtSep` / `windowsShell` / `groupWrap`，4 个适配器实现（`windowsShell`：pwsh/cmd → `true`，zsh/bash → `false`）；删除 `splitCommand`、`splitByContinuation`、`hasHeredoc`；重写 3 个 `*OpenContinuation` 检测（注释 / heredoc 闭合 / 括号深度 / here-string，见 §5），`heredocDelim` 改逐字符引号感知，新增 `isPosixCommentStart`、`pwshHereStringStart` |
 | `src/agent.ts` | 删除 `AgentSession.splitCommand` 声明与 `run-exec` 多行拆分分支 |
 | `src/local-session.ts` | 覆盖 `_lineSep = "\r"` |
 | `src/server.ts` | `buildRawFromHistory` cmd 分支行尾规范化（`\r?\n` → `\r\n`） |
@@ -218,7 +230,6 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 | 项 | 说明 |
 |---|---|
 | 续行检测自身限制 | 控制关键字结构（`if…then` 缺 `fi` 等）不检测、同一行多个 heredoc 只跟第一个、拒绝文案通用——详见 §5 已知限制 |
-| SSH 连到 **Windows 上的 pwsh / cmd** | 仍走 SSH 路径的 `_lineSep = "\n"`，理论上可能出现与 §4 相同的行序问题。**未实测**（无该场景目标），若复现则需按探测到的远端 OS 覆盖 `_lineSep` |
 | cmd 多行命令 | 不包组（`groupWrap` 返回 `null`），仍为逐行执行，中间输出丢失问题在 cmd 下**未解决**；仅完成标记因 `stmtSep = "&"` 而恢复正常 |
 | 包组的副作用 | 整段多行成为一条命令后，`history` 记录为一条（含组语法），与逐行执行的记录形态不同 |
 | `owner.json` 写入失败 | 不影响持锁，仅失去属主判定依据，退化为「无属主 → 超 5s 即清理」路径 |

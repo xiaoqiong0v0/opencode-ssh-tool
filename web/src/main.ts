@@ -1,6 +1,8 @@
-// 前端入口：纯 WebSocket 驱动（无 HTTP 轮询/断线重连），raw 模式 xterm.js 渲染、transcript 用 TermScreen
+// 前端入口：纯 WebSocket 驱动（无 HTTP 轮询/断线重连），raw 模式 xterm.js 渲染、transcript 用 HeadlessScreen
 
 import { Terminal } from "@xterm/xterm"
+import { Terminal as HeadlessTerminal } from "@xterm/headless"
+import type { IBufferCell, Terminal as HeadlessTerminalType } from "@xterm/headless"
 
 interface I18n {
   commands: string
@@ -49,13 +51,6 @@ function parseOutput(raw: string): { text: string; exitCode?: number } {
   return { text: raw }
 }
 
-interface GridCell {
-  ch: string
-  fg: string | null
-  bg: string | null
-  bold: boolean
-}
-
 const I18N: I18n = (window as unknown as { __I18N__: I18n }).__I18N__
 const PTY_COLS: number = (window as unknown as { __PTY_COLS__: number }).__PTY_COLS__ || 120
 const PTY_ROWS: number = (window as unknown as { __PTY_ROWS__: number }).__PTY_ROWS__ || 40
@@ -63,193 +58,178 @@ const PTY_ROWS: number = (window as unknown as { __PTY_ROWS__: number }).__PTY_R
 const ANSI_BASE = ["#010101", "#de382b", "#39b54a", "#ffc005", "#006fb8", "#762671", "#2cb3e9", "#c9d1d9"]
 const ANSI_BRIGHT = ["#666666", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#f0f6fc"]
 
-class TermScreen {
-  private cols: number
-  private grid: GridCell[][] = []
-  private r = 0
-  private c = 0
-  private fg: string | null = null
-  private bg: string | null = null
-  private bold = false
-  private sr = 0 // 保存的光标行（ESC 7 / CSI s）
-  private sc = 0 // 保存的光标列
-  private altGrid: GridCell[][] | null = null // 备屏保存（CSI ?1049h/l）
+/** headless 模拟保留的 scrollback 行数（与模型侧 TERM_SCROLLBACK_LINES 一致） */
+const SCROLLBACK_LINES = 2000
 
+/** headless 写入回调等待上限（毫秒）：超时按已解析内容渲染，避免极端情况下界面卡死 */
+const WRITE_TIMEOUT_MS = 10_000
+
+/** 256 色中 16..231 色立方每通道取值 */
+const COLOR_CUBE_STEPS = [0, 95, 135, 175, 215, 255]
+
+/**
+ * 8 位分量转 #rrggbb
+ * @param r 红分量 0-255
+ * @param g 绿分量 0-255
+ * @param b 蓝分量 0-255
+ * @returns #rrggbb
+ */
+function rgbHex(r: number, g: number, b: number): string {
+  const h = (n: number): string => n.toString(16).padStart(2, "0")
+  return "#" + h(r) + h(g) + h(b)
+}
+
+/**
+ * xterm 调色板索引转 CSS 颜色：0-7 基本色、8-15 亮色（复用既有调色板常量），
+ * 16-231 为 6×6×6 色立方，232-255 为灰度阶；越界返回 null（按默认色处理）
+ * @param index 调色板索引
+ * @returns #rrggbb 或 null
+ */
+function paletteColor(index: number): string | null {
+  if (index >= 0 && index < 8) return ANSI_BASE[index]
+  if (index >= 8 && index < 16) return ANSI_BRIGHT[index - 8]
+  if (index >= 16 && index < 232) {
+    const n = index - 16
+    return rgbHex(COLOR_CUBE_STEPS[Math.floor(n / 36)], COLOR_CUBE_STEPS[Math.floor((n % 36) / 6)], COLOR_CUBE_STEPS[n % 6])
+  }
+  if (index >= 232 && index < 256) {
+    const gray = 8 + (index - 232) * 10
+    return rgbHex(gray, gray, gray)
+  }
+  return null
+}
+
+/**
+ * 取单元格前景色
+ * @param cell headless buffer 单元格
+ * @returns #rrggbb；默认色返回 null（表示不设 style）
+ */
+function cellFg(cell: IBufferCell): string | null {
+  if (cell.isFgDefault()) return null
+  const c = cell.getFgColor()
+  return cell.isFgPalette() ? paletteColor(c) : rgbHex((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff)
+}
+
+/**
+ * 取单元格背景色
+ * @param cell headless buffer 单元格
+ * @returns #rrggbb；默认色返回 null（表示不设 style）
+ */
+function cellBg(cell: IBufferCell): string | null {
+  if (cell.isBgDefault()) return null
+  const c = cell.getBgColor()
+  return cell.isBgPalette() ? paletteColor(c) : rgbHex((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff)
+}
+
+/**
+ * 浏览器端屏幕模拟：基于 @xterm/headless 复刻真实终端语义（光标/清行/覆盖/SGR/备屏/scrollback）。
+ * write 串行排队保证顺序与最终一致；render 读取 buffer.active 逐 cell 生成带样式的 HTML 行。
+ */
+class HeadlessScreen {
+  private term: HeadlessTerminalType
+  /** 写入串行队列：上一段写入完成后再写下一段 */
+  private queue: Promise<void> = Promise.resolve()
+  /** 是否已释放（释放后写入与渲染均为空操作） */
+  private disposed = false
+
+  /**
+   * @param cols 终端列数（固定 PTY_COLS）
+   */
   constructor(cols: number) {
-    this.cols = cols
+    this.term = new HeadlessTerminal({
+      cols,
+      rows: PTY_ROWS,
+      scrollback: SCROLLBACK_LINES,
+      allowProposedApi: true,
+    })
   }
 
-  private _row(r: number): GridCell[] {
-    while (this.grid.length <= r) {
-      const row: GridCell[] = []
-      for (let i = 0; i < this.cols; i++) row.push({ ch: " ", fg: null, bg: null, bold: false })
-      this.grid.push(row)
-    }
-    return this.grid[r]
+  /**
+   * 串行写入一段原始输出
+   * @param text 原始输出（含 ANSI）
+   * @returns Promise：本段解析落屏后兑现
+   */
+  write(text: string): Promise<void> {
+    this.queue = this.queue.then(() => this.writeOnce(text))
+    return this.queue
   }
 
-  private _put(ch: string): void {
-    const row = this._row(this.r)
-    row[this.c] = { ch, fg: this.fg, bg: this.bg, bold: this.bold }
-    this.c++
-    if (this.c >= this.cols) {
-      this.c = 0
-      this.r++
-    }
+  /**
+   * 单次写入并等待 write 回调
+   * @param text 原始输出（含 ANSI）
+   * @returns Promise：回调触发或超时后兑现（已释放则立即兑现）
+   */
+  private writeOnce(text: string): Promise<void> {
+    if (this.disposed) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      let settled = false
+      const done = (): void => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      const timer = setTimeout(done, WRITE_TIMEOUT_MS)
+      this.term.write(text, () => {
+        clearTimeout(timer)
+        done()
+      })
+    })
   }
 
-  write(text: string): void {
-    let i = 0
-    const n = text.length
-    while (i < n) {
-      const ch = text[i]
-      if (ch === "\x1b") {
-        if (i + 1 < n && text[i + 1] === "]") {
-          let j = i + 2
-          while (j < n && text[j] !== "\x07" && !(text[j] === "\x1b" && text[j + 1] === "\\")) j++
-          if (j >= n) break
-          i = text[j] === "\x07" ? j + 1 : j + 2
-          continue
-        }
-        if (i + 1 < n && text[i + 1] === "[") {
-          let j = i + 2
-          const start = j
-          while (j < n && !/[A-Za-z@]/.test(text[j])) j++
-          if (j >= n) break
-          this._csi(text.slice(start, j), text[j])
-          i = j + 1
-          continue
-        }
-        if (text[i + 1] === "7") { this.sr = this.r; this.sc = this.c; i += 2; continue }
-        if (text[i + 1] === "8") { this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc; i += 2; continue }
-        i += 2
-        continue
-      }
-      if (ch === "\r") { this.c = 0; i++; continue }
-      if (ch === "\n") { this.r++; this.c = 0; i++; continue }
-      if (ch === "\b") { if (this.c > 0) this.c--; i++; continue }
-      if (ch === "\t") {
-        this.c = (Math.floor(this.c / 8) + 1) * 8
-        if (this.c >= this.cols) { this.c = 0; this.r++ }
-        i++
-        continue
-      }
-      if (ch.charCodeAt(0) < 32) { i++; continue }
-      this._put(ch)
-      i++
-    }
-  }
-
-  private _csi(body: string, final: string): void {
-    const b = body.replace(/^[?]/, "")
-    if (final === "m") {
-      const codes = b ? b.split(";").map((x) => parseInt(x, 10)) : [0]
-      if (!b || codes.indexOf(0) >= 0) { this.fg = null; this.bg = null; this.bold = false }
-      for (const code of codes) {
-        if (code === 1) this.bold = true
-        else if (code === 22) this.bold = false
-        else if (code >= 30 && code <= 37) this.fg = ANSI_BASE[code - 30]
-        else if (code === 39) this.fg = null
-        else if (code >= 90 && code <= 97) this.fg = ANSI_BRIGHT[code - 90]
-        else if (code >= 40 && code <= 47) this.bg = ANSI_BASE[code - 40]
-        else if (code === 49) this.bg = null
-        else if (code >= 100 && code <= 107) this.bg = ANSI_BRIGHT[code - 100]
-      }
-      return
-    }
-    const p = (d: string): number => { const v = parseInt(d, 10); return Number.isFinite(v) && v > 0 ? v : 1 }
-    const va = (d: string): number => { const v = parseInt(d, 10); return Number.isFinite(v) && v >= 0 ? v : 0 }
-    if (final === "A") this.r = Math.max(0, this.r - p(b))
-    else if (final === "B") this.r += p(b)
-    else if (final === "C") this.c = Math.min(this.cols - 1, this.c + p(b))
-    else if (final === "D") this.c = Math.max(0, this.c - p(b))
-    else if (final === "H" || final === "f") {
-      const m = b.split(";")
-      this.r = p(m[0]) - 1
-      this.c = p(m[1]) - 1
-    }
-    else if (final === "G" || final.charCodeAt(0) === 96) this.c = Math.max(0, p(b) - 1)
-    else if (final === "d") this.r = Math.max(0, p(b) - 1)
-    else if (final === "J") {
-      const mode = va(b)
-      if (mode === 2 || mode === 3) {
-        for (let ri = 0; ri < this.grid.length; ri++) {
-          const row = this._row(ri)
-          for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-        }
-        this.r = 0
-        this.c = 0
-      } else if (mode === 1) {
-        for (let ri = 0; ri <= this.r; ri++) {
-          const row = this._row(ri)
-          const end = ri === this.r ? this.c : this.cols
-          for (let ci = 0; ci < end; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-        }
-      } else {
-        for (let ri = this.r; ri < this.grid.length; ri++) {
-          const row = this._row(ri)
-          const start = ri === this.r ? this.c : 0
-          for (let ci = start; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-        }
-      }
-    } else if (final === "K") {
-      const mode = va(b)
-      const row = this._row(this.r)
-      if (mode === 2) {
-        for (let ci = 0; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-      } else if (mode === 1) {
-        for (let ci = 0; ci <= this.c; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-      } else {
-        for (let ci = this.c; ci < this.cols; ci++) row[ci] = { ch: " ", fg: null, bg: null, bold: false }
-      }
-    }
-    else if (final === "s") { this.sr = this.r; this.sc = this.c }
-    else if (final === "u") { this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc }
-    else if ((final === "h" || final === "l") && body.startsWith("?")) {
-      const mode = va(body.slice(1).split(";")[0])
-      if (mode === 1049) {
-        if (final === "h") {
-          this.altGrid = this.grid.map((row) => row.slice())
-          this.sr = this.r; this.sc = this.c
-          this.grid = []
-          this.r = 0; this.c = 0
-        } else if (this.altGrid) {
-          this.grid = this.altGrid
-          this.altGrid = null
-          this.r = Math.min(this.sr, this.grid.length - 1); this.c = this.sc
-        }
-      }
-    }
-  }
-
+  /**
+   * 渲染当前屏幕（含 scrollback）为 HTML 行数组：仅返回非空行，行尾去尾空白，
+   * 逐 cell 取字符/颜色/粗体并合并相邻同一样式
+   * @returns HTML 行字符串数组（内容已转义）
+   */
   render(): string[] {
+    if (this.disposed) return []
     const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    const buf = this.term.buffer.active
     const out: string[] = []
-    for (let ri = 0; ri < this.grid.length; ri++) {
-      const row = this.grid[ri]
-      let last = this.cols
-      while (last > 0 && row[last - 1].ch === " ") last--
+    for (let ri = 0; ri < buf.length; ri++) {
+      const line = buf.getLine(ri)
+      if (!line) continue
+      // 行尾去尾空白：定位最后一个非空单元格
+      let last = line.length
+      while (last > 0) {
+        const cell = line.getCell(last - 1)
+        const ch = cell?.getChars() ?? ""
+        if (ch !== "" && ch !== " ") break
+        last--
+      }
       if (last === 0) continue
       let html = ""
       let cur: string | null = null
       for (let ci = 0; ci < last; ci++) {
-        const cell = row[ci]
+        const cell = line.getCell(ci)
+        if (!cell) continue
+        // 宽字符续格（宽度 0）跳过，避免重复输出
+        if (cell.getWidth() === 0) continue
         const style: string[] = []
-        if (cell.bold) style.push("font-weight:bold")
-        if (cell.fg) style.push("color:" + cell.fg)
-        if (cell.bg) style.push("background-color:" + cell.bg)
+        if (cell.isBold()) style.push("font-weight:bold")
+        const fg = cellFg(cell)
+        if (fg) style.push("color:" + fg)
+        const bg = cellBg(cell)
+        if (bg) style.push("background-color:" + bg)
         const key = style.join(";")
         if (key !== cur) {
           if (cur) html += "</span>"
           cur = key
           if (key) html += '<span style="' + key + '">'
         }
-        html += esc(cell.ch)
+        html += esc(cell.getChars() || " ")
       }
       if (cur) html += "</span>"
       out.push(html)
     }
     return out
+  }
+
+  /** 释放底层 headless 终端资源 */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.term.dispose()
   }
 }
 
@@ -257,7 +237,7 @@ class TermScreen {
 let ws: WebSocket | null = null
 let sessionsData: SessionStatus[] = []
 let stickToBottom = true
-let runScreen: TermScreen | null = null
+let runScreen: HeadlessScreen | null = null
 /** 当前活动输出块（diff 渲染用，固化后保留在 DOM，后续命令不再复用/删除） */
 let curBlock: HTMLDivElement | null = null
 let debugMode = false
@@ -267,6 +247,12 @@ let prefRaw = localStorage.getItem("debugMode") === "1"
 /** 实际生效的 raw 模式：统一按用户意图（离线历史会话由 server 从 history 重建 raw 流） */
 function effRaw(): boolean {
   return prefRaw
+}
+
+/** 释放并清空当前命令的增量屏幕（切换命令/会话/重建时调用，避免 headless 终端泄漏） */
+function resetRunScreen(): void {
+  if (runScreen) runScreen.dispose()
+  runScreen = null
 }
 
 // ===== WS 连接 =====
@@ -309,6 +295,7 @@ function clearAllTerminals(): void {
   termPre.innerHTML = '<div class="row"><span class="c">' + (I18N.noSession || "") + '</span></div>'
   document.getElementById("meta").textContent = ""
   localPairs = []
+  resetRunScreen()
   subSid = ""
   subName = ""
   prefRaw = false
@@ -405,12 +392,12 @@ function subscribe(): void {
   if (sid === subSid && name === subName) return
   subSid = sid
   subName = name
-  runScreen = null
+  resetRunScreen()
   ws.send(JSON.stringify({ type: "subscribe", sessionID: sid, name, mode: debugMode ? "raw" : "transcript" }))
 }
 
 // ===== Snapshot 处理 =====
-function handleSnapshot(msg: { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }): void {
+async function handleSnapshot(msg: { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }): Promise<void> {
   const pre = document.getElementById("term") as HTMLPreElement
   const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
   if (msg.notFound) {
@@ -428,9 +415,12 @@ function handleSnapshot(msg: { sessionID: string; name: string; pairs: Transcrip
   localPairs = pairs
   // raw 模式：画面由 xterm 渲染（raw 通道），snapshot 不重建 transcript
   if (debugMode) return
-  runScreen = null
+  resetRunScreen()
   curBlock = null
-  pre.innerHTML = renderTranscript(pairs, showTime)
+  const html = await renderTranscript(pairs, showTime)
+  // 渲染期间可能已切换会话/终端：丢弃过期快照，避免旧内容覆盖新画面
+  if (msg.sessionID !== subSid || msg.name !== subName) return
+  pre.innerHTML = html
   updateScrollState(pre, toBottomBtn)
 }
 
@@ -460,7 +450,7 @@ function updateScrollState(pre: HTMLPreElement, toBottomBtn: HTMLButtonElement):
 }
 
 // ===== Diff 增量处理（transcript 模式唯一增量来源：cmd/out/done） =====
-function handleDiff(msg: { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number; final?: boolean }): void {
+async function handleDiff(msg: { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number; final?: boolean }): Promise<void> {
   if (debugMode) return // raw 模式画面由 raw 通道渲染，diff 忽略
   const pre = document.getElementById("term") as HTMLPreElement
   const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
@@ -472,7 +462,7 @@ function handleDiff(msg: { sessionID: string; name: string; event: string; comma
     const old = curBlock as HTMLDivElement | null
     if (old && old.dataset.finalized !== "1") old.remove()
     curBlock = null
-    runScreen = null
+    resetRunScreen()
     // 插入命令行
     const t = showTime ? fmtTime(Date.now()) : ""
     const row = document.createElement("div")
@@ -494,20 +484,25 @@ function handleDiff(msg: { sessionID: string; name: string; event: string; comma
     }
     if (msg.final) {
       // 命令完成时 server 下推的处理后完整输出：丢弃 diff 增量累积（动画帧等），重建本命令输出块
-      runScreen = new TermScreen(PTY_COLS)
+      resetRunScreen()
+      runScreen = new HeadlessScreen(PTY_COLS)
       // 本地累积：用处理后结果替换此前累积的原始增量（避免本地/快照不一致）
       const last = localPairs[localPairs.length - 1]
       if (last && last.type === "out") last.text = msg.data
       else localPairs.push({ type: "out", text: msg.data })
     } else {
-      if (!runScreen) runScreen = new TermScreen(PTY_COLS)
+      if (!runScreen) runScreen = new HeadlessScreen(PTY_COLS)
       // 本地累积：追加到当前输出块（对命令/输出对的 out 累积）
       const last = localPairs[localPairs.length - 1]
       if (last && last.type === "out") last.text += msg.data
       else localPairs.push({ type: "out", text: msg.data })
     }
-    runScreen.write(stripDone(msg.data))
-    const html = runScreen.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
+    // 捕获当前屏幕引用：await 期间若收到 cmd/新命令会 resetRunScreen，此时放弃本次渲染
+    const scr = runScreen
+    if (!scr) return
+    await scr.write(stripDone(msg.data))
+    if (runScreen !== scr) return
+    const html = scr.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
     block.innerHTML = html
     // REPL 交互等持续 out 场景同样需跟随输出滚动（此前仅有 done 时滚动，输出中途会停住）
     updateScrollState(pre, toBottomBtn)
@@ -583,7 +578,7 @@ function ensureXterm(): Terminal {
   const t = new Terminal({
     cols: PTY_COLS,
     rows: PTY_ROWS,
-    scrollback: 2000,
+    scrollback: SCROLLBACK_LINES,
     fontFamily: '"CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace',
     fontSize: 13,
     theme: {
@@ -676,7 +671,7 @@ function stripDone(s: string): string {
   return s.replace(DONE_RE, "")
 }
 
-function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
+async function renderTranscript(pairs: TranscriptPair[], showTime: boolean): Promise<string> {
   const out: string[] = []
   /** 当前命令的开始/结束时刻（供下一条输出行展示耗时与退出状态） */
   let pending: { ts?: number; endTs?: number } | null = null
@@ -690,15 +685,17 @@ function renderTranscript(pairs: TranscriptPair[], showTime: boolean): string {
       const t = p.ts ? fmtTime(p.ts) : ""
       out.push('<div class="row cmdline"><span class="t">' + t + '</span><span class="c">' + escHtml(p.text) + '</span></div>')
     } else if (p.type === "run") {
-      const scr = new TermScreen(PTY_COLS)
-      scr.write(stripDone(p.text))
+      const scr = new HeadlessScreen(PTY_COLS)
+      await scr.write(stripDone(p.text))
       const rows = scr.render().map((r) => '<div class="row"><span class="t"></span><span class="c">' + r + '</span></div>').join("")
+      scr.dispose()
       out.push('<div class="runBlock">' + rows + '</div>')
     } else {
       const parsed = parseOutput(p.text)
-      const scr = new TermScreen(PTY_COLS)
-      scr.write(parsed.text)
+      const scr = new HeadlessScreen(PTY_COLS)
+      await scr.write(parsed.text)
       const rows = scr.render()
+      scr.dispose()
       const meta = showTime ? resultMeta(pending, parsed.exitCode ?? p.exitCode) : ""
       const rowOf = (t: string, c: string): string => '<div class="row"><span class="t">' + t + '</span><span class="c">' + c + '</span></div>'
       if (rows.length === 0) {

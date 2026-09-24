@@ -205,7 +205,7 @@ export abstract class BaseSession {
         this._history.append(command, out, this._runningStartTs, Date.now())
         this._emitDone(outcome.exitCode ?? null, Date.now(), out)
         this._clearRunningContext()
-        return { ok: true, output: this._truncate(toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
+        return { ok: true, output: this._truncate(await toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "interactive": {
         // 交互程序（sudo 密码 / 确认提示）：命令仍在等待用户输入，
@@ -214,7 +214,7 @@ export abstract class BaseSession {
         const raw = this._buffer.slice(captureStart)
         const out = this._extractOutput(raw, command)
         this._startBackgroundWatch(captureStart, command)
-        return { ok: true, output: this._truncate(toModelText(out)), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
+        return { ok: true, output: this._truncate(await toModelText(out)), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "running": {
         this._runningStartPos = 0
@@ -233,7 +233,7 @@ export abstract class BaseSession {
         // watch 已写入 history，取最后一条记录的输出
         const pairs = this._history.getPairs()
         const last = pairs[pairs.length - 1]
-        const output = last ? this._truncate(toModelText(stripMarkers(this._history.readOutput(last)))) : ""
+        const output = last ? this._truncate(await toModelText(stripMarkers(this._history.readOutput(last)))) : ""
         return { ok: true, output, command, duration: Date.now() - startTs, ...this._extraResult }
       }
     }
@@ -262,7 +262,7 @@ export abstract class BaseSession {
       this._buffer = ""
       this._cursor = 0
     }
-    return { ok: true, output: this._truncate(toModelText(out)) }
+    return { ok: true, output: this._truncate(await toModelText(out)) }
   }
 
   /**
@@ -389,14 +389,20 @@ export abstract class BaseSession {
   }
 
   /**
-   * 组合实际写入 PTY 的命令：在规范形式（`_composeEchoText`）基础上把换行改写为会话行分隔符并补尾部回车。
-   * 行分隔符按会话类型：Unix PTY 用 `\n`（正常提交行），Windows ConPTY 用 `\r`（实测裸 `\n` 不提交行，
-   * pwsh 会停在续行 `>>`、行序错乱）。
+   * 组合实际写入 PTY 的命令：在规范形式（`_composeEchoText`）基础上把换行改写为行分隔符并补尾部回车。
+   * 行分隔符按**探测到的 shell 类型/平台**决定，而非按传输类型（本地/SSH）：
+   * - Windows shell（pwsh/cmd，控制台为 ConPTY）→ `\r`；本地 ConPTY 会话（无 adapter 时由 `_lineSep` 覆盖为 `\r`）→ `\r`；
+   * - SSH + POSIX（zsh/bash，走 Unix PTY）→ `\n`（`_lineSep` 默认值）。
+   * 原因：ConPTY 下裸 `\n` 只下移不复位、不提交行 → 多行命令逆序执行并卡在 `>>` 续行，须用 `\r`；
+   * 实测 SSH 连到 Windows 的 pwsh：用 `\n` 分隔时命令逆序卡死，改用 `\r` 后行序正确、组内作用域保留、输出正常。
+   * Unix PTY 下 `\n` 可正常提交行，保持不变。
    * @param command 原始命令（history 存干净版本）
-   * @returns 实际写入 PTY 的文本（尾部带 \r，行分隔已按会话类型规范化）
+   * @returns 实际写入 PTY 的文本（尾部带 \r，行分隔已按 shell 类型/平台规范化）
    */
   private _composeCommand(command: string): string {
-    return this._composeEchoText(command).replace(/\n/g, this._lineSep) + "\r"
+    // 行分隔符优先按 shell 类型判定：Windows shell（pwsh/cmd）→ \r；否则沿用会话 _lineSep
+    const sep = this._adapter?.windowsShell ? "\r" : this._lineSep
+    return this._composeEchoText(command).replace(/\n/g, sep) + "\r"
   }
 
   /**

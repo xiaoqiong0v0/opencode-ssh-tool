@@ -16,6 +16,12 @@ export interface ShellAdapter {
    * POSIX 系（zsh/bash）与 pwsh 为 `;`；cmd 的 `;` 不是分隔符，须用 `&`。
    */
   readonly stmtSep: string
+  /**
+   * 是否 Windows 控制台（ConPTY）：裸 \n 只下移不复位、不提交行，
+   * 多行命令写入须用 \r（否则逆序执行、卡在 >> 续行）。
+   * pwsh/cmd → true；POSIX 系（zsh/bash，走 Unix PTY）→ false。
+   */
+  readonly windowsShell: boolean
   parseProbe(output: string): boolean
   /** 每条命令后追加的完成标记命令（seq 为命令序号，独立一行执行） */
   markerCmd(seq: number): string
@@ -275,6 +281,7 @@ class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   readonly stmtSep = ";"
+  readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
   markerCmd(seq: number): string {
     // 结尾补换行：否则 zsh 判定"上条输出未以换行结束"，会补印 PROMPT_EOL_MARK（root 为 #）污染画面
     return `printf '\\n${DONE_TAG}${seq}:%s>\\n' $?`
@@ -298,6 +305,7 @@ class BashAdapter implements ShellAdapter {
   readonly name = "bash"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   readonly stmtSep = ";"
+  readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
   markerCmd(seq: number): string {
     // bash 无 PROMPT_EOL_MARK，标记无需补尾换行（补了反而在 raw 里多顶一行）
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
@@ -320,6 +328,7 @@ class PwshAdapter implements ShellAdapter {
   readonly name = "pwsh"
   readonly probeCommand = `Write-Output ${SHELL_ID_PREFIX}pwsh_$PSHOME`
   readonly stmtSep = ";"
+  readonly windowsShell = true // pwsh 运行在 Windows 控制台（ConPTY），裸 \n 不提交行，多行命令写入须用 \r
   markerCmd(seq: number): string {
     // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
     // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
@@ -344,6 +353,7 @@ class CmdAdapter implements ShellAdapter {
   readonly name = "cmd"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}%COMSPEC%`
   readonly stmtSep = "&"
+  readonly windowsShell = true // cmd 运行在 Windows 控制台（ConPTY），裸 \n 不提交行，多行命令写入须用 \r
   markerCmd(seq: number): string {
     return `echo ${DONE_TAG}${seq}:%errorlevel%>`
   }
