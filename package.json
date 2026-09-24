@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-ssh-tool",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "type": "module",
   "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
   "files": [
@@ -37,6 +37,7 @@
   },
   "dependencies": {
     "@xiaoqiong0v0/opencode-plugin-logger": "^1.0.5",
+    "@xterm/headless": "^5.5.0",
     "@xterm/xterm": "^5.5.0",
     "ssh2": "^1.16.0",
     "string-argv": "^0.3.2",
