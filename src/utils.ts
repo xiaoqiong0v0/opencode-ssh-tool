@@ -34,7 +34,7 @@ const TAIL_ANSI = `(?:${ANSI_SEQ_PATTERN})*`
  * @param endBound 搜索上界（不含），默认窗口末尾；末次匹配模式下用于避免后续裸命令回显把定位带偏
  * @param first true 取窗口内**首次**匹配（语法错误路径：错误块会重印含标记的整行命令，
  *              末次匹配会落到错误块内的命令拷贝上，导致错误块前半被裁掉）
- * @returns 命令回显结束后的字节偏移；未命中命令文本返回 -1（调用方按"未定位"处理）
+ * @returns 命令回显结束后的字节偏移（命中必 > 0）；未命中命令文本返回 -1（调用方按 `<= 0` 判定"未定位"）
  */
 export function extractOutputStart(raw: string, command: string, endBound = raw.length, first = false): number {
   const cmd = command.trim()
