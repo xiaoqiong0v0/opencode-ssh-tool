@@ -26,6 +26,17 @@ export const INTERACTIVE_BUSY_MS = 500
 /** 动画检测阈值：连续输出超过此时长仍无哨兵/静默 → 判定仍在运行 */
 export const ANIMATION_WINDOW_MS = 5_000
 
+/**
+ * 语法/解析错误收尾的安静窗口（毫秒）：识别到 shell 语法错误后，先等输出停止增长此时长再收尾，
+ * 确保 pwsh 异步/批量渲染的多行错误块被完整收进输出窗口。
+ */
+export const SYNTAX_QUIET_MS = 300
+
+/**
+ * 语法/解析错误收尾的等待上限（毫秒）：自首次识别起最长等此时长，防止错误块持续刷新时迟迟不收尾。
+ */
+export const SYNTAX_MAX_WAIT_MS = 1_000
+
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 

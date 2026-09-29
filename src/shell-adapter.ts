@@ -4,6 +4,7 @@
 // 完成判定不再依赖 prompt 钩子（PROMPT_COMMAND/PS1/prompt 函数——会被 oh-my-posh/p10k 覆盖），
 // 改为在每条命令后追加独立一行的标记输出命令，免疫任何提示符框架。
 
+import { stripAnsi } from "./ansi.js"
 import { DONE_TAG, SHELL_ID_PREFIX } from "./constants.js"
 import { findLastMatch } from "./last-match.js"
 
@@ -42,6 +43,13 @@ export interface ShellAdapter {
    * @returns true 表示 shell 会等待续行
    */
   hasOpenContinuation(command: string): boolean
+  /**
+   * shell 自身报出的语法/解析错误的行首模式（null = 该 shell 不支持识别）。
+   * 解析错误会使**整行**命令作废，同行拼装的完成标记也不会执行 → 须以该模式本身作为完成信号。
+   * 模式必须**行首锚定**（检测前已由 detectSyntaxError 剥净 ANSI，故模式内无需再容忍转义序列），
+   * 避免命令输出中偶然出现同名词被误判为完成；不可带 `g` 标志（检测方按无状态 `test` 使用）。
+   */
+  readonly syntaxErrorRe: RegExp | null
 }
 
 // ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:seq:退出码>） =====
@@ -77,6 +85,25 @@ export function stripMarkers(raw: string): string {
 export function detectInterrupt(buffer: string, fromPos: number): { interrupted: boolean; pos: number } {
   const idx = buffer.indexOf(INTERRUPT_ECHO, fromPos)
   return { interrupted: idx >= 0, pos: idx >= 0 ? idx : 0 }
+}
+
+/**
+ * 检测捕获窗口内是否出现 shell 自身的语法/解析错误。
+ * 解析错误会让整行命令（含同行拼装的完成标记）作废，标记永不出现 → 须由错误本身充当完成信号。
+ * 匹配前先剥净窗口内的全部 ANSI 序列再按行首判定：真实 ConPTY 的错误行前有
+ * `\x1b[?25l`（隐藏光标）、`\x1b[39;1H`（光标定位）等**非 SGR** 序列，
+ * 只容忍 SGR 的旧模式会漏判 → 信号永不触发 → busy 卡死。
+ * 剥 ANSI 会让位置偏移，但该信号只判"是否已结束"，不需要精确位置。
+ * @param adapter 当前 shell 适配器（syntaxErrorRe 为 null 表示该 shell 不支持识别）
+ * @param buffer 原始字节流
+ * @param fromPos 搜索起点（命令起点）
+ * @returns true 表示捕获窗口内出现语法/解析错误
+ */
+export function detectSyntaxError(adapter: ShellAdapter | null, buffer: string, fromPos: number): boolean {
+  const re = adapter?.syntaxErrorRe
+  if (!re) return false
+  // 模式不带 g，test 无状态；不改变 lastIndex 也不受其影响
+  return re.test(stripAnsi(buffer.slice(fromPos)))
 }
 
 // ===== Shell 类型探测与标记命令 =====
@@ -277,11 +304,31 @@ function cmdOpenContinuation(s: string): boolean {
   return parenDepth > 0 || /\^\s*$/.test(s)
 }
 
+// ===== 语法/解析错误模式（行首锚定；解析错误使整行命令作废，含同行完成标记也不执行）=====
+// 注意：模式在 detectSyntaxError 中于**剥净 ANSI 后**的文本上执行，故模式内不再需要容忍转义序列。
+
+/**
+ * POSIX 系（bash/zsh/sh/dash）语法/解析错误模式，命中形式：
+ * `bash: syntax error near unexpected token ...`、`zsh: parse error near ...`、
+ * `/bin/sh: 1: Syntax error: ...`（dash 首字母大写，故大小写不敏感）。
+ * 行首锚定：容忍可选的「路径 + shell 名 + 位置链」前缀；
+ * 因此仅在行首（或行首 shell 前缀之后）出现该词时命中，命令行中途的普通文本不会误判。
+ */
+const POSIX_SYNTAX_ERROR_RE =
+  /(?:^|[\r\n])(?:(?:[^\s:]*\/)?-?(?:bash|zsh|sh|dash|ksh|ash):(?:\s*[^\s:]+(?:\s+\d+)?:)*\s*)?(?:syntax|parse)\s+error/i
+
+/**
+ * PowerShell 语法/解析错误模式：pwsh 报错首行为 `ParserError:`。
+ * 行首锚定：命令输出里行中出现 `ParserError` 不命中。
+ */
+const PWSH_SYNTAX_ERROR_RE = /(?:^|[\r\n])ParserError:/
+
 class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   readonly stmtSep = ";"
   readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
+  readonly syntaxErrorRe = POSIX_SYNTAX_ERROR_RE
   markerCmd(seq: number): string {
     // 结尾补换行：否则 zsh 判定"上条输出未以换行结束"，会补印 PROMPT_EOL_MARK（root 为 #）污染画面
     return `printf '\\n${DONE_TAG}${seq}:%s>\\n' $?`
@@ -306,6 +353,7 @@ class BashAdapter implements ShellAdapter {
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}$0`
   readonly stmtSep = ";"
   readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
+  readonly syntaxErrorRe = POSIX_SYNTAX_ERROR_RE
   markerCmd(seq: number): string {
     // bash 无 PROMPT_EOL_MARK，标记无需补尾换行（补了反而在 raw 里多顶一行）
     return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
@@ -329,6 +377,7 @@ class PwshAdapter implements ShellAdapter {
   readonly probeCommand = `Write-Output ${SHELL_ID_PREFIX}pwsh_$PSHOME`
   readonly stmtSep = ";"
   readonly windowsShell = true // pwsh 运行在 Windows 控制台（ConPTY），裸 \n 不提交行，多行命令写入须用 \r
+  readonly syntaxErrorRe = PWSH_SYNTAX_ERROR_RE
   markerCmd(seq: number): string {
     // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
     // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
@@ -354,6 +403,10 @@ class CmdAdapter implements ShellAdapter {
   readonly probeCommand = `echo ${SHELL_ID_PREFIX}%COMSPEC%`
   readonly stmtSep = "&"
   readonly windowsShell = true // cmd 运行在 Windows 控制台（ConPTY），裸 \n 不提交行，多行命令写入须用 \r
+  // cmd 不识别：其语法错误文案 `The syntax of the command is incorrect.` 随系统语言本地化（中文版为
+  // `命令语法不正确。`），按字节无法稳定识别；且 cmd 错误以 `&` 分隔的后续命令仍会执行，
+  // 完成标记照常输出，标记法已完成判定，无需该信号
+  readonly syntaxErrorRe = null
   markerCmd(seq: number): string {
     return `echo ${DONE_TAG}${seq}:%errorlevel%>`
   }

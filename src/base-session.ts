@@ -7,11 +7,13 @@ import {
   MAX_OUTPUT_LEN,
   RAW_LOG_MAX,
   DONE_TAG,
+  SYNTAX_QUIET_MS,
+  SYNTAX_MAX_WAIT_MS,
 } from "./constants.js"
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
-import { toModelText, extractOutputStart } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, detectInterrupt, adapters, type ShellAdapter } from "./shell-adapter.js"
+import { toModelText, extractOutputStart, stripTrailingPromptLine } from "./utils.js"
+import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
 /** 命令执行结果 */
@@ -116,6 +118,11 @@ export abstract class BaseSession {
   private _cmdSeq = 0
   /** 当前命令序号（_beginCapture 递增，供检测/拼接用） */
   private _runningSeq = 0
+  /**
+   * 命令发起前缓冲的末行（旧提示符行）：语法错误收尾时 shell 会重印同形提示符，
+   * 据此把它从输出尾部剥掉（exec 的输出窗口自命令回显起，旧提示符在窗口之外，需单独记录）。
+   */
+  private _promptRef = ""
   /** 下次捕获窗口起点（相对当前 buffer）：前一条命令结束后，标记/残留从此处开始 */
   protected _cursor = 0
   /** WS 实时流已发送位置（相对 buffer 偏移）；null = 尚未定位命令回显结束点 */
@@ -201,7 +208,7 @@ export abstract class BaseSession {
         this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
         const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
-        const out = this._extractOutput(raw, command)
+        const out = this._extractOutput(raw, command, outcome.syntaxError === true)
         this._history.append(command, out, this._runningStartTs, Date.now())
         this._emitDone(outcome.exitCode ?? null, Date.now(), out)
         this._clearRunningContext()
@@ -440,19 +447,29 @@ export abstract class BaseSession {
    * 回显定位使用组合命令文本（command + 标记段）而非裸命令：裸命令可能出现在程序错误输出中
    * （如 `pw` 的错误行 `bash: pw: command not found`），而组合命令整行回显是唯一的，
    * 可避免 last-match 误命中错误行导致输出被裁空。
+   * 语法错误路径（syntaxMode）另作两处特殊处理：
+   * - 回显定位取**首次**匹配：pwsh 错误块的 `   1 |  <命令>` 行会重印含标记的整行命令，
+   *   末次匹配会落到该拷贝上，导致 `ParserError:`/`Line |` 等错误块前半被裁掉；
+   * - 剥掉尾部 shell 重印的提示符行（与旧提示符行同形，属画面噪音）。
    * @param raw 本次执行窗口原始字节流
    * @param command 原始命令（历史用）
+   * @param syntaxMode true 表示语法/解析错误收尾（无完成标记，整行命令作废）
    * @returns 纯程序输出原始流
    */
-  private _extractOutput(raw: string, command: string): string {
+  private _extractOutput(raw: string, command: string, syntaxMode = false): string {
     // 完成标记先定位：marker 自带唯一 seq，从窗口起点搜索即可（echoEnd 可能被连续输入的后序回显带偏）
     const marker = detectLastDoneMarker(raw, 0, this._runningSeq)
     const echoText = this._composeEchoText(command)
-    const end = marker.done ? extractOutputStart(raw, echoText, marker.pos) : extractOutputStart(raw, echoText)
+    const end = marker.done
+      ? extractOutputStart(raw, echoText, marker.pos)
+      : extractOutputStart(raw, echoText, raw.length, syntaxMode)
     if (end <= 0) return stripMarkers(raw)
     let out: string
     if (marker.done) {
       out = raw.slice(end, marker.pos)
+    } else if (syntaxMode) {
+      // 语法错误：命令整行作废、无 marker → 输出 = 回显结束 → 窗口末尾（含整段错误块），再剥尾部重印提示符
+      out = stripTrailingPromptLine(raw.slice(end), raw, this._promptRef)
     } else {
       const intr = detectInterrupt(raw, end)
       out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
@@ -473,6 +490,8 @@ export abstract class BaseSession {
     // fallback：无标记时依赖 _cursor 裁剪
     this._buffer = this._buffer.slice(this._cursor)
     this._cursor = 0
+    // 记录命令发起前缓冲末行（旧提示符行）：语法错误收尾时 shell 会重印同形提示符，供输出尾部剥离
+    this._promptRef = this._buffer.split("\n").pop() ?? ""
     this._runningStartPos = 0
     this._runningCommand = command
     this._runningStartTs = Date.now()
@@ -533,21 +552,53 @@ export abstract class BaseSession {
     return this._buffer.length > 0 ? this._buffer : null
   }
 
+  /**
+   * 同步等待命令完成：轮询语法错误 / 完成标记 / 交互提示 / ^C 中断，超动画窗口仍未完成则转后台 watch。
+   * @param startPos 捕获窗口起点（相对当前 buffer）
+   * @param startTs 命令发起时刻（判定动画窗口用）
+   * @returns kind=done 时 exitCode 为退出码（语法错误无标记可读，为 null）；markerPos 缺省表示窗口取到缓冲区末尾；
+   *          syntaxError=true 表示本次是语法/解析错误收尾（输出提取须改用首次回显匹配 + 剥尾部提示符）
+   */
   private _waitCompletion(
     startPos: number,
     startTs: number,
-  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number; exitCode?: number }> {
+  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number; exitCode?: number | null; syntaxError?: boolean }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
+      // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
+      let syntaxSeenAt = 0
+      let syntaxQuietAt = 0
+      let syntaxLen = 0
       const timer = setInterval(() => {
+        const now = Date.now()
+        const curLen = this._buffer.length
+        if (curLen !== lastLen) lastLen = curLen
+        // 语法/解析错误：**每轮最先判定**（优先于交互提示与"判为 running"），命中即进入静默等待再收尾。
+        // 整行命令作废（含同行拼装的完成标记也不会执行）→ 视为命令已结束。
+        // 不立即收尾：pwsh 的多行错误块由格式化器异步/批量渲染，须等输出安静一小段再收尾，
+        // 否则只截到 `ParserError:` 首行、丢掉 Line | 等后续行；安静窗口 300ms，自识别起上限 1s。
+        // 禁止"无标记超时即完成"式兜底：静默长命令（如 sleep）会被误判为已完成。
+        if (detectSyntaxError(this._adapter, this._buffer, startPos)) {
+          if (syntaxSeenAt === 0) {
+            syntaxSeenAt = now
+            syntaxQuietAt = now
+            syntaxLen = curLen
+          } else if (curLen !== syntaxLen) {
+            syntaxLen = curLen
+            syntaxQuietAt = now
+          }
+          if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
+            clearInterval(timer)
+            // 无标记可读 → exitCode=null；markerPos 缺省 → 输出窗口取到缓冲区末尾（含整段错误）
+            resolve({ kind: "done", exitCode: null, syntaxError: true })
+            return
+          }
+        }
         if (INTERACTIVE_RE.test(this._buffer.slice(startPos))) {
           clearInterval(timer)
           resolve({ kind: "interactive" })
           return
         }
-        const now = Date.now()
-        const curLen = this._buffer.length
-        if (curLen !== lastLen) lastLen = curLen
         // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，或 Ctrl-C 中断时 TTY 回显 ^C。
         // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）
         const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
@@ -576,10 +627,14 @@ export abstract class BaseSession {
     })
   }
 
-  /** 后台监听：轮询 done 标记 / ^C 中断 → 收集输出进 history + busy=false */
+  /** 后台监听：轮询 done 标记 / 语法错误 / ^C 中断 → 收集输出进 history + busy=false */
   private _startBackgroundWatch(startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
     const born = Date.now()
+    // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
+    let syntaxSeenAt = 0
+    let syntaxQuietAt = 0
+    let syntaxLen = 0
     this._watchTimer = setInterval(() => {
       if (!this._connected || Date.now() - born > MAX_WATCH_LEN) {
         // 超时/断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
@@ -604,6 +659,33 @@ export abstract class BaseSession {
         this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
+        return
+      }
+      // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后按完成收尾，
+      // 走与正常完成一致的路径（history / done 事件 / 清 running / 翻转 busy）；
+      // exitCode=null（无标记可读），输出窗口 = 回显结束 → 缓冲区末尾（含整段多行错误块，
+      // 回显取首次匹配并剥掉尾部重印的提示符行，见 _extractOutput 的 syntaxMode）
+      if (detectSyntaxError(this._adapter, this._buffer, startPos)) {
+        const now = Date.now()
+        const len = this._buffer.length
+        if (syntaxSeenAt === 0) {
+          syntaxSeenAt = now
+          syntaxQuietAt = now
+          syntaxLen = len
+        } else if (len !== syntaxLen) {
+          syntaxLen = len
+          syntaxQuietAt = now
+        }
+        if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
+          const out = this._extractOutput(this._buffer.slice(startPos), command, true)
+          this._history.append(command, out, this._runningStartTs)
+          this._emitDone(null, Date.now(), out)
+          this._cursor = this._buffer.length
+          this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
+          this._clearRunningContext()
+          if (this._watchTimer) clearInterval(this._watchTimer)
+          return
+        }
       }
     }, 200)
   }

@@ -12,7 +12,7 @@ opencode **npm 插件**（本项目提交 GitHub）：长驻交互式 SSH 会话
 | [design/消息协议重构设计.md](design/消息协议重构设计.md) | WS 实时消息协议重构（统一事件流）设计说明与全路径清单 |
 | [design/终端渲染与尺寸固定说明.md](design/终端渲染与尺寸固定说明.md) | 终端尺寸固定 120×40、取消 resize、shell 续行检测、raw/transcript 渲染修复 |
 | [design/多语言配置说明.md](design/多语言配置说明.md) | toolLang / webLang 分离与边界（web 只管页面 UI），agent/session 文案 i18n |
-| [design/多行命令包组与raw渲染修复说明.md](design/多行命令包组与raw渲染修复说明.md) | 多行命令统一 shell 组包组（删除多行拆分）、离线 raw 阶梯修复、ConPTY 行分隔符 `\r`（与匹配形式解耦）、续行/完整性检测修正、服务锁陈旧自愈；取代 G10 拆分做法 |
+| [design/多行命令包组与raw渲染修复说明.md](design/多行命令包组与raw渲染修复说明.md) | 多行命令统一 shell 组包组（删除多行拆分）、离线 raw 阶梯修复、ConPTY 行分隔符 `\r`（与匹配形式解耦）、续行/完整性检测修正、服务锁陈旧自愈；transcript 与模型文本改用 `@xterm/headless`（§11）、shell 语法/解析错误作为完成信号（§12）；取代 G10 拆分做法 |
 
 ## 变更说明
 
@@ -26,3 +26,6 @@ opencode **npm 插件**（本项目提交 GitHub）：长驻交互式 SSH 会话
 | 2026-09-18 | 终端尺寸固定 `120×40`、取消 resize 通道、shell 续行检测、toBottom 移入 header、zsh 标记补尾换行 | PTY 与 xterm 行数不一致致 PSReadLine 绝对定位越界（raw 错位）；resize 通道在多浏览器/历史重开下冲突；未闭合引号/反引号使 shell 续行等待 → 完成标记失效卡死；toBottom 悬浮遮挡；zsh 标记输出缺尾换行触发 `PROMPT_EOL_MARK`（`#`）。`SERVER_PROTO_VERSION` 11。详见 `design/终端渲染与尺寸固定说明.md` |
 | 2026-09-18 | 语言配置恢复 `toolLang` / `webLang` 分离；agent/session 文案接入 i18n | `12ab9bc` 误将两类语言合并为单一 `lang`（`webLang` 只应管页面 UI）；session 级提示（busy/续行/探测超时/未连接）硬编码、且探测超时文案中文硬编码。新增 `SSH_WEB_LANG`。详见 `design/多语言配置说明.md` |
 | 2026-09-22 | 多行命令统一包组（删除 heredoc/续行感知拆分）；离线 raw 阶梯修复；ConPTY 行分隔符；续行/完整性检测修正；服务锁陈旧自愈 | shell 逐行执行致回显/输出交错、transcript 丢中间输出；历史 `command` 为裸 `\n`，xterm 只下移不复位；ConPTY 裸 `\n` 不提交行；删除拆分后 `hasOpenContinuation` 判错会拒合法命令/发卡死命令（注释/heredoc 闭合/括号深度/here-string/cmd 引号共 9 处修正，矩阵 81 断言全 PASS）；崩溃残留 `server.lock` 使服务再也起不来。`stmtSep` 顺带修复 cmd 完成标记从未生效。`SERVER_PROTO_VERSION` 13。详见 `design/多行命令包组与raw渲染修复说明.md` |
+| 2026-09-29 | 多行命令行分隔符按**探测到的 shell 类型/平台**判定（`ShellAdapter.windowsShell`：Windows shell pwsh/cmd 与本地 ConPTY 会话写入用 `\r`，SSH + POSIX 用 `\n`；`_composeCommand` = `windowsShell ? "\r" : _lineSep`，与匹配形式解耦） | 修 SSH 连 Windows pwsh/cmd 时多行命令**逆序发送并卡在续行**：ConPTY 下裸 `\n` 只下移不复位列、不提交行 → 多行逆序 + 卡 `>>`；实测 `\r` 正常。详见 `design/多行命令包组与raw渲染修复说明.md` §4 |
+| 2026-09-29 | transcript 与模型文本改用 `@xterm/headless`（删除自研 `simulateScreen` / `TermScreen`，新增 web `HeadlessScreen`） | 自研屏幕模拟器缺**滚动**语义：CUP 回到屏幕底行时原地覆盖，raw 中的多行错误块在模型侧只剩最后一行（实测 1 行 31 字符）。两侧同 `cols/rows/scrollback`（新增 `TERM_SCROLLBACK_LINES = 2000`）+ `allowProposedApi: true`；颜色按 palette 0-15 / 256 色 / `#rrggbb` 重建；`toModelText` 因异步 write 改返回 `Promise<string>`。真实缓存字节回归：错误块两行都在。详见 `design/多行命令包组与raw渲染修复说明.md` §11 |
+| 2026-09-29 | shell 语法/解析错误作为完成信号（新增 `src/ansi.ts`、`syntaxErrorRe` / `detectSyntaxError`、`SYNTAX_QUIET_MS` / `SYNTAX_MAX_WAIT_MS`） | pwsh `ParserError` 使**整行作废**，同行拼装的完成标记永不执行 → 等不到完成、一直 busy、输出不落地（实测只能 Ctrl-C）。检测**先剥 ANSI 再按行首判定**（真实 ConPTY 错误块前有 `\x1b[?25l` / `\x1b[39;1H` 等非 SGR 序列，只容忍 SGR 的首版因此失效）；命中后等输出安静再收尾，`exitCode = null`、窗口取到缓冲区末尾、回显改首次匹配。cmd 不识别（`null`）。单测 74 例 PASS、回归 81/81 + 9/9、真机 pwsh over SSH 实测。详见 `design/多行命令包组与raw渲染修复说明.md` §12 |
