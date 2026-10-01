@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:f
 import { basename, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawn, type ChildProcess } from "node:child_process"
+import { createServer } from "node:net"
 import type { Lang } from "./i18n.js"
 import { SERVER_PROTO_VERSION } from "./constants.js"
 import log from "./log.js"
@@ -46,6 +47,14 @@ const SPAWN_WAIT_MAX = 15000
 /** 杀旧进程后等待端口释放的上限 */
 const KILL_WAIT_MAX = 4000
 
+/**
+ * 本进程内"某个期望端口"的一次确保结果（Promise 复用）：
+ * - 成功：后续同端口调用直接复用已起服务，不再 spawn
+ * - 失败（固定端口绑定被拒 / 锁竞争 / 启动超时）：收敛为同一失败结果，同端口不再重试（不刷屏、不反复起进程）
+ * 端口变化视为一次显式新请求，替换缓存。
+ */
+let cachedEnsure: { port: number; promise: Promise<ServerResult> } | null = null
+
 /** 探测某端口 /health 是否可达（判断服务是否已运行） */
 async function probe(port: number): Promise<boolean> {
   try {
@@ -57,6 +66,22 @@ async function probe(port: number): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * 预检端口在本机 127.0.0.1 能否绑定（快速失败）：
+ * 固定端口落在系统保留区间时立即得到 EACCES，无需 spawn 子进程后干等启动超时。
+ * @param port 待检查端口（仅用于固定端口，>0）
+ * @returns 可绑定返回 null；否则返回错误码（如 EACCES / EADDRINUSE）
+ */
+function probeBindable(port: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const srv = createServer()
+    srv.once("error", (e) => resolve((e as NodeJS.ErrnoException).code ?? "UNKNOWN"))
+    srv.listen(port, "127.0.0.1", () => {
+      srv.close(() => resolve(null))
+    })
+  })
 }
 
 /** 读取服务信息文件（可能不存在） */
@@ -182,19 +207,49 @@ async function killStale(info: ServerInfo | null): Promise<boolean> {
   return false
 }
 
+/** 失败结果：url 为空串，调用方据此判定服务不可用（命令执行不受影响） */
+function failedResult(): ServerResult {
+  return { server: null, url: "", port: 0, reused: false }
+}
+
 /**
- * 确保 HTTP 服务单例运行（独立子进程，不随插件进程退出）：
+ * 确保 HTTP 服务可用（进程内按端口缓存一次尝试，成功复用、失败收敛，绝不抛错）：
+ * 同端口重复调用直接复用同一 Promise —— 成功不再 spawn，失败不再重试（不刷屏、不反复起进程）。
+ * @param port 期望端口（0=自动分配；>0=固定端口，绑定被拒时直接放弃、不回退不重试）
+ * @param getSessions 会话列表函数（独立进程内由服务自身从状态文件读取，此处无需）
+ * @param dir 缓存目录（锁与信息文件存放处）
+ * @param lang Web 界面语言（默认 en）
+ * @returns 服务结果（url 为空串即不可用）
+ */
+export function ensureServer(
+  port: number,
+  getSessions: () => unknown[],
+  dir: string,
+  lang: Lang = "en",
+): Promise<ServerResult> {
+  if (cachedEnsure && cachedEnsure.port === port) return cachedEnsure.promise
+  const promise = ensureServerOnce(port, getSessions, dir, lang).catch((e) => {
+    log.error("确保 HTTP 服务失败", e instanceof Error ? e : String(e))
+    return failedResult()
+  })
+  cachedEnsure = { port, promise }
+  return promise
+}
+
+/**
+ * 单次确保 HTTP 服务单例运行（独立子进程，不随插件进程退出）：
  * 1. 有 server.json 且端口可探测、proto 为当前版本 → 复用（reused=true）
  *    proto 不符或探测失败 → 杀旧进程后走 spawn 新服务
  * 2. 否则拿文件锁（mkdir 原子）→ spawn 子进程 → 等端口就绪 → 释放锁
  * 3. 锁竞争失败 → 等待后重新探测复用（同样校验版本，新旧并存时杀旧）
+ * 4. 固定端口（>0）：spawn 前预检可绑定；绑定被拒或子进程启动即退出 → 立即失败，不换端口、不重试
  * @param port 期望端口（0=随机，但随机端口无法跨进程复用，故随机时总是新启）
  * @param _getSessions 会话列表函数（独立进程内由服务自身从状态文件读取，此处无需）
  * @param dir 缓存目录（锁与信息文件存放处）
  * @param lang Web 界面语言（默认 en）
- * @returns 服务结果
+ * @returns 服务结果（url 为空串即不可用）
  */
-export async function ensureServer(
+async function ensureServerOnce(
   port: number,
   _getSessions: () => unknown[],
   dir: string,
@@ -231,23 +286,39 @@ export async function ensureServer(
       }
       acquired = acquireLock(dir)
     }
-    if (!acquired) return { server: null, url: "", port: 0, reused: false }
+    if (!acquired) return failedResult()
   }
 
   try {
     // 3. 拿锁成功：先清残留旧进程（可能 pid 已退出或锁内刚杀掉），再启动新版
     const leftover = readInfo(dir)
     if (leftover && !isCurrentVersion(leftover)) await killStale(leftover)
-    spawnServerProc(port, dir, lang)
+
+    // 固定端口：spawn 前预检可绑定，绑定被拒（如 Windows 保留区间 EACCES）立即失败，不回退不重试
+    if (port > 0) {
+      const code = await probeBindable(port)
+      if (code) {
+        log.error(`固定端口 ${port} 绑定失败（${code}），固定端口不回退不重试；Web 记录服务不可用，命令执行不受影响`)
+        return failedResult()
+      }
+    }
+
+    const child = spawnServerProc(port, dir, lang)
     const deadline = Date.now() + SPAWN_WAIT_MAX
     while (Date.now() < deadline) {
+      // 子进程启动即退出（绑定被拒/端口被抢占等）→ 立即判定失败，不干等满 15s
+      if (child.exitCode !== null || child.signalCode !== null) {
+        log.error(`独立服务子进程启动即退出（端口 ${port}），Web 记录服务不可用，命令执行不受影响`)
+        return failedResult()
+      }
       const info = readInfo(dir)
       if (info && isCurrentVersion(info) && (await probe(info.port))) {
         return { server: null, url: `http://127.0.0.1:${info.port}`, port: info.port, reused: false }
       }
       await new Promise((r) => setTimeout(r, 200))
     }
-    return { server: null, url: "", port: 0, reused: false }
+    log.error(`独立服务启动超时（端口 ${port}），Web 记录服务不可用，命令执行不受影响`)
+    return failedResult()
   } finally {
     try {
       rmSync(lockPath, { recursive: true, force: true })
@@ -271,24 +342,22 @@ function resolveInterpreter(): string {
   return "node"
 }
 
-/** 子进程句柄缓存（进程退出后置空，供 ensureServer 复用判断） */
-let serverProc: ChildProcess | null = null
-
 /**
  * 启动独立服务子进程（detached：父进程退出不带走）
  * @param port 期望端口（0=随机；随机时端口由子进程决定并写入 server.json）
  * @param dir 缓存目录
  * @param lang Web 界面语言
+ * @returns 子进程句柄（调用方据此监测是否启动即退出）
  */
-function spawnServerProc(port: number, dir: string, lang: Lang): void {
+function spawnServerProc(port: number, dir: string, lang: Lang): ChildProcess {
   // 子进程入口：本模块编译产物 dist/server-manager.js 同目录的 dist/server-entry.js
   const selfPath = fileURLToPath(import.meta.url)
   const entry = join(dirname(selfPath), "server-entry.js").replace(/\\/g, "/")
   const bin = resolveInterpreter()
-  serverProc = spawn(bin, [entry, "--port", String(port), "--dir", dir, "--lang", lang], {
+  const child = spawn(bin, [entry, "--port", String(port), "--dir", dir, "--lang", lang], {
     detached: true,
     stdio: "ignore",
   })
-  serverProc.unref()
-  serverProc.on("exit", () => { serverProc = null })
+  child.unref()
+  return child
 }

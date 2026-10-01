@@ -188,6 +188,7 @@ Examples:
   st_http_server: { en: "httpServer", zh: "HTTP 服务" },
   st_active_sessions: { en: "activeSessions", zh: "活跃会话" },
   st_disabled: { en: "disabled", zh: "已禁用" },
+  st_server_unavailable: { en: "not started (commands unaffected)", zh: "未启动（命令执行不受影响）" },
   denied_danger: {
     en: "Dangerous command, execution rejected.",
     zh: "危险命令，已拒绝执行。",
@@ -243,6 +244,10 @@ Examples:
   server_not_enabled: {
     en: "\n(HTTP server not enabled)",
     zh: "\n（HTTP 服务未启用）",
+  },
+  server_unavailable: {
+    en: "\n(Web record service not started; command execution is unaffected)",
+    zh: "\n（Web 记录服务未启动，命令执行不受影响）",
   },
   history_title: {
     en: "Terminal history (last {n} / total {total})",

@@ -10,13 +10,13 @@ import { join } from "node:path"
 import { rmSync } from "node:fs"
 import { loadConfig } from "./config.js"
 import { SessionHistory } from "./history.js"
-import { T, getToolLang, getWebLang, tr } from "./i18n.js"
+import { T, getToolLang, getWebLang, tr, type FlatKey } from "./i18n.js"
 import { toModelText } from "./utils.js"
 import { createDecider } from "./permission.js"
 import { SshSession } from "./session.js"
 import { LocalSession } from "./local-session.js"
 import { type SessionEntry } from "./server.js"
-import { ensureServer } from "./server-manager.js"
+import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
 
@@ -247,29 +247,57 @@ export const OpenCodeSshTool: Plugin = async () => {
   }
   log.loaded()
 
-  // 加载配置并启动 HTTP 终端记录服务（默认开启；端口 0=自动分配）
+  // 加载配置并"发起"HTTP 终端记录服务启动（默认开启；端口 0=自动分配）。
+  // 刻意不 await：服务启动慢/失败均不阻塞插件加载与命令执行；需要 URL 的路径再惰性等待下面的 Promise。
   const cfg = loadConfig()
   // 语言：toolLang 用于工具描述/CLI/session 文案（SSH_TOOL_LANG 覆盖）；webLang 仅用于 Web 页面 UI（SSH_WEB_LANG 覆盖）
   const toolLang = getToolLang(cfg.toolLang)
   const webLang = getWebLang(cfg.webLang)
   // 权限判定器：内置正则 + 配置自定义 deny/allow 正则
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
+  // 服务启动 Promise（null=配置未启用）；失败已在 server-manager 内收敛为失败结果，这里再兜底 catch 避免 unhandled rejection
+  let serverStart: Promise<ServerResult> | null = null
   if (cfg.server.enabled) {
-    try {
-      const sr = await ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), webLang)
-      if (sr.url) {
-        httpUrl = sr.url
-        log.info(`HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`)
-        const wsUrl = sr.url.replace(/^http/, "ws") + "/ws"
-        agent = startAgent(wsUrl, resolveAgentSession, listAgentSessions)
-      } else {
-        log.info("HTTP 服务未启动（端口冲突或锁竞争）")
-      }
-    } catch (e) {
-      log.error("HTTP 服务启动失败", e instanceof Error ? e : String(e))
-    }
+    serverStart = ensureServer(cfg.server.port, listSessionEntries, cacheRoot(), webLang)
+      .then((sr) => {
+        if (sr.url) {
+          httpUrl = sr.url
+          log.info(`HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`)
+          const wsUrl = sr.url.replace(/^http/, "ws") + "/ws"
+          agent = startAgent(wsUrl, resolveAgentSession, listAgentSessions)
+        } else {
+          log.info("HTTP 服务未启动（固定端口绑定被拒或端口/锁竞争），Web 记录不可用；命令执行不受影响")
+        }
+        return sr
+      })
+      .catch((e) => {
+        log.error("HTTP 服务启动失败", e instanceof Error ? e : String(e))
+        return { server: null, url: "", port: 0, reused: false } satisfies ServerResult
+      })
   } else {
     log.info("HTTP 服务未启用（配置 server.enabled=false）")
+  }
+
+  /**
+   * 惰性获取 Web 记录服务地址：等待启动 Promise 但失败不抛错（命令执行不受影响）
+   * @returns 服务 URL；未启用或不可用时为空串
+   */
+  async function resolveHttpUrl(): Promise<string> {
+    if (!serverStart) return ""
+    try {
+      await serverStart
+    } catch {
+      /* 启动异常已在工厂内记录 */
+    }
+    return httpUrl
+  }
+
+  /**
+   * Web 服务不可用时的提示文案键：配置关闭 → 未启用；已发起但未起来 → 未启动（命令执行不受影响）
+   * @returns i18n 文案键
+   */
+  function httpUnavailableKey(): FlatKey {
+    return serverStart ? "server_unavailable" : "server_not_enabled"
   }
 
 
@@ -395,7 +423,8 @@ export const OpenCodeSshTool: Plugin = async () => {
     const parts: string[] = []
     for (const p of selected) parts.push((includeCommand ? `$ ${p.command}\n` : "") + await toModelText(history.readOutput(p)))
     const text = parts.join("\n")
-    const browserLine = httpUrl ? tr("browser_full_record", toolLang).replace("{url}", httpUrl) : tr("server_not_enabled", toolLang)
+    const url = await resolveHttpUrl()
+    const browserLine = url ? tr("browser_full_record", toolLang).replace("{url}", url) : tr(httpUnavailableKey(), toolLang)
     return `${tr(direction === "tail" ? "history_title" : "history_title_head", toolLang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
   }
 
@@ -449,9 +478,10 @@ export const OpenCodeSshTool: Plugin = async () => {
       ].filter(Boolean).join("\n"))
       parts.push(st.busy ? tr("status_busy_hint", toolLang) : tr("status_idle_hint", toolLang))
     }
-    const serverLines = httpUrl
-      ? ["", `${tr("st_http_server", toolLang)}: ${httpUrl}`, `${tr("st_active_sessions", toolLang)}: ${listSessionEntries().length}`]
-      : ["", `${tr("st_http_server", toolLang)}: ${tr("st_disabled", toolLang)}`]
+    const serverUrl = await resolveHttpUrl()
+    const serverLines = serverUrl
+      ? ["", `${tr("st_http_server", toolLang)}: ${serverUrl}`, `${tr("st_active_sessions", toolLang)}: ${listSessionEntries().length}`]
+      : ["", `${tr("st_http_server", toolLang)}: ${tr(serverStart ? "st_server_unavailable" : "st_disabled", toolLang)}`]
     return parts.join("\n\n") + serverLines.join("\n")
   }
 
