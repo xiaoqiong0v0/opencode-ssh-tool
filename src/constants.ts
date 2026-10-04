@@ -11,12 +11,6 @@ export const DENY =
 /** shell 元字符（出现即降级走 ask，防白名单拼接绕过） */
 export const SHELL_META = /[;|&`$()<>]/
 
-/** 单次 ssh_exec 默认超时（毫秒） */
-export const EXEC_TIMEOUT_MS = 30_000
-
-/** 静默窗口阈值：输出停止增长超过此时长视为命令完成 */
-export const QUIET_WINDOW_MS = 500
-
 /**
  * 交互模式判定阈值（毫秒）：命令提交时终端仍 busy，距上次提交不足此时长视为连续快速命令（排队等待执行），
  * 超过此时长仍 busy 视为用户正在给运行中的交互程序输入（sudo 密码/REPL 等），按交互输入原样 send。

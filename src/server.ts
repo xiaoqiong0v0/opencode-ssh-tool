@@ -181,7 +181,7 @@ export function startServer(
     const now = Date.now()
     // 兜底：streamBuf 中 agent 连接已消失的 key 强制清 busy（agent 崩溃/退出防卡死）。
     // 注意不能用"无 out 超时"判定——交互命令（sudo/read 等输入）等待期间无输出，
-    // 但 agent 仍在，命令未完成，busy 必须保持 true（完成由 agent 生命周期钩子兜底，含 watch 超时发 done）
+    // 但 agent 仍在，命令未完成，busy 必须保持 true（完成由 agent 生命周期钩子兜底，仅断连时 watch 补发 done，无超时强杀）
     for (const [key, b] of streamBuf) {
       if (b && !b.done && !agentBySession.has(key)) {
         b.done = true

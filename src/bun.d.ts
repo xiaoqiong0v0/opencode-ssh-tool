@@ -30,6 +30,11 @@ declare namespace Bun {
 
   /** spawn 选项 */
   interface SpawnOptions {
+    /**
+     * 终端：请用**内联 `TerminalOptions`**，句柄从 `proc.terminal` 取。
+     * **不要**把已 `new` 的 `Terminal` 对象传入 spawn——Bun（≥1.3.14）对其不传 `pty_slave_fd`，
+     * 子进程不会 `setsid+TIOCSCTTY`，控制终端仍是调用方 pts（`sudo` 等读 `/dev/tty` 会污染 TUI）。
+     */
     terminal?: TerminalOptions | Terminal
     cwd?: string
     env?: Record<string, string>
@@ -48,7 +53,11 @@ declare namespace Bun {
 }
 
 declare const Bun: {
-  /** 创建可复用 PTY 终端（也可内联传给 spawn 的 terminal 选项） */
+  /**
+   * 创建 PTY 终端。
+   * **警示**：不要把该构造出的对象传给 `spawn` 的 `terminal`（Bun ≥1.3.14 不传 `pty_slave_fd`
+   * → 子进程无控制终端，`sudo` 读 `/dev/tty` 会抢占调用方 TUI）；spawn 应内联 `TerminalOptions`。
+   */
   Terminal: new (options?: Bun.TerminalOptions) => Bun.Terminal
   /** 通过 shell 衍生命令，可附加 PTY 终端 */
   spawn: (command: string | string[], options?: Bun.SpawnOptions) => Bun.Subprocess

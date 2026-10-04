@@ -41,9 +41,6 @@ const INTERACTIVE_RE =
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
 
-/** 后台监听最长存活时间（防泄漏） */
-const MAX_WATCH_LEN = 10 * 60_000
-
 /** Shell 探测等待超时 */
 const PROBE_TIMEOUT_MS = 5_000
 
@@ -256,10 +253,11 @@ export abstract class BaseSession {
     if (this._runningStartPos !== null && this._runningCommand) {
       const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
       if (marker.done) {
-        const raw = this._buffer.slice(this._runningStartPos, marker.pos)
+        // 与后台 watch 完成路径复用同一收尾（history/done/busy/停 watch），避免 busy 卡死
+        const raw = this._completeRunning(this._runningStartPos, marker.pos, marker.exitCode, this._runningCommand)
+        // readBuffer 语义：读取后消费标记及之前部分（缓冲区坐标重置，cursor 归零）
         this._buffer = this._buffer.slice(marker.pos)
         this._cursor = 0
-        this._clearRunningContext()
         out = raw
       } else {
         out = this._buffer.slice(this._runningStartPos)
@@ -630,14 +628,13 @@ export abstract class BaseSession {
   /** 后台监听：轮询 done 标记 / 语法错误 / ^C 中断 → 收集输出进 history + busy=false */
   private _startBackgroundWatch(startPos: number, command: string): void {
     if (this._watchTimer) clearInterval(this._watchTimer)
-    const born = Date.now()
     // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
     let syntaxSeenAt = 0
     let syntaxQuietAt = 0
     let syntaxLen = 0
     this._watchTimer = setInterval(() => {
-      if (!this._connected || Date.now() - born > MAX_WATCH_LEN) {
-        // 超时/断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
+      if (!this._connected) {
+        // 断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
         if (this._runningCommand) this._emitDone(null, Date.now())
         this._remoteBusy = false
         this._clearRunningContext()
@@ -650,15 +647,8 @@ export abstract class BaseSession {
       const intr = this._interruptSent ? detectInterrupt(this._buffer, startPos) : { interrupted: false, pos: 0 }
       const end = marker.done ? marker.pos : intr.pos
       if (marker.done || intr.interrupted) {
-        const raw = this._buffer.slice(startPos, end)
         const code = marker.done ? marker.exitCode : 130
-        const out = this._extractOutput(raw, command)
-        this._history.append(command, out, this._runningStartTs)
-        this._emitDone(code, Date.now(), out)
-        this._cursor = Math.max(startPos, end)
-        this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
-        this._clearRunningContext()
-        if (this._watchTimer) clearInterval(this._watchTimer)
+        this._completeRunning(startPos, end, code, command)
         return
       }
       // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后按完成收尾，
@@ -678,16 +668,33 @@ export abstract class BaseSession {
         }
         if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
           const out = this._extractOutput(this._buffer.slice(startPos), command, true)
-          this._history.append(command, out, this._runningStartTs)
-          this._emitDone(null, Date.now(), out)
-          this._cursor = this._buffer.length
-          this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
-          this._clearRunningContext()
-          if (this._watchTimer) clearInterval(this._watchTimer)
+          this._completeRunning(startPos, this._buffer.length, null, command, out)
           return
         }
       }
     }, 200)
+  }
+
+  /**
+   * 统一命令完成收尾（供后台 watch 与 readBuffer 复用，避免两处收尾逻辑漂移）：
+   * 提取/追加 history、补发 done 事件、定位 cursor、翻转 busy、清 running 上下文、停后台 watch。
+   * @param startPos 命令捕获窗口起点（相对 buffer；watch 的捕获起点与 _runningStartPos 可能不同，须显式传入）
+   * @param endPos 完成位置（marker/中断回显在 buffer 中的偏移）
+   * @param exitCode 退出码（语法错误收尾为 null，^C 为 130）
+   * @param command 原始命令（history 记录用）
+   * @param out 已提取的纯输出；缺省时由 [startPos, endPos) 窗口经 _extractOutput 提取
+   * @returns 本次完成窗口的原始片段（readBuffer 返回给调用方用）
+   */
+  private _completeRunning(startPos: number, endPos: number, exitCode: number | null, command: string, out?: string): string {
+    const raw = this._buffer.slice(startPos, endPos)
+    const output = out ?? this._extractOutput(raw, command)
+    this._history.append(command, output, this._runningStartTs)
+    this._emitDone(exitCode, Date.now(), output)
+    this._cursor = Math.max(startPos, endPos)
+    this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
+    this._clearRunningContext()
+    if (this._watchTimer) clearInterval(this._watchTimer)
+    return raw
   }
 
   protected _clearRunningContext(): void {
