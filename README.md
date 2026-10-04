@@ -7,7 +7,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **长驻会话**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
-- **命令完成判定**：完成标记法（`<SSH_DONE:seq:退出码>`）+ 静默窗口 + 超时三重兜底，动画输出（进度条等）自动识别；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截
+- **命令完成判定**：完成标记法（`<SSH_DONE:seq:退出码>`）+ 静默窗口 + 动画检测（进度条等长输出自动识别）三重判定；**断连兜底，不设超时强杀**（长命令由 Ctrl-C 干预）；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），重启不丢、会话关闭清理
 - **HTTP 终端查看**：默认开启本地服务，浏览器打开可查看终端记录（WebSocket 实时推送，无轮询）
@@ -165,7 +165,7 @@ npm publish      # 只发布 dist/
 - [ ] 交互场景：`term_cli exec("sudo ...")` 触发密码提示 → `term_cli read` 配合
 - [ ] 白名单命令不弹审批直接执行；`rm -rf` 被拒绝
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
-- [ ] 长命令超时：`term_cli exec("sleep 60")` 30s 超时返回，不挂死会话
+- [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
 - [ ] `term_cli read` 取前/后 N 条历史输出（含 `includeCommand`、`source=buffer`）
 - [ ] `term_cli status` / HTTP 页面浏览器可访问
 - [ ] `term_cli disconnect` 后连接释放
