@@ -22,8 +22,8 @@ declare namespace Bun {
     name?: string
     /** 收到输出数据回调 */
     data?: (terminal: Terminal, data: Uint8Array) => void
-    /** 终端流关闭回调（exitCode 0=EOF，1=错误） */
-    exit?: (terminal: Terminal, exitCode: number, signal: number) => void
+    /** 终端流关闭回调（exitCode 0=EOF，1=错误；signal 当前恒为 null，保留待用） */
+    exit?: (terminal: Terminal, exitCode: number, signal: string | null) => void
     /** 可接受更多数据回调 */
     drain?: (terminal: Terminal) => void
   }
@@ -42,6 +42,8 @@ declare namespace Bun {
     /** 退出 Promise */
     readonly exited: Promise<number>
     readonly exitCode: number | null
+    /** 以 terminal 选项 spawn 时附加的终端句柄；未附加时为 undefined（内联路径下由此取句柄） */
+    readonly terminal?: Bun.Terminal
   }
 }
 

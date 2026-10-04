@@ -57,24 +57,30 @@ export class LocalSession extends BaseSession {
    */
   async connect(opts: { command: string; cwd?: string }): Promise<{ ok: boolean; error?: string }> {
     try {
-      const term = new Bun.Terminal({
-        cols: PTY_COLS,
-        rows: PTY_ROWS,
-        name: "xterm-256color",
-        data: (_t, d) => this._appendBuffer(new TextDecoder().decode(d)),
-        exit: (_t, exitCode, signal) => {
-          this._connected = false
-          this._remoteBusy = false
-          log.warn(`本地终端 PTY 退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, exit=${exitCode}, signal=${signal})`)
+      // 内联 terminal 选项：让 Bun 走 terminal_info 路径、向子进程传 pty_slave_fd，
+      // 子进程才能 setsid+TIOCSCTTY 取得自己的控制终端。若改为传入已 new 出的 Terminal 对象，
+      // Bun 不传该 fd，子进程会沿用 opencode TUI 的 pts，导致 sudo 等读 /dev/tty 的程序抢占 TUI 屏幕/键盘。
+      const proc = Bun.spawn(splitCommand(opts.command), {
+        cwd: opts.cwd,
+        terminal: {
+          cols: PTY_COLS,
+          rows: PTY_ROWS,
+          name: "xterm-256color",
+          data: (_t, d) => this._appendBuffer(new TextDecoder().decode(d)),
+          exit: (_t, exitCode, signal) => {
+            this._connected = false
+            this._remoteBusy = false
+            log.warn(`本地终端 PTY 退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, exit=${exitCode}, signal=${signal})`)
+          },
         },
       })
-      const proc = Bun.spawn(splitCommand(opts.command), { terminal: term, cwd: opts.cwd })
       // 监听子进程退出：docker exec/wsl 前端进程退出时此回调触发，用于定位"无 close() 日志却掉线"的场景
       const bootAt = Date.now()
       proc.exited.then((code) => {
         log.error(`本地终端子进程退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, code=${code}, boot2exit=${Date.now() - bootAt}ms)`)
       }).catch(() => { /* ignore */ })
-      this._term = term
+      // 内联路径下终端句柄由子进程持有（Bun 拥有该终端，子进程退出时自动 close），故从 proc.terminal 取
+      this._term = proc.terminal ?? null
       this._proc = proc
       this._program = opts.command
       this._connected = true
