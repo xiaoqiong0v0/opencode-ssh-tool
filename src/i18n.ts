@@ -40,8 +40,8 @@ export function getWebLang(configured: Lang = "en"): Lang {
 /** 工具描述与参数说明字典 */
 export const T = {
   submitted: {
-    en: "Command submitted (async). Running in background: check term_cli status for completion, then term_cli read to read output.",
-    zh: "命令已异步提交，后台执行中：用 term_cli status 查完成状态，再用 term_cli read 读取输出。",
+    en: "Command submitted (this call did not wait for the result). It is still running in the terminal's foreground: use term_cli status to check completion, then term_cli read to read output.",
+    zh: "命令已提交（本次调用未等待结果），命令仍在该终端前台执行：用 term_cli status 查完成状态，再用 term_cli read 读取输出。",
   },
   send_ok: {
     en: "Sent: {text}",
@@ -76,7 +76,7 @@ Subcommands:
   local "<command>" [-n name] [-c cwd]
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
   exec "<command>" [-n name] [-w]
-      run a command in the terminal (default: submit async and return immediately; -w waits for result)
+      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits for the result)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [-n name]
@@ -111,7 +111,7 @@ Examples:
   local "<command>" [-n name] [-c cwd]
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
   exec "<command>" [-n name] [-w]
-      在指定终端执行命令（默认异步提交立即返回；-w 同步等待结果）
+      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等待结果）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [-n name]

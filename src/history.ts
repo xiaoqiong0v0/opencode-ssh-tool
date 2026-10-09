@@ -13,6 +13,8 @@ export interface HistoryPair {
   ts: number
   /** 命令完成时刻（标记出现时） */
   endTs: number
+  /** 命令退出码（完成标记读取；undefined = 未知，如语法错误/旧记录，勿补 0） */
+  exitCode?: number
   /** 序号（文件顺序） */
   seq: number
 }
@@ -54,10 +56,13 @@ export class SessionHistory {
           output?: string
           ts: number
           endTs?: number
+          exitCode?: number
         }
         const seq = parseInt(f.split("-")[0] ?? "0", 10) || this.nextSeq
         const size = data.output?.length ?? 0
-        this.pairs.push({ command: data.command, file: join(this.dir, f), size, ts: data.ts, endTs: data.endTs ?? data.ts, seq })
+        // 向后兼容：老文件无 exitCode 字段 → undefined（未知，不补 0）
+        const exitCode = typeof data.exitCode === "number" ? data.exitCode : undefined
+        this.pairs.push({ command: data.command, file: join(this.dir, f), size, ts: data.ts, endTs: data.endTs ?? data.ts, exitCode, seq })
         if (seq >= this.nextSeq) this.nextSeq = seq + 1
       } catch {
         /* 跳过损坏文件 */
@@ -73,14 +78,16 @@ export class SessionHistory {
    * @param output 原始终端流（已去哨兵注入，未做其他清理），供 web 忠实渲染、模型按需 toModelText
    * @param startTs 命令输入时刻（默认取当前时间）；用于展示命令发起时间
    * @param endTs 命令完成时刻（标记出现时；默认取当前时间）
+   * @param exitCode 命令退出码（完成标记读取；undefined = 未知，如语法错误）。
+   *   undefined 时 JSON 序列化不写入该字段，老版本读取视为未知，向后兼容。
    */
-  append(command: string, output: string, startTs?: number, endTs?: number): void {
+  append(command: string, output: string, startTs?: number, endTs?: number, exitCode?: number): void {
     const ts = startTs ?? Date.now()
     const end = endTs ?? Date.now()
     const seq = this.nextSeq++
     const file = join(this.dir, `${String(seq).padStart(6, "0")}-${ts}.json`)
-    writeFileSync(file, JSON.stringify({ command, output, ts, endTs: end }), "utf8")
-    this.pairs.push({ command, file, size: output.length, ts, endTs: end, seq })
+    writeFileSync(file, JSON.stringify({ command, output, ts, endTs: end, exitCode }), "utf8")
+    this.pairs.push({ command, file, size: output.length, ts, endTs: end, exitCode, seq })
     this._trim()
   }
 

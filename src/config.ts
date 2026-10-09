@@ -36,6 +36,12 @@ export interface ToolConfig {
   toolLang: Lang
   /** Web 界面语言：仅页面 UI 文案（默认 en，可用环境变量 SSH_WEB_LANG 覆盖） */
   webLang: Lang
+  /**
+   * 中断探针补发间隔（秒，默认 5）：用户显式 Ctrl+C 后**立即**补发首条探针，
+   * 之后每隔该秒数补发一次，直到命令结束。非法值（非数字 / NaN / ≤0）回退默认 5。
+   * 该定时器仅用于周期性重发探针，不参与完成判定（完成只认当前 seq 的完成标记）。
+   */
+  interruptProbeInterval: number
   permission: PermissionConfig
 }
 
@@ -53,6 +59,7 @@ const DEFAULT_CONFIG: ToolConfig = {
   },
   toolLang: "en",
   webLang: "en",
+  interruptProbeInterval: 5,
   permission: {
     deny: [],
     allow: [],
@@ -86,6 +93,9 @@ const CONFIG_TEMPLATE = `{
   "toolLang": "en",
   // Web 界面语言（仅页面 UI 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_WEB_LANG 覆盖）
   "webLang": "en",
+  // 中断探针补发间隔（秒，默认 5）：Ctrl+C 后立即补发首条探针，之后每隔该秒数补发一次，直到命令结束
+  // 仅用于周期性重发探针，不判命令完成；非法值（非数字 / ≤0）回退默认 5
+  "interruptProbeInterval": 5,
   // 权限自定义正则（追加到内置默认，控制"拒绝"与"需审批"命令）
   "permission": {
     // 内置默认危险命令黑名单（命中直接拒绝，不需要重复添加）：
@@ -136,6 +146,11 @@ export function loadConfig(): ToolConfig {
     const legacyLang: Lang | undefined = raw.lang === "zh" ? "zh" : raw.lang === "en" ? "en" : undefined
     const toolLang: Lang = raw.toolLang === "zh" ? "zh" : raw.toolLang === "en" ? "en" : legacyLang ?? "en"
     const webLang: Lang = raw.webLang === "zh" ? "zh" : raw.webLang === "en" ? "en" : legacyLang ?? "en"
+    // 中断探针间隔：仅接受正有限数（秒）；非数字 / NaN / ≤0 一律回退默认值（不回退为 0 导致探针失效）
+    const interruptProbeInterval =
+      typeof raw.interruptProbeInterval === "number" && Number.isFinite(raw.interruptProbeInterval) && raw.interruptProbeInterval > 0
+        ? raw.interruptProbeInterval
+        : DEFAULT_CONFIG.interruptProbeInterval
     return {
       server: {
         enabled: server.enabled ?? DEFAULT_CONFIG.server.enabled,
@@ -148,6 +163,7 @@ export function loadConfig(): ToolConfig {
       },
       toolLang,
       webLang,
+      interruptProbeInterval,
       permission: {
         deny: Array.isArray(permission.deny) ? permission.deny : [],
         allow: Array.isArray(permission.allow) ? permission.allow : [],

@@ -31,6 +31,14 @@ export const SYNTAX_QUIET_MS = 300
  */
 export const SYNTAX_MAX_WAIT_MS = 1_000
 
+/**
+ * 中断探针补发间隔默认值（秒）：用户显式 Ctrl+C 后**立即**补发首条探针，
+ * 之后每隔此间隔补发一次，直到命令结束（收到当前 seq 标记）。
+ * 实际间隔取配置 interruptProbeInterval（秒），非法/缺失时回退此默认值。
+ * 仅用于周期性重发探针，**绝不**用于"到点判命令完成"——完成判定只认当前 seq 的完成标记。
+ */
+export const INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC = 5
+
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 
@@ -75,4 +83,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  */
-export const SERVER_PROTO_VERSION = 13
+export const SERVER_PROTO_VERSION = 14

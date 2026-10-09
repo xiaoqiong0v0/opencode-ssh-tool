@@ -2,6 +2,8 @@
 // 统一完成标记法：注入 PROMPT_COMMAND 脚本，命令完成时输出 <SSH_DONE:退出码>
 // 子类仅需实现：连接建立(connect)、数据写入(_write)、传输层清理(_closeTransport)、状态字段(getStatus)
 
+import { randomUUID } from "node:crypto"
+
 import {
   ANIMATION_WINDOW_MS,
   MAX_OUTPUT_LEN,
@@ -9,6 +11,7 @@ import {
   DONE_TAG,
   SYNTAX_QUIET_MS,
   SYNTAX_MAX_WAIT_MS,
+  INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC,
 } from "./constants.js"
 import log from "./log.js"
 import { SessionHistory } from "./history.js"
@@ -138,6 +141,11 @@ export abstract class BaseSession {
   /** 累积原始字节总数（单调递增，前端增量游标） */
   private _rawTotal = 0
   protected readonly _history: SessionHistory
+  /**
+   * 会话实例代次：每次构造生成唯一值。同名终端重建/进程重启后新实例代次不同，
+   * 供 agent 识别"已是新会话"并重置 raw 增量游标；随 raw 上报透传给 server，作为清屏（reset）依据。
+   */
+  readonly generation: string = randomUUID()
   /** 生命周期监听器（命令开始/完成事件，agent 转报 server） */
   private _lifecycle: ((ev: LifecycleEvent) => void) | null = null
   /**
@@ -147,12 +155,26 @@ export abstract class BaseSession {
    * 仅当确实发过 ^C 才去缓冲区找 ^C 回显，天然排除历史残留 ^C 的误判。
    */
   private _interruptSent = false
+  /**
+   * 已补发中断探针的命令序号集合（set 即"探针已发"记录）。
+   * 探针在用户显式 Ctrl+C 时补发，其回显可能迟到落到后续命令的输出窗口里，
+   * 保留序号以便无论何时到达都从可见输出中剔除其回显（见 _stripProbeEchoes）。
+   * 不清空：迟到可能跨多条命令（Raw 视图保留原始字节，不经此剔除）。
+   */
+  private _probeSeqs = new Set<number>()
+  /**
+   * 中断探针周期定时器：Ctrl+C 后立即补发首条探针，随后每 _interruptProbeIntervalMs 补发一次。
+   * null = 不在中断周期内。仅"周期性重发探针"用，不参与完成判定（完成只认当前 seq 标记）。
+   */
+  private _interruptTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(
     protected readonly sessionID: string,
     history: SessionHistory,
     protected readonly name = "default",
     protected readonly _lang: Lang = "en",
+    /** 中断探针补发间隔（毫秒）；来自配置 interruptProbeInterval（秒），非法/缺失时为常量默认值 */
+    protected readonly _interruptProbeIntervalMs: number = INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC * 1000,
   ) {
     this._history = history
   }
@@ -165,7 +187,7 @@ export abstract class BaseSession {
   protected get _extraResult(): Partial<ExecResult> { return {} }
 
   /**
-   * 异步提交命令：立即返回，命令后台执行，输出由后台监听收集进 history
+   * 提交命令：立即返回、不等待结果；命令在该终端前台执行，完成后由后台 watch 收集输出进 history
    * @param command 命令
    * @returns 提交结果（立即返回，不等待命令完成）
    */
@@ -206,8 +228,9 @@ export abstract class BaseSession {
         const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
         this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
         const out = this._extractOutput(raw, command, outcome.syntaxError === true)
-        this._history.append(command, out, this._runningStartTs, Date.now())
+        this._history.append(command, out, this._runningStartTs, Date.now(), outcome.exitCode ?? undefined)
         this._emitDone(outcome.exitCode ?? null, Date.now(), out)
+        this._stopInterruptCycle("命令完成")
         this._clearRunningContext()
         return { ok: true, output: this._truncate(await toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
@@ -267,7 +290,7 @@ export abstract class BaseSession {
       this._buffer = ""
       this._cursor = 0
     }
-    return { ok: true, output: this._truncate(await toModelText(out)) }
+    return { ok: true, output: this._truncate(await toModelText(this._stripProbeEchoes(out))) }
   }
 
   /**
@@ -286,9 +309,14 @@ export abstract class BaseSession {
       .replace(/\\r/g, "\r")
       .replace(/\\n/g, "\r")
     log.info(`send -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
-    // 真实中断输入：标记本次命令已发过 Ctrl-C，供完成判定识别 ^C 回显（不依赖命令回显定位）
-    if (payload.includes("\x03")) this._interruptSent = true
+    // 真实中断输入：标记本次命令已发过 Ctrl-C；写完中断键后进入中断周期，
+    // 周期内**立即**补发首条探针、之后按配置间隔（默认 5s）补发探针标记来收尾被中断的命令。
+    // 防抖：周期内重复 Ctrl-C 被 _startInterruptCycle 抑制（不重启周期、不额外补探针），
+    // 但 \x03 字节本身仍照常写入 PTY（不吞按键，保留"连按两次退出"等程序行为）。
+    const interrupted = payload.includes("\x03")
+    if (interrupted) this._interruptSent = true
     this._write(payload)
+    if (interrupted) this._startInterruptCycle()
     this._lastActive = Date.now()
     return { ok: true }
   }
@@ -360,6 +388,7 @@ export abstract class BaseSession {
     this._streamPos = windowEnd
     let data = stripMarkers(raw)
     if (this._adapter) data = data.replace(this._markerCmd(this._runningSeq), "")
+    data = this._stripProbeEchoes(data)
     return { data, done: marker.done }
   }
 
@@ -368,6 +397,7 @@ export abstract class BaseSession {
     if (this._closed) return
     this._closed = true
     if (this._watchTimer) clearInterval(this._watchTimer)
+    this._stopInterruptCycle("会话关闭")
     this._closeTransport()
     this._connected = false
     this._remoteBusy = false
@@ -405,9 +435,118 @@ export abstract class BaseSession {
    * @returns 实际写入 PTY 的文本（尾部带 \r，行分隔已按 shell 类型/平台规范化）
    */
   private _composeCommand(command: string): string {
-    // 行分隔符优先按 shell 类型判定：Windows shell（pwsh/cmd）→ \r；否则沿用会话 _lineSep
-    const sep = this._adapter?.windowsShell ? "\r" : this._lineSep
-    return this._composeEchoText(command).replace(/\n/g, sep) + "\r"
+    // 行分隔符按 shell 类型/平台判定（见 _ptyLineSep）
+    return this._composeEchoText(command).replace(/\n/g, this._ptyLineSep()) + "\r"
+  }
+
+  /**
+   * 当前 shell 的 PTY **提交分隔符**（让 shell 执行该行）：Windows shell（pwsh/cmd，ConPTY）→ `\r`
+   * （裸 \n 不提交行）；其余沿用会话 `_lineSep`（Unix PTY 为 \n，本地会话为 \r）。
+   * @returns 提交分隔符字符串
+   */
+  private _ptyLineSep(): string {
+    return this._adapter?.windowsShell ? "\r" : this._lineSep
+  }
+
+  /**
+   * 组合中断探针写入文本：**不加任何前缀换行**，直接写一条独立的当前 seq 完成标记命令，
+   * 末尾用**提交分隔符**让 shell 执行该行。
+   *
+   * 不加前缀换行的原因：Ctrl+C 后插入的前导 `\r`/`\n` 会被 shell 各算一次 accept-line，
+   * 在 SIGINT + 提示符重绘期间额外提交空命令，PTY 回声与 bash readline 增量重绘竞态，
+   * 使 marker 回显在字节流里被截断成残片（如缺开头 12 字节的 `printf '\n<S...`），无法被精确剔除。
+   * 探针在提示符处补发，本就是干净新行，无需前缀；提交仅靠尾部 `\r`，
+   * 与 `_composeCommand` 尾部分隔符一致。
+   * @param seq 探针使用的命令序号（被中断命令的当前 seq）
+   * @returns 写入 PTY 的探针文本
+   */
+  private _composeProbe(seq: number): string {
+    return this._markerCmd(seq) + "\r"
+  }
+
+  /**
+   * 补发一次中断探针：用户显式 Ctrl+C 后，前台命令可能已死、shell 已回到提示符，
+   * 但命令列表被中断丢弃 → 原命令的完成标记永不执行 → busy 卡死。
+   * 补写一条"裸标记命令"作为探针：shell 若已回到提示符会读它并打印当前 seq 标记，
+   * 使命令正常收尾；若前台程序未死，字节留在 tty 输入缓冲，待 shell 拿回控制权时再读
+   * （两种情况均符合预期，保持 busy、绝不误判完成）。
+   * 由中断周期调用：写完 \x03 时立即调用一次，之后定时器每间隔调用一次（见 _startInterruptCycle）。
+   * 幂等：同一条被中断命令多次补发（立即 1 条 + 每间隔 1 条），先到的当前 seq 标记胜出。
+   * @returns 无
+   */
+  private _sendInterruptProbe(): void {
+    // 仅在确实有正在追踪的命令时补发：空闲期 Ctrl+C 无待收尾命令，补发只会污染缓冲
+    if (this._runningStartPos === null || this._runningCommand === "") return
+    const seq = this._runningSeq
+    this._probeSeqs.add(seq)
+    const probe = this._composeProbe(seq)
+    log.info(`中断探针 -> seq=${seq} ${JSON.stringify(probe)} (busy=${this._remoteBusy})`)
+    this._write(probe)
+  }
+
+  /**
+   * 启动中断周期：用户显式 Ctrl+C 后进入。**写完 \x03 立即补发首条探针**（同一次 send 调用内，不再等待），
+   * 之后每 _interruptProbeIntervalMs（来自配置，默认 5s）补发一次，直至命令结束/关会话/开始新命令
+   * （见 _stopInterruptCycle）。防抖：已在周期内时直接返回——狂按 Ctrl+C 不重启周期、不额外补探针
+   * （\x03 字节仍由 send 照常写入）。空闲期（无正在追踪的命令）Ctrl+C 不进入周期，避免无谓探针污染缓冲。
+   * 定时器只负责周期性重发探针，不做任何"到点判完成"。
+   * @returns 无
+   */
+  private _startInterruptCycle(): void {
+    // 防抖：周期内重复 Ctrl+C 直接忽略（不重启计时、不额外补探针）
+    if (this._interruptTimer !== null) return
+    // 空闲期 Ctrl+C 无待收尾命令：不进入周期
+    if (this._runningStartPos === null || this._runningCommand === "") return
+    const seq = this._runningSeq
+    const intervalSec = this._interruptProbeIntervalMs / 1000
+    log.info(`中断周期开始 -> seq=${seq}，已立即补发首条探针，之后每 ${intervalSec}s 一条`)
+    // 写完 \x03 后立即补发首条探针（t0），后续 setInterval 自此刻起按间隔补发（t0+N、t0+2N…）
+    this._sendInterruptProbe()
+    this._interruptTimer = setInterval(() => { this._onInterruptTick() }, this._interruptProbeIntervalMs)
+  }
+
+  /**
+   * 中断周期的一次 tick：先判命令是否仍在追踪中，不在则停周期并清状态（不判完成）；
+   * 仍在则补发一次探针。完成判定始终只认当前 seq 的完成标记，与定时器无关。
+   * @returns 无
+   */
+  private _onInterruptTick(): void {
+    if (this._runningStartPos === null || this._runningCommand === "" || !this._connected) {
+      this._stopInterruptCycle("命令已结束或会话关闭")
+      return
+    }
+    this._sendInterruptProbe()
+  }
+
+  /**
+   * 停止中断周期并清周期状态：清定时器，日志记录结束原因（幂等，未在周期内时不做任何事）。
+   * 在命令完成收尾、关会话、开始新命令、运行上下文清理等路径调用。
+   * @param reason 周期结束原因（用于日志）
+   * @returns 无
+   */
+  private _stopInterruptCycle(reason: string): void {
+    if (this._interruptTimer === null) return
+    clearInterval(this._interruptTimer)
+    this._interruptTimer = null
+    log.info(`中断周期结束 -> ${reason}`)
+  }
+
+  /**
+   * 从可见输出中剔除中断探针留下的痕迹（探针命令的回显）。
+   * 探针在用户中断时补发，其回显可能迟到落到后续命令的输出窗口里；按已记录探针 seq
+   * 生成精确回显文本并删除全部出现，从而无论何时到达都剔除。完成标记本身由 stripMarkers
+   * 按标记模式统一去除（不限 seq）。Raw 视图不经此函数，保留原始字节。
+   * @param text 可见输出文本
+   * @returns 剔除探针回显后的文本
+   */
+  private _stripProbeEchoes(text: string): string {
+    if (this._probeSeqs.size === 0) return text
+    let out = text
+    for (const seq of this._probeSeqs) {
+      const echo = this._markerCmd(seq)
+      if (out.includes(echo)) out = out.split(echo).join("")
+    }
+    return out
   }
 
   /**
@@ -461,10 +600,26 @@ export abstract class BaseSession {
     const end = marker.done
       ? extractOutputStart(raw, echoText, marker.pos)
       : extractOutputStart(raw, echoText, raw.length, syntaxMode)
-    if (end <= 0) return stripMarkers(raw)
+    if (end <= 0) {
+      // 未定位到命令回显（超宽命令折行重绘等）：退回整窗；中断命令再截到首个 ^C 回显，
+      // 避免输出残留 ^C 与探针后 shell 重印的提示符（与旧版"中断收尾"输出语义一致）
+      let fallback = raw
+      if (this._interruptSent) {
+        const intr = detectInterrupt(raw, 0)
+        if (intr.interrupted) fallback = raw.slice(0, intr.pos)
+      }
+      return this._stripProbeEchoes(stripMarkers(fallback))
+    }
     let out: string
     if (marker.done) {
-      out = raw.slice(end, marker.pos)
+      // 中断命令：完成标记由探针补发，输出窗口会多出 ^C 回显、重印提示符与探针回显；
+      // 输出在首个 ^C 回显处截断，保留中断前程序输出（探针回显另由 _stripProbeEchoes 剔除）
+      let endPos = marker.pos
+      if (this._interruptSent) {
+        const intr = detectInterrupt(raw, end)
+        if (intr.interrupted) endPos = Math.min(endPos, intr.pos)
+      }
+      out = raw.slice(end, endPos)
     } else if (syntaxMode) {
       // 语法错误：命令整行作废、无 marker → 输出 = 回显结束 → 窗口末尾（含整段错误块），再剥尾部重印提示符
       out = stripTrailingPromptLine(raw.slice(end), raw, this._promptRef)
@@ -473,11 +628,13 @@ export abstract class BaseSession {
       out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
     }
     if (this._adapter) out = out.replace(this._markerCmd(this._runningSeq), "")
-    return stripMarkers(out.replace(/^[\r\n]+/, ""))
+    return this._stripProbeEchoes(stripMarkers(out.replace(/^[\r\n]+/, "")))
   }
 
   /** 命令执行/提交前准备：裁剪已消费缓冲 + 丢弃上一条命令的迟到残留标记 */
   private _beginCapture(command: string): void {
+    // 开始新命令：停掉上一条命令遗留的中断周期（新命令有自己的 seq 与收尾）
+    this._stopInterruptCycle("开始新命令")
     // 用上一条命令完成标记（<SSH_DONE:seq:N>，此刻 _runningSeq 仍是上一条的）定位命令起点；
     // 备屏重放等场景下 buffer 可能含旧标记，裁剪到最后一个标记之后即可
     const marker = detectLastDoneMarker(this._buffer, 0, this._runningSeq)
@@ -597,23 +754,15 @@ export abstract class BaseSession {
           resolve({ kind: "interactive" })
           return
         }
-        // 完成判定（权威）：命令后追加的 printf 输出 <SSH_DONE>，或 Ctrl-C 中断时 TTY 回显 ^C。
-        // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）
+        // 完成判定（权威且唯一）：命令后追加的 printf 输出 <SSH_DONE:seq:code>。
+        // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）。
+        // ^C 回显不作为完成依据：捕获/忽略 SIGINT 的程序（mysql/REPL）同样回显 ^C 但命令未结束，
+        // 据此判完成会把后续命令喂进运行中的程序；中断收尾改由 send() 补发的探针标记触发。
         const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
         if (marker.done) {
           clearInterval(timer)
           resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
           return
-        }
-        // ^C 中断：仅当本次命令确实发送过 Ctrl-C 才检测（无需命令回显定位，
-        // 超宽命令折行重绘会让回显精确匹配失败；未发过 Ctrl-C 时缓冲区里的 ^C 只可能是残留）
-        if (this._interruptSent) {
-          const intr = detectInterrupt(this._buffer, startPos)
-          if (intr.interrupted) {
-            clearInterval(timer)
-            resolve({ kind: "done", markerPos: intr.pos, exitCode: 130 })
-            return
-          }
         }
         // 超过动画窗口仍未出现完成信号 → 交给后台 watch 继续监听（不设硬超时）
         if (now - startTs >= ANIMATION_WINDOW_MS) {
@@ -641,14 +790,12 @@ export abstract class BaseSession {
         if (this._watchTimer) clearInterval(this._watchTimer)
         return
       }
-      // marker 唯一 seq，从命令起点搜索（不依赖命令回显定位）
+      // 完成判定只认当前 seq 的标记：^C 回显不作为完成依据（捕获/忽略 SIGINT 的程序
+      // 同样回显 ^C 但命令未结束，据此判完成会把后续命令喂进运行中的程序）。
+      // 中断收尾由 send() 补发的探针标记触发（见 _sendInterruptProbe）。
       const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
-      // ^C 中断：仅当本次命令确实发送过 Ctrl-C 才检测（超宽命令折行重绘会让回显精确匹配失败）
-      const intr = this._interruptSent ? detectInterrupt(this._buffer, startPos) : { interrupted: false, pos: 0 }
-      const end = marker.done ? marker.pos : intr.pos
-      if (marker.done || intr.interrupted) {
-        const code = marker.done ? marker.exitCode : 130
-        this._completeRunning(startPos, end, code, command)
+      if (marker.done) {
+        this._completeRunning(startPos, marker.pos, marker.exitCode, command)
         return
       }
       // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后按完成收尾，
@@ -688,16 +835,18 @@ export abstract class BaseSession {
   private _completeRunning(startPos: number, endPos: number, exitCode: number | null, command: string, out?: string): string {
     const raw = this._buffer.slice(startPos, endPos)
     const output = out ?? this._extractOutput(raw, command)
-    this._history.append(command, output, this._runningStartTs)
+    this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
     this._emitDone(exitCode, Date.now(), output)
     this._cursor = Math.max(startPos, endPos)
     this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
+    this._stopInterruptCycle("命令完成")
     this._clearRunningContext()
     if (this._watchTimer) clearInterval(this._watchTimer)
     return raw
   }
 
   protected _clearRunningContext(): void {
+    this._stopInterruptCycle("运行上下文清理")
     this._runningStartPos = null
     this._runningCommand = ""
     this._streamPos = null

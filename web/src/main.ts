@@ -502,7 +502,17 @@ async function handleDiff(msg: { sessionID: string; name: string; event: string;
     if (!scr) return
     await scr.write(stripDone(msg.data))
     if (runScreen !== scr) return
-    const html = scr.render().map((row) => '<div class="row"><span class="t"></span><span class="c">' + row + '</span></div>').join("")
+    // 重建整块时保留行尾状态列：done 处理器可能已在 write 挂起期间写入 meta（红 ✗ 一闪而过的竞态），
+    // 此刻 localPairs 末尾的 out 对已由 done 补上 endTs/exitCode，据此重放让 meta 在重建后仍在
+    const lastPair = localPairs[localPairs.length - 1]
+    const lastCmd = [...localPairs].reverse().find((p) => p.type === "cmd")
+    const meta = showTime && lastPair?.type === "out" && (lastPair.endTs !== undefined || lastPair.exitCode !== undefined)
+      ? resultMeta({ ts: lastCmd?.ts, endTs: lastPair.endTs }, lastPair.exitCode)
+      : ""
+    const rows = scr.render()
+    const html = rows
+      .map((row, i) => '<div class="row"><span class="t">' + (i === rows.length - 1 ? meta : "") + '</span><span class="c">' + row + '</span></div>')
+      .join("")
     block.innerHTML = html
     // REPL 交互等持续 out 场景同样需跟随输出滚动（此前仅有 done 时滚动，输出中途会停住）
     updateScrollState(pre, toBottomBtn)

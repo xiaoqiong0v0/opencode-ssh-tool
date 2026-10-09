@@ -49,6 +49,8 @@ export interface TranscriptPair {
   type: "cmd" | "out" | "run" | "sep"
   ts?: number
   endTs?: number
+  /** 命令退出码（随 out 对透传；undefined = 未知，前端只显示耗时、不误判成功） */
+  exitCode?: number
   text: string
 }
 
@@ -103,7 +105,7 @@ export function startServer(
   const agents = new Map<WsClient, Set<string>>()
   const agentBySession = new Map<string, WsClient>()
   const streamBuf = new Map<string, StreamBufEntry>()
-  const rawBuf = new Map<string, { data: string; pos: number }>()
+  const rawBuf = new Map<string, { data: string; pos: number; generation: string }>()
   const cmdCount = new Map<string, number>()
   /** 排队序列保持 busy 的 key（agent 报 more=true 加入，最后一条 done 移除） */
   const seqHold = new Set<string>()
@@ -394,15 +396,28 @@ export function startServer(
         const name = typeof msg.name === "string" ? msg.name : ""
         const data = typeof msg.data === "string" ? msg.data : ""
         const pos = typeof msg.pos === "number" ? msg.pos : 0
+        const generation = typeof msg.generation === "string" ? msg.generation : ""
         if (!sid) return
         const k = sessionKey(sid, name)
         const existing = rawBuf.get(k)
-        if (msg.reset === true || !existing) rawBuf.set(k, { data, pos })
-        else if (data) rawBuf.set(k, { data: existing.data + data, pos })
-        // 直接转发给 raw 订阅者（agent 推的已是增量、WS 保序）
-        for (const c of subscribersOf(sid, name)) {
-          if (c._mode !== "raw") continue
-          send(c, { type: "raw", data, pos, reset: msg.reset === true })
+        // 代次不同 = 同名会话已重建（或 agent 进程重启）：旧 rawBuf 作废，向订阅者下发 reset 清屏，
+        // 再以本帧为新基线（即使 data 为空也要清，不依赖"新数据恰好非空"）。
+        // msg.reset=true（agent 重连重发全量/ring 裁剪）同样走 replace 语义，避免叠加重复。
+        if (msg.reset === true || !existing || existing.generation !== generation) {
+          rawBuf.set(k, { data, pos, generation })
+          for (const c of subscribersOf(sid, name)) {
+            if (c._mode !== "raw") continue
+            send(c, { type: "raw", data, pos, reset: true })
+          }
+          return
+        }
+        if (data) {
+          rawBuf.set(k, { data: existing.data + data, pos, generation })
+          // 直接转发给 raw 订阅者（agent 推的已是增量、WS 保序）
+          for (const c of subscribersOf(sid, name)) {
+            if (c._mode !== "raw") continue
+            send(c, { type: "raw", data, pos, reset: false })
+          }
         }
         return
       }
@@ -617,13 +632,14 @@ function readHistoryFromFile(dir: string, sessionID: string, name: string): Tran
   const out: TranscriptPair[] = []
   for (const f of files) {
     try {
-      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string; ts?: number; endTs?: number }
+      const data = JSON.parse(readFileSync(join(hdir, f), "utf8")) as { command?: string; output?: string; ts?: number; endTs?: number; exitCode?: number }
       if (data.command === "__SSH_SEP__") {
         out.push({ type: "sep", ts: data.ts ?? Date.now(), text: "" })
         continue
       }
       if (typeof data.command === "string") out.push({ type: "cmd", ts: data.ts ?? Date.now(), endTs: data.endTs, text: data.command })
-      if (typeof data.output === "string") out.push({ type: "out", text: data.output })
+      // 老记录无 exitCode 字段 → 保持 undefined（未知），前端不显示退出标识
+      if (typeof data.output === "string") out.push({ type: "out", exitCode: typeof data.exitCode === "number" ? data.exitCode : undefined, text: data.output })
     } catch {
       /* skip */
     }

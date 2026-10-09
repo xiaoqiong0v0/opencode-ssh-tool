@@ -255,6 +255,8 @@ export const OpenCodeSshTool: Plugin = async () => {
   const webLang = getWebLang(cfg.webLang)
   // 权限判定器：内置正则 + 配置自定义 deny/allow 正则
   const decide = createDecider(cfg.permission.deny, cfg.permission.allow)
+  // 中断探针补发间隔：配置为秒（默认 5，已在 config 校验 >0），会话构造时转毫秒（下限 1ms）
+  const interruptProbeIntervalMs = Math.max(1, Math.round(cfg.interruptProbeInterval * 1000))
   // 服务启动 Promise（null=配置未启用）；失败已在 server-manager 内收敛为失败结果，这里再兜底 catch 避免 unhandled rejection
   let serverStart: Promise<ServerResult> | null = null
   if (cfg.server.enabled) {
@@ -334,7 +336,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       old.close()
       map!.delete(name)
     }
-    const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name, toolLang)
+    const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ host, user, port, password: values.password })
     log.tool("ssh_connect", { host, user, port: port ?? 22, name })
     if (!result.ok) {
@@ -361,7 +363,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       old.close()
       map!.delete(name)
     }
-    const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name, toolLang)
+    const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ command, cwd: values.cwd })
     log.tool("local_connect", { command, name })
     if (!result.ok) {

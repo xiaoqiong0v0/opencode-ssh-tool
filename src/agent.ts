@@ -18,6 +18,8 @@ export interface AgentSession {
   setLifecycle(listener: ((ev: { type: "start"; command: string; ts: number } | { type: "done"; exitCode: number | null; endTs: number; output?: string }) => void) | null): void
   /** 读取原始字节流增量 */
   readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
+  /** 会话实例代次：同名重建/进程重启后变化，用于判定新会话并重置 raw 增量游标 */
+  readonly generation: string
 }
 
 /** 代理状态 */
@@ -52,7 +54,8 @@ export function startAgent(
     send({ type: "register", sessions: listSessions() })
   }
 
-  const rawPosMap = new Map<string, number>()
+  /** raw 增量游标：按会话实例代次记录已推位置；代次不同即新会话，从 0 重新读 */
+  const rawPosMap = new Map<string, { gen: string; pos: number }>()
   /** 已挂接生命周期监听的会话对象（按对象去重：同名会话断开重建是新对象，需重新挂接） */
   const lifeHooked = new WeakSet<object>()
   /** 会话执行队列：命令 busy 时 web 提交的命令排队，当前命令完成后依次执行（key=sessionID:name） */
@@ -132,10 +135,14 @@ export function startAgent(
       const key = `${sessionID}:${name}`
       if (!session) continue
       hookLifecycle(key, session)
-      const raw = session.readRawStream(rawPosMap.get(key) ?? 0)
-      if (raw.data) {
-        rawPosMap.set(key, raw.pos)
-        send({ type: "raw", sessionID, name, data: raw.data, pos: raw.pos, reset: !!raw.reset })
+      // 代次变化 = 同名会话已重建（新实例）：丢弃旧游标从 0 重读；即使暂无新数据也要上报（带 reset），
+      // 让 server 立即清空该 key 的 rawBuf 并给订阅者下发清屏，不能依赖"新数据恰好非空"
+      const prev = rawPosMap.get(key)
+      const genChanged = !prev || prev.gen !== session.generation
+      const raw = session.readRawStream(genChanged ? 0 : prev.pos)
+      rawPosMap.set(key, { gen: session.generation, pos: raw.pos })
+      if (raw.data || genChanged || raw.reset) {
+        send({ type: "raw", sessionID, name, data: raw.data, pos: raw.pos, reset: genChanged || !!raw.reset, generation: session.generation })
       }
       if (!session.hasRunningStream()) continue
       const st = session.getRunningStream()
@@ -155,6 +162,9 @@ export function startAgent(
     ws.onopen = () => {
       log.info(`代理已连接 ${wsUrl}`)
       register()
+      // 重连后清空 raw 游标：server 可能已重启（rawBuf 丢失）或本进程原地重连，
+      // 首帧统一以"新代次"重发全量并带 reset，server 端 replace 语义保证不重复累积
+      rawPosMap.clear()
       timer = setInterval(pushStreams, 100)
     }
     ws.onmessage = (ev: MessageEvent) => {
