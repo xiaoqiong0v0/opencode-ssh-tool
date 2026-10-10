@@ -56,8 +56,8 @@ export const T = {
     zh: "本地终端启动失败",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / status / disconnect / help. Use 'help' for full usage.",
-    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / status / disconnect / help。用 'help' 查看完整用法。",
+    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read; use -w only for commands expected to finish quickly.",
+    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read；-w 只用于预期很快结束的命令。",
   },
   term_cli_args: {
     en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host'; defaults to 'help' when empty.",
@@ -76,7 +76,7 @@ Subcommands:
   local "<command>" [-n name] [-c cwd]
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
   exec "<command>" [-n name] [-w]
-      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits for the result)
+      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; for long-running / stdin-reading / interactive commands use the default and poll with status/read, because -w keeps waiting as long as the command runs)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [-n name]
@@ -111,7 +111,7 @@ Examples:
   local "<command>" [-n name] [-c cwd]
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
   exec "<command>" [-n name] [-w]
-      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等待结果）
+      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；长时间运行 / 需要 stdin / 交互的命令请用默认模式，再用 status/read 轮询，因为只要命令没结束 -w 就会一直等）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [-n name]
@@ -230,8 +230,8 @@ Examples:
     zh: "终端已断开",
   },
   status_busy_hint: {
-    en: "\nHint: a command is still running. Wait and retry, or call term_cli read for partial output.",
-    zh: "\n提示：仍有命令在执行，请等待后重试或调用 term_cli read 获取部分输出。",
+    en: "\nHint: a command is still running. Wait and retry, or call term_cli read for partial output. Do not re-run it with -w.",
+    zh: "\n提示：已有命令在运行。等它结束，或直接用 term_cli read 读取部分输出；不要用 -w 重跑。",
   },
   status_idle_hint: {
     en: "\nHint: no command running. You can safely execute a new command or call term_cli read for remaining output.",

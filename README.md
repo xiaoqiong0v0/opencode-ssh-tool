@@ -33,7 +33,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ```text
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
-term_cli exec "<command>" [-n name] [-w]                          # 执行命令
+term_cli exec "<command>" [-n name] [-w]                          # 执行命令（默认提交后立即返回；-w 等到命令真正结束，仅用于预期很快结束的命令）
 term_cli read [-n name] [-s buffer|history] [-l limit] [--head]   # 读输出
 term_cli send "<text>" [-n name]                                  # 发送按键（sudo 密码等）
 term_cli status [-n name]                                         # 状态
