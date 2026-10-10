@@ -115,8 +115,9 @@ export function startServer(
     const path = url.pathname
 
     if (path === "/health") {
+      // 自证身份：返回本服务进程 pid，供 ensureServer 在终止旧进程前校验归属（防 pid 复用误杀）
       res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(JSON.stringify({ ok: true }))
+      res.end(JSON.stringify({ ok: true, pid: process.pid }))
       return
     }
 

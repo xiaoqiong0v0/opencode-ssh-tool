@@ -69,6 +69,26 @@ async function probe(port: number): Promise<boolean> {
 }
 
 /**
+ * 读取端口上服务 /health 自证的身份（其自身进程 pid），用于终止前校验归属。
+ * 取不到 / 超时 / 响应非 2xx / 响应体异常 / 无 pid 字段均返回 null，表示"身份未知"。
+ * @param port 待探测端口
+ * @returns 服务自报 pid；无法确认时返回 null
+ */
+async function probeServerPid(port: number): Promise<number | null> {
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT)
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctrl.signal })
+    clearTimeout(timer)
+    if (!r.ok) return null
+    const body = (await r.json()) as { pid?: unknown }
+    return typeof body?.pid === "number" ? body.pid : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 预检端口在本机 127.0.0.1 能否绑定（快速失败）：
  * 固定端口落在系统保留区间时立即得到 EACCES，无需 spawn 子进程后干等启动超时。
  * @param port 待检查端口（仅用于固定端口，>0）
@@ -185,14 +205,24 @@ function acquireLock(dir: string): boolean {
 }
 
 /**
- * 杀掉可能仍在运行的旧服务进程并等待端口释放：
+ * 杀掉可能仍在运行的旧服务进程并等待端口释放（跨平台，不依赖 lsof/wmic）：
  * detached 子进程不随插件进程退出，升级后旧进程可能仍占住端口，
  * 必须显式 kill 后再 spawn，否则新进程 bind 失败。
+ * 杀之前先向 info.port 取 /health 自证身份：仅当响应 pid 与 info.pid 一致才发 SIGTERM，
+ * 防止 server.json 残留的 pid 已被系统回收给无关进程时误杀。
+ * /health 取不到、超时、响应异常、pid 缺失或不匹配 → 一律不杀（宁可留僵尸元数据，也不误杀），
+ * 残留元数据（server.json / 陈旧锁）交由既有清理路径处理，随后继续启动新服务。
  * @param info 服务信息（含 pid/port）
- * @returns 端口是否已释放
  */
-async function killStale(info: ServerInfo | null): Promise<boolean> {
-  if (!info) return true
+async function killStale(info: ServerInfo | null): Promise<void> {
+  if (!info) return
+  const selfPid = await probeServerPid(info.port)
+  if (selfPid === null || selfPid !== info.pid) {
+    log.info(
+      `跳过终止 pid=${info.pid}：其不在我们的端口 ${info.port} 上服务 / pid 归属不符（端口自报 pid=${selfPid ?? "未知"}），仅清理残留元数据`,
+    )
+    return
+  }
   try {
     process.kill(info.pid, "SIGTERM")
   } catch {
@@ -200,11 +230,9 @@ async function killStale(info: ServerInfo | null): Promise<boolean> {
   }
   const deadline = Date.now() + KILL_WAIT_MAX
   while (Date.now() < deadline) {
-    const alive = await probe(info.port)
-    if (!alive) return true
+    if (!(await probe(info.port))) return
     await new Promise((r) => setTimeout(r, 200))
   }
-  return false
 }
 
 /** 失败结果：url 为空串，调用方据此判定服务不可用（命令执行不受影响） */
