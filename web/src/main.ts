@@ -314,10 +314,10 @@ let lastPingAt = 0
 let heartbeatTimer: number | null = null
 /** 命令框/直接输入当前是否可用（由 applyInputState 依据 WS 与终端连接状态维护） */
 let inputEnabled = false
-/** 直接输入开关的持久化键（localStorage） */
+/** 直接输入开关的历史持久化键（已废弃：改为焦点驱动，仅用于启动时清理旧值，避免残留影响默认） */
 const DIRECT_INPUT_PREF_KEY = "directInput"
-/** 直接输入开关（用户偏好，默认开＝一直可输入；关掉后按键回归浏览器/页面） */
-let directInputOn = localStorage.getItem(DIRECT_INPUT_PREF_KEY) !== "0"
+/** 直接输入开关：由焦点驱动，默认关（命令框优先）；点终端区域/入口按钮开启，焦点回命令框即关闭 */
+let directInputOn = false
 let sessionsData: SessionStatus[] = []
 let stickToBottom = true
 let runScreen: HeadlessScreen | null = null
@@ -497,11 +497,18 @@ function inputState(): { enabled: boolean; reason: string } {
  */
 function applyInputState(): void {
   const st = inputState()
+  const wasEnabled = inputEnabled
   inputEnabled = st.enabled
   const cmdInput = document.getElementById("cmdInput") as HTMLTextAreaElement
   cmdInput.disabled = !st.enabled
   cmdInput.placeholder = st.enabled ? (I18N.cmdPlaceholder || "") : st.reason
   cmdInput.title = st.reason
+  // 由「不可用」转「可用」（首次就绪/重连恢复）：默认焦点交还命令框并关闭直接输入，
+  // 保证「命令框优先」且焦点状态与显示一致（不会出现显示已启用、实际焦点在命令框的错位）。
+  if (st.enabled && !wasEnabled) {
+    setDirectInput(false)
+    cmdInput.focus()
+  }
   updateCmdKey()
   const status = document.getElementById("connStatus")
   if (status) {
@@ -1077,8 +1084,10 @@ function autoGrowCmdInput(): void {
 cmdInput.addEventListener("input", autoGrowCmdInput)
 
 // ===== 直接输入（交互输入）=====
-// 文档级按键捕获：默认启用（无需先点击激活），可点击指示器关闭（关闭后按键回归浏览器/页面）。
-// 按键一律走 type:"send"（keystroke 通道），不产生 exec、不写命令记录；命令框仍走 exec 发命令。
+// 由焦点驱动：页面默认焦点在命令框（按键留在浏览器、走 exec 发命令）；
+// 点终端区域（transcript `#term` / raw `#xt`）或入口按钮 → 启用（按键走 type:"send" keystroke 通道，
+// 不产生 exec、不写命令记录）；焦点回到命令框/其它可编辑控件 → 自动关闭。
+// 状态不持久化，每次打开都是「命令框优先」。指示器文案始终跟随开关，二者共用一个入口，不会错位。
 // 按键 → 终端字节序列的映射（含 Home/End/PgUp/PgDn/Delete/Shift+Tab/Esc 等）集中在 ./keys.ts；
 // 发送的是**真实控制字节**（0x7f/0x09/ESC 引导序列），与后端通用解码口径一致（见 src/escapes.ts）。
 
@@ -1088,6 +1097,17 @@ function isEditableTarget(t: EventTarget | null): boolean {
   if (!el || !el.tagName) return false
   const tag = el.tagName.toUpperCase()
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || el.isContentEditable
+}
+
+/**
+ * 目标是否位于终端展示区域（transcript `#term` / raw `#xt`，含 xterm 内部辅助 textarea）。
+ * 该区域内的可编辑控件（xterm 隐藏输入框）不算「命令框」，不应据此关闭直接输入。
+ * @param t 事件目标
+ * @returns 是否在终端区域内
+ */
+function inTerminalArea(t: EventTarget | null): boolean {
+  const el = t as Element | null
+  return !!el && typeof el.closest === "function" && !!el.closest("#term, #xt")
 }
 
 /** 发送一段按键文本到当前终端（keystroke 通道，不写命令记录） */
@@ -1100,7 +1120,8 @@ function sendKeystroke(text: string): void {
 
 /**
  * 刷新直接输入指示器：文案随开关状态（中/英），高亮随可用性。
- * 默认开＝"一直可输入"；端点离线/WS 断开时叠加 disabled 样式（原因由 connStatus 显示）。
+ * 关闭＝按键留在浏览器（命令框优先）；启用＝按键发往终端。
+ * 端点离线/WS 断开时叠加 disabled 样式（原因由 connStatus 显示）。
  */
 function updateCmdKey(): void {
   const key = document.getElementById("cmdKey") as HTMLSpanElement | null
@@ -1113,23 +1134,34 @@ function updateCmdKey(): void {
   key.setAttribute("aria-pressed", directInputOn ? "true" : "false")
 }
 
-// 指示器即开关：点击切换直接输入（关掉后按键回归浏览器/页面），状态持久化到 localStorage
+/** 设置直接输入开关并即时刷新指示器（唯一改状态入口，保证显示与实际生效一致） */
+function setDirectInput(on: boolean): void {
+  if (directInputOn === on) return
+  directInputOn = on
+  updateCmdKey()
+}
+
+// 入口指示器即开关：点击显式切换（与焦点驱动共享同一状态，二者不会打架）
 const cmdKey = document.getElementById("cmdKey") as HTMLSpanElement
 cmdKey.setAttribute("role", "switch")
-cmdKey.addEventListener("click", () => {
-  directInputOn = !directInputOn
-  localStorage.setItem(DIRECT_INPUT_PREF_KEY, directInputOn ? "1" : "0")
-  updateCmdKey()
+cmdKey.addEventListener("click", () => setDirectInput(!directInputOn))
+
+// 焦点驱动：点终端区域启用；焦点落到命令框/其它可编辑控件（终端辅助 textarea 除外）即关闭
+document.addEventListener("click", (ev) => {
+  if (inTerminalArea(ev.target)) setDirectInput(true)
+})
+document.addEventListener("focusin", (ev) => {
+  if (isEditableTarget(ev.target) && !inTerminalArea(ev.target)) setDirectInput(false)
 })
 
 /**
- * 直接输入按键处理：开关开启且终端可用时生效（无需点击激活）。
+ * 直接输入按键处理：开关开启且终端可用时生效。
  * 焦点在命令框/选择框等控件上、浏览器快捷键、Cmd 组合、端点离线时一律不拦截。
  * @param ev keydown 事件
  */
 function onDirectInputKeydown(ev: KeyboardEvent): void {
   if (!directInputOn) return
-  if (isEditableTarget(ev.target)) return
+  if (isEditableTarget(ev.target) && !inTerminalArea(ev.target)) return
   if (!inputEnabled) return
   const seq = mapKeystroke(ev)
   if (seq === null) return
@@ -1137,6 +1169,9 @@ function onDirectInputKeydown(ev: KeyboardEvent): void {
   sendKeystroke(seq)
 }
 document.addEventListener("keydown", onDirectInputKeydown, true)
+
+// 清理旧的持久化值：状态改由焦点驱动，保证每次打开都是「命令框优先」而非上次的残留
+localStorage.removeItem(DIRECT_INPUT_PREF_KEY)
 updateCmdKey()
 
 Object.assign(window, {

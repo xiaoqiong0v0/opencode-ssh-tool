@@ -44,7 +44,7 @@ body:not(.show-time) .row .t { display: none; }
 #cmdKey { flex: 0 0 auto; max-width: 46%; text-align: center; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 #cmdKey.on { border-color: #3fb950; color: #3fb950; background: #0f2417; }
 #cmdKey.off { border-color: #30363d; color: #8b949e; background: #161b22; }
-#cmdKey.disabled { opacity: 0.35; cursor: default; }
+#cmdKey.disabled { opacity: 0.35; cursor: default; pointer-events: none; }
 .tgl.disabled { opacity: 0.35; pointer-events: none; }
 .conn-status { display: none; flex: 0 0 auto; padding: 6px 16px; background: #3d1f1f; color: #ff7b72; border-top: 1px solid #30363d; font-size: 13px; }
 .conn-status.show { display: block; }
