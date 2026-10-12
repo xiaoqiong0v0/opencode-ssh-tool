@@ -3,7 +3,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import stringArgv from "string-argv"
 import { parseArgs } from "node:util"
-import log from "./log.js"
+import log, { infoDedupShared } from "./log.js"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -111,8 +111,9 @@ function listSessionEntries(): SessionEntry[] {
  * 同步某终端状态到共享文件（跨进程聚合展示用，SSH 与本地/容器通用）
  * @param sessionID opencode 会话 ID
  * @param name 终端名（默认 default）
+ * @param reason 写入原因（connect / exec前 / exec后 / send / session-meta 等，用于日志追溯）
  */
-function syncSessionState(sessionID: string, name = DEFAULT_NAME): void {
+function syncSessionState(sessionID: string, name = DEFAULT_NAME, reason = "sync"): void {
   const session = resolveSession(sessionID, name)
   if (!session) return
   const st = session.getStatus()
@@ -134,7 +135,7 @@ function syncSessionState(sessionID: string, name = DEFAULT_NAME): void {
     title: meta?.title,
     directory: meta?.directory,
     updatedAt: Date.now(),
-  })
+  }, reason)
 }
 
 /** 按 sessionID 取本地/容器终端表（无则返回 undefined） */
@@ -245,7 +246,9 @@ export const OpenCodeSshTool: Plugin = async () => {
     }
     return cur
   }
-  log.loaded()
+  // 插件实例批量加载（评测一次起多个 opencode run）时，"loaded" 每实例刷一条无信息量，
+  // 用跨进程短窗去重合并（同一时间窗内多次加载只记一条，下次窗口外补"重复 N 次"）
+  infoDedupShared("plugin-loaded", "loaded", 10000)
 
   // 加载配置并"发起"HTTP 终端记录服务启动（默认开启；端口 0=自动分配）。
   // 刻意不 await：服务启动慢/失败均不阻塞插件加载与命令执行；需要 URL 的路径再惰性等待下面的 Promise。
@@ -264,7 +267,8 @@ export const OpenCodeSshTool: Plugin = async () => {
       .then((sr) => {
         if (sr.url) {
           httpUrl = sr.url
-          log.info(`HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`)
+          // 多实例共享同一服务，"复用"行按 url 跨进程去重（首次"已启动"仍即时可见）
+          infoDedupShared(`http-service:${sr.url}`, `HTTP 服务${sr.reused ? "复用" : "已启动"} ${sr.url}`, 10000)
           const wsUrl = sr.url.replace(/^http/, "ws") + "/ws"
           agent = startAgent(wsUrl, resolveAgentSession, listAgentSessions)
         } else {
@@ -338,14 +342,14 @@ export const OpenCodeSshTool: Plugin = async () => {
     }
     const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ host, user, port, password: values.password })
-    log.tool("ssh_connect", { host, user, port: port ?? 22, name })
+    log.tool("ssh_connect", { sessionID: ctx.sessionID, name, host, user, port: port ?? 22 })
     if (!result.ok) {
       session.close()
       return `${tr("connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
     }
     if (!map) sshSessions.set(ctx.sessionID, new Map())
     sshSessions.get(ctx.sessionID)!.set(name, session)
-    syncSessionState(ctx.sessionID, name)
+    syncSessionState(ctx.sessionID, name, "connect")
     refreshAgent()
     return tr("connect_ok", toolLang).replace("{user}", user).replace("{host}", host).replace("{port}", String(port ?? 22)).replace("{sid}", ctx.sessionID).replace("{name}", name)
   }
@@ -365,14 +369,14 @@ export const OpenCodeSshTool: Plugin = async () => {
     }
     const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ command, cwd: values.cwd })
-    log.tool("local_connect", { command, name })
+    log.tool("local_connect", { sessionID: ctx.sessionID, name, command })
     if (!result.ok) {
       session.close()
       return `${tr("local_connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
     }
     if (!map) localSessions.set(ctx.sessionID, new Map())
     localSessions.get(ctx.sessionID)!.set(name, session)
-    syncSessionState(ctx.sessionID, name)
+    syncSessionState(ctx.sessionID, name, "local")
     refreshAgent()
     return tr("local_connect_ok", toolLang).replace("{cmd}", command).replace("{name}", name)
   }
@@ -386,7 +390,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!session) return tr("not_connected", toolLang)
     const decision = decide(command)
     if (decision === "deny") {
-      log.tool("term_exec_denied", { command })
+      log.tool("term_exec_denied", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, command })
       return tr("denied_danger", toolLang)
     }
     if (decision === "ask") {
@@ -397,10 +401,10 @@ export const OpenCodeSshTool: Plugin = async () => {
       }
     }
     const name = values.name ?? DEFAULT_NAME
-    syncSessionState(ctx.sessionID, name)
+    syncSessionState(ctx.sessionID, name, "exec前")
     const result = values.waitResult ? await session.exec(command) : await session.submit(command)
-    syncSessionState(ctx.sessionID, name)
-    log.tool("term_exec", { command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
+    syncSessionState(ctx.sessionID, name, "exec后")
+    log.tool("term_exec", { sessionID: ctx.sessionID, name, command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
     if (result.submitted) return tr("submitted", toolLang)
     return result.ok ? result.output : result.error ?? tr("exec_failed", toolLang)
   }
@@ -439,8 +443,8 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!session) return tr("not_connected", toolLang)
     const r = session.send(text)
     if (!r.ok) return tr("err_not_connected", toolLang)
-    syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME)
-    log.tool("term_send", { text: text.slice(0, 60), name: values.name ?? DEFAULT_NAME })
+    syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME, "send")
+    log.tool("term_send", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, text: text.slice(0, 60) })
     return tr("send_ok", toolLang).replace("{text}", text.slice(0, 60))
   }
 
@@ -559,7 +563,7 @@ export const OpenCodeSshTool: Plugin = async () => {
           }
           // 有活动终端时同步状态文件
           const map = getSessionMap(root)
-          if (map) for (const name of map.keys()) syncSessionState(root, name)
+          if (map) for (const name of map.keys()) syncSessionState(root, name, "session-meta")
         }
       }
       if (event.type === "session.deleted") {

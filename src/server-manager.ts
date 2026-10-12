@@ -9,7 +9,7 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { createServer } from "node:net"
 import type { Lang } from "./i18n.js"
 import { SERVER_PROTO_VERSION } from "./constants.js"
-import log from "./log.js"
+import log, { infoDedupShared } from "./log.js"
 
 /** 服务句柄（独立进程托管，本进程无 ServerHandle） */
 export interface ServerResult {
@@ -225,6 +225,7 @@ async function killStale(info: ServerInfo | null): Promise<void> {
   }
   try {
     process.kill(info.pid, "SIGTERM")
+    log.info(`终止旧独立服务 pid=${info.pid}（端口 ${info.port}，等待端口释放）`)
   } catch {
     // 进程可能已退出或无权 kill，交由端口探测判断
   }
@@ -233,6 +234,7 @@ async function killStale(info: ServerInfo | null): Promise<void> {
     if (!(await probe(info.port))) return
     await new Promise((r) => setTimeout(r, 200))
   }
+  log.warn(`旧独立服务 pid=${info.pid} 未在 ${KILL_WAIT_MAX}ms 内释放端口 ${info.port}，继续尝试启动新服务`)
 }
 
 /** 失败结果：url 为空串，调用方据此判定服务不可用（命令执行不受影响） */
@@ -285,14 +287,19 @@ async function ensureServerOnce(
 ): Promise<ServerResult> {
   mkdirSync(dir, { recursive: true })
 
+  /** 本次被终止/判定为陈旧的旧服务 pid（用于日志对齐"旧 pid → 新 pid"的替换关系） */
+  let replacedPid: number | null = null
+
   // 1. 探测既有服务（固定端口场景可复用；旧版本实例不复用，杀旧后新启）
   if (port > 0) {
     const info = readInfo(dir)
     if (isCurrentVersion(info) && info!.port === port && (await probe(port))) {
+      infoDedupShared(`reuse-service:${port}`, `复用现有独立服务 pid=${info!.pid} port=${port}（proto ${info!.proto}）`, 10000)
       return { server: null, url: `http://127.0.0.1:${port}`, port, reused: true }
     }
     if (info && info.port === port && (await probe(port)) && !isCurrentVersion(info)) {
       log.info(`检测到旧版服务 pid=${info.pid}（proto ${info.proto ?? "?"}），重启独立服务`)
+      replacedPid = info.pid
       await killStale(info)
     }
   }
@@ -307,9 +314,11 @@ async function ensureServerOnce(
       await new Promise((r) => setTimeout(r, 200))
       const info = readInfo(dir)
       if (info && isCurrentVersion(info) && (await probe(info.port))) {
+        infoDedupShared(`reuse-service:${info.port}`, `复用现有独立服务 pid=${info.pid} port=${info.port}（锁竞争等待后探测到）`, 10000)
         return { server: null, url: `http://127.0.0.1:${info.port}`, port: info.port, reused: true }
       }
       if (info && !isCurrentVersion(info) && (await probe(info.port))) {
+        replacedPid = info.pid
         await killStale(info)
       }
       acquired = acquireLock(dir)
@@ -320,7 +329,10 @@ async function ensureServerOnce(
   try {
     // 3. 拿锁成功：先清残留旧进程（可能 pid 已退出或锁内刚杀掉），再启动新版
     const leftover = readInfo(dir)
-    if (leftover && !isCurrentVersion(leftover)) await killStale(leftover)
+    if (leftover && !isCurrentVersion(leftover)) {
+      replacedPid = leftover.pid
+      await killStale(leftover)
+    }
 
     // 固定端口：spawn 前预检可绑定，绑定被拒（如 Windows 保留区间 EACCES）立即失败，不回退不重试
     if (port > 0) {
@@ -341,6 +353,11 @@ async function ensureServerOnce(
       }
       const info = readInfo(dir)
       if (info && isCurrentVersion(info) && (await probe(info.port))) {
+        if (replacedPid !== null) {
+          log.info(`独立服务已替换 ${replacedPid} -> ${info.pid}（port ${info.port}）`)
+        } else {
+          log.info(`独立服务已启动 pid=${info.pid} port=${info.port}（本进程启动，非复用）`)
+        }
         return { server: null, url: `http://127.0.0.1:${info.port}`, port: info.port, reused: false }
       }
       await new Promise((r) => setTimeout(r, 200))

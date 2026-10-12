@@ -1,7 +1,7 @@
 // 代理客户端：插件进程连上独立服务（WS），注册本进程持有的会话，
 // 处理服务转发来的交互命令（run-exec / run-send / run-delete），并把实时流推给服务。
 
-import log from "./log.js"
+import log, { debug, infoDedup, infoDedupShared } from "./log.js"
 import { INTERACTIVE_BUSY_MS } from "./constants.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
@@ -44,6 +44,8 @@ export function startAgent(
   let ws: WebSocket | null = null
   let closed = false
   let timer: ReturnType<typeof setInterval> | null = null
+  /** 连接成功次数（1=首次连接，>1=重连），用于在日志里区分首连与重连 */
+  let connSeq = 0
 
   const wsUrl = url.startsWith("ws://") ? url : `ws://${url}`
   const send = (msg: unknown): void => {
@@ -160,8 +162,27 @@ export function startAgent(
       return
     }
     ws.onopen = () => {
-      log.info(`代理已连接 ${wsUrl}`)
+      connSeq += 1
+      // 连接事件跨进程按"第 N 次 + 地址"合并（批量实例首连 connSeq 均为 1，合并为一行 + 计数）
+      infoDedupShared(`agent-open:${wsUrl}:${connSeq}`, `代理已连接 ${wsUrl}（第 ${connSeq} 次）`, 10000)
       register()
+      // 重连后记录本进程仍在运行中的会话：当前不补播 cmdStart（server 端 streamBuf 已随其重启丢失），
+      // 至少把"发现 N 个运行中会话、未补播"这一事实落盘，便于事后判断 busy 状态是否失联。
+      const running: string[] = []
+      const all: string[] = []
+      for (const { sessionID, name } of listSessions()) {
+        const k = `${sessionID}/${name}`
+        all.push(k)
+        const s = resolveSession(sessionID, name)
+        if (s?.hasRunningStream()) running.push(k)
+      }
+      const tag = connSeq > 1 ? "重连" : "首连"
+      if (running.length) {
+        log.info(`代理${tag}发现 ${running.length} 个运行中会话（未补播 cmdStart，busy 以本进程为准）: ${running.join(", ")}`)
+      } else {
+        // 空态属周期性噪声，降到 debug（置 SSH_TOOL_DEBUG=1 才落盘）；仍带上本进程会话 key，便于按主会话 ID 关联
+        debug(`代理${tag}未发现运行中会话（${wsUrl}）本进程会话: ${all.length ? all.join(", ") : "无"}`)
+      }
       // 重连后清空 raw 游标：server 可能已重启（rawBuf 丢失）或本进程原地重连，
       // 首帧统一以"新代次"重发全量并带 reset，server 端 replace 语义保证不重复累积
       rawPosMap.clear()
@@ -235,7 +256,14 @@ export function startAgent(
     ws.onclose = () => {
       if (timer) { clearInterval(timer); timer = null }
       if (closed) return
-      log.info("代理连接断开，2s 后重连")
+      // 断开时记录受影响的终端列表；重连每 2s 重试一次，用 10s 窗口去重避免刷屏（重复次数附在汇总行）。
+      // 去重键含受影响终端列表：同一批终端反复断连才合并，终端集合变化时立即另记一行，不丢会话归属信息。
+      const keys = listSessions().map(({ sessionID, name }) => `${sessionID}/${name}`)
+      infoDedup(
+        `agent-close:${wsUrl}:${keys.join(",")}`,
+        `代理连接断开（受影响终端: ${keys.length ? keys.join(", ") : "无"}），2s 后重连`,
+        10000,
+      )
       setTimeout(connect, 2000)
     }
     ws.onerror = () => { /* onclose 会触发重连 */ }

@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     "utf8",
   )
 
-  log.info(`独立服务启动 ${handle.url} (pid ${process.pid})`)
+  log.info(`独立服务启动 ${handle.url} (pid ${process.pid}, proto ${SERVER_PROTO_VERSION})，内存流缓冲 streamBuf 初始为空（新进程不复用旧内存，旧进程追踪中的命令状态需 agent 重连后重新上报）`)
 
   // 空闲自动关闭：无任何 connected 会话持续 idleShutdownMs 后退出（0=不关闭）
   if (idleShutdownMs > 0) {

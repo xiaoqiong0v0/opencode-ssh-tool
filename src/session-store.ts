@@ -2,6 +2,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { infoDedup } from "./log.js"
 
 /** 跨进程会话状态（写入共享目录供聚合） */
 export interface SessionState {
@@ -32,12 +33,23 @@ function stateFile(sessionsDir: string, sessionID: string, name: string): string
   return join(sessionsDir, `${sessionID}-${name}.json`)
 }
 
-/** 写/更新某会话状态文件（进程内会话变化时调用） */
-export function writeSessionState(cacheRoot: string, state: SessionState): void {
+/**
+ * 写/更新某会话状态文件（进程内会话变化时调用）。
+ * 状态文件是 server 拿不到 agent 实时流时 busy 的回退来源，故每次写入记一行
+ * （写入值 + 原因 + 目标终端；短窗去重防刷屏），便于事后判断 busy 来源是否陈旧。
+ * @param cacheRoot 插件缓存根目录
+ * @param state 会话状态（写入内容）
+ * @param reason 写入原因（connect / exec前 / exec后 / send / session-meta 等）
+ */
+export function writeSessionState(cacheRoot: string, state: SessionState, reason = "sync"): void {
   try {
     const dir = join(cacheRoot, SESSIONS_DIR)
     mkdirSync(dir, { recursive: true })
     writeFileSync(stateFile(dir, state.sessionID, state.name), JSON.stringify(state), "utf8")
+    infoDedup(
+      `state-write:${state.sessionID}|${state.name}|${reason}|${state.busy}|${state.connected}`,
+      `[state] 写状态文件 ${state.sessionID}/${state.name} busy=${state.busy} connected=${state.connected} reason=${reason}`,
+    )
   } catch {
     /* 忽略写失败 */
   }

@@ -2,6 +2,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { debug } from "./log.js"
 
 /** 消息对元数据（输出存文件，内存只存引用） */
 export interface HistoryPair {
@@ -19,15 +20,15 @@ export interface HistoryPair {
   seq: number
 }
 
-/** 消息对存储：目录 <cacheRoot>/<sessionID>/，每对一文件，超对数删最旧 */
+/** 消息对存储：目录 <cacheRoot>/<终端目录名>（调用方的 cacheRoot 已含主会话 ID，本地终端名带 local- 前缀），每对一文件，超对数删最旧 */
 export class SessionHistory {
   private pairs: HistoryPair[] = []
   private readonly dir: string
   private nextSeq = 1
 
   /**
-   * @param cacheRoot 插件缓存根目录（如 ~/.opencode/plugins-cache/opencode-ssh-tool）
-   * @param sessionID opencode 会话 ID（用作子目录名）
+   * @param cacheRoot 插件缓存根目录（调用方传入已含主会话 ID 的会话目录，如 ~/.opencode/plugins-cache/opencode-ssh-tool/<ses_...>）
+   * @param sessionID 该终端的历史子目录名（SSH 为终端名，本地/容器为 `local-<终端名>`）
    * @param maxMessages 保留消息对数（最小 1，保留最新）
    */
   constructor(
@@ -88,6 +89,7 @@ export class SessionHistory {
     const file = join(this.dir, `${String(seq).padStart(6, "0")}-${ts}.json`)
     writeFileSync(file, JSON.stringify({ command, output, ts, endTs: end, exitCode }), "utf8")
     this.pairs.push({ command, file, size: output.length, ts, endTs: end, exitCode, seq })
+    debug(`[history] ${this._logTag} 追加 pair seq=${seq} endTs=${end} exitCode=${exitCode ?? "null"} bytes=${output.length}`)
     this._trim()
   }
 
@@ -96,6 +98,7 @@ export class SessionHistory {
     while (this.pairs.length > Math.max(1, this.maxMessages)) {
       const oldest = this.pairs.shift()
       if (oldest) {
+        debug(`[history] ${this._logTag} 淘汰最旧 pair seq=${oldest.seq}（超对数上限）`)
         try {
           rmSync(oldest.file, { force: true })
         } catch {
@@ -155,5 +158,18 @@ export class SessionHistory {
     } catch {
       /* 忽略 */
     }
+  }
+
+  /**
+   * 日志身份标签 `<主会话ID>/<终端名>`：目录布局为 `<cacheRoot>/<主会话ID>/<终端名>`
+   * （本地/容器终端的末段带 `local-` 前缀，与 server 端历史目录约定一致），
+   * 故取路径末两段拼出，使 `[history]` 明细行也能被 `grep ses_xxx` 捞出。
+   * @returns 形如 `ses_abc123/default` 的标签；路径不足两段时返回可得的那一段
+   */
+  private get _logTag(): string {
+    const segs = this.dir.split(/[\\/]/).filter((s) => s.length > 0)
+    const term = segs.pop() ?? ""
+    const sid = segs.pop() ?? ""
+    return sid ? `${sid}/${term}` : term
   }
 }

@@ -47,7 +47,7 @@ export class LocalSession extends BaseSession {
   protected _closeTransport(): void {
     try { this._term?.close() } catch { /* ignore */ }
     try { this._proc?.kill() } catch { /* ignore */ }
-    log.hook("local_disconnect", `关闭本地终端 ${this._program}`)
+    log.hook("local_disconnect", `关闭本地终端 ${this._program} (session ${this.sessionID}, term ${this.name})`)
   }
 
   /**
@@ -69,7 +69,7 @@ export class LocalSession extends BaseSession {
           data: (_t, d) => this._appendBuffer(new TextDecoder().decode(d)),
           exit: (_t, exitCode, signal) => {
             this._connected = false
-            this._remoteBusy = false
+            this._setBusy(false, "本地 PTY 退出")
             log.warn(`本地终端 PTY 退出 ${opts.command} (session ${this.sessionID}, term ${this.name}, exit=${exitCode}, signal=${signal})`)
           },
         },
@@ -97,19 +97,19 @@ export class LocalSession extends BaseSession {
       const deadline = Date.now() + INJECT_TIMEOUT_MS
       const adapter = await this._probeShell(deadline)
       if (!adapter) {
-        log.error("Shell 探测超时，连接终止")
+        log.error(`Shell 探测超时，连接终止 (session ${this.sessionID}, term ${this.name})`)
         this.close()
         return { ok: false, error: tr("shell_probe_timeout", this._lang) }
       }
       this._adapter = adapter
-      log.info(`Shell 探测结果: ${this._adapter.name}`)
+      log.info(`Shell 探测结果: ${this._adapter.name} (session ${this.sessionID}, term ${this.name})`)
 
       this._buffer = ""
       this._cursor = 0
       return { ok: true }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      log.error(`本地终端启动失败 ${opts.command}`, msg)
+      log.error(`本地终端启动失败 ${opts.command} (session ${this.sessionID}, term ${this.name})`, msg)
       this.close()
       return { ok: false, error: msg }
     }

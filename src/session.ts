@@ -2,7 +2,7 @@
 // 完成标记法：注入 PROMPT_COMMAND 脚本，命令完成时输出 <SSH_DONE:退出码>
 
 import { Client, type ConnectConfig } from "ssh2"
-import log from "./log.js"
+import log, { isDebugEnabled, ssh2Trace } from "./log.js"
 import { INJECT_TIMEOUT_MS, PTY_COLS, PTY_ROWS, READY_TIMEOUT_MS } from "./constants.js"
 import { tr } from "./i18n.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
@@ -49,7 +49,7 @@ export class SshSession extends BaseSession {
   protected _closeTransport(): void {
     if (this._stream) { try { this._stream.end() } catch { /* ignore */ } }
     if (this._client) { try { this._client.end() } catch { /* ignore */ } }
-    log.hook("ssh_disconnect", `关闭会话 ${this._host}`)
+    log.hook("ssh_disconnect", `关闭会话 ${this._host} (session ${this.sessionID}, term ${this.name})`)
   }
 
   async connect(opts: { host: string; user: string; port?: number; password?: string }): Promise<ConnectResult> {
@@ -66,7 +66,9 @@ export class SshSession extends BaseSession {
       port,
       username: opts.user,
       readyTimeout: READY_TIMEOUT_MS,
-      debug: (msg: string) => log.info(`[ssh2] ${msg}`),
+      // ssh2 协议 trace 属 debug 级；仅在真正会输出时才注册回调，避免关闭时 ssh2 每次仍做无谓的消息拼装。
+      // ssh2Trace 内部再丢弃随输出量增长的 CHANNEL_DATA 等行，只记有界的握手/认证事件。
+      ...(isDebugEnabled() ? { debug: (msg: string) => ssh2Trace(this._logTag, msg) } : {}),
       ...auth,
     }
 
@@ -77,7 +79,7 @@ export class SshSession extends BaseSession {
       const fail = (msg: string) => {
         if (settled) return
         settled = true
-        log.error(`连接失败 ${opts.host}`, msg)
+        log.error(`连接失败 ${opts.host} (session ${this.sessionID}, term ${this.name})`, msg)
         resolve({ ok: false, host: opts.host, user: opts.user, port, error: msg })
       }
 
@@ -87,9 +89,9 @@ export class SshSession extends BaseSession {
           fail(err.message)
           return
         }
-        log.error(`SSH 会话错误 ${opts.host}`, err)
+        log.error(`SSH 会话错误 ${opts.host} (session ${this.sessionID}, term ${this.name})`, err)
         this._connected = false
-        this._remoteBusy = false
+        this._setBusy(false, "SSH 会话错误")
         this._clearRunningContext()
         if (this._watchTimer) {
           clearInterval(this._watchTimer)
@@ -117,28 +119,28 @@ export class SshSession extends BaseSession {
             this._lastActive = Date.now()
 
             stream.on("data", (chunk: Buffer) => { this._appendBuffer(chunk.toString()) })
-            stream.on("close", () => { this._connected = false; this._remoteBusy = false })
-            stream.on("error", (e: Error) => { log.error("PTY stream 错误", e); this._connected = false })
+            stream.on("close", () => { this._connected = false; this._setBusy(false, "PTY stream 关闭") })
+            stream.on("error", (e: Error) => { log.error(`PTY stream 错误 (session ${this.sessionID}, term ${this.name})`, e); this._connected = false })
 
             ;(async () => {
               await new Promise((r) => setTimeout(r, 400))
               this._buffer = ""
               this._cursor = 0
               this._runningStartPos = null
-              log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID})`)
+              log.info(`连接成功 ${opts.user}@${opts.host}:${port} (session ${this.sessionID}, term ${this.name})`)
 
               if (this._history.totalPairs() > 0) this._history.clear()
 
               const deadline = Date.now() + INJECT_TIMEOUT_MS
               const adapter = await this._probeShell(deadline)
               if (!adapter) {
-                log.error(`Shell 探测超时，终止连接 ${opts.user}@${opts.host}`)
+                log.error(`Shell 探测超时，终止连接 ${opts.user}@${opts.host} (session ${this.sessionID}, term ${this.name})`)
                 this.close()
                 resolve({ ok: false, host: opts.user, user: opts.user, port, error: tr("shell_probe_timeout", this._lang) })
                 return
               }
               this._adapter = adapter
-              log.info(`Shell 探测结果: ${this._adapter.name}`)
+              log.info(`Shell 探测结果: ${this._adapter.name} (session ${this.sessionID}, term ${this.name})`)
 
               this._buffer = ""
               this._cursor = 0

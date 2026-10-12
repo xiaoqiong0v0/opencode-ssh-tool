@@ -11,7 +11,7 @@ import { WebSocketServer, WebSocket } from "ws"
 import { listAllSessions, removeSessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
 import { PTY_COLS, PTY_ROWS } from "./constants.js"
-import log from "./log.js"
+import log, { infoDedup } from "./log.js"
 
 export interface LiveSession {
   getHistory(): { getPairs(): unknown[] }
@@ -91,6 +91,17 @@ const STATUS_PUSH_MS = 2000
 
 const sessionKey = (sid: string, name: string): string => `${sid}:${name}`
 
+/**
+ * 会话键（`sid:name`）转日志显示形式（`sid/name`）：与终端侧 `[busy]`/`[run]` 行同一写法，
+ * 保证所有带会话上下文的日志都能用同一个 `<主会话ID>/<终端名>` 口径 grep。
+ * @param sKey 会话键（sid:name）
+ * @returns 显示用标签（ses_xxx/default）；无分隔符时原样返回
+ */
+const keyTag = (sKey: string): string => {
+  const i = sKey.indexOf(":")
+  return i < 0 ? sKey : `${sKey.slice(0, i)}/${sKey.slice(i + 1)}`
+}
+
 export function startServer(
   port: number,
   _getSessions: () => SessionEntry[],
@@ -109,6 +120,22 @@ export function startServer(
   const cmdCount = new Map<string, number>()
   /** 排队序列保持 busy 的 key（agent 报 more=true 加入，最后一条 done 移除） */
   const seqHold = new Set<string>()
+
+  /** server 侧各终端最近一次的对外 busy 状态（仅用于日志：翻转时记一行） */
+  const busyState = new Map<string, boolean>()
+
+  /**
+   * 记录 server 侧 busy 翻转（仅在值变化时输出一行，带 session/终端/原因）：
+   * 与终端侧 [busy] 行互补，便于对齐"server 认为忙/闲"的时间线。
+   * @param sKey 会话键（sid:name）
+   * @param next 目标 busy 值
+   * @param reason 翻转原因（cmdStart / cmdDone / exec / 无 agent 强制 done / 状态文件回退 等）
+   */
+  const logBusy = (sKey: string, next: boolean, reason: string): void => {
+    if (busyState.get(sKey) === next) return
+    busyState.set(sKey, next)
+    log.info(`[busy] server ${keyTag(sKey)} busy=${next} reason=${reason}`)
+  }
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -187,6 +214,9 @@ export function startServer(
     // 但 agent 仍在，命令未完成，busy 必须保持 true（完成由 agent 生命周期钩子兜底，仅断连时 watch 补发 done，无超时强杀）
     for (const [key, b] of streamBuf) {
       if (b && !b.done && !agentBySession.has(key)) {
+        // 盲点显式化：server 侧找不到该 key 的 agent 连接，直接判命令完成（行为不变，仅补日志）
+        log.info(`[fallback] 无 agent 连接即判完成 ${keyTag(key)} command=${JSON.stringify((b.command ?? "").slice(0, 120))} ts=${b.ts}（server 不再追踪该命令，busy→false）`)
+        logBusy(key, false, "无 agent 连接强制 done")
         b.done = true
         b.ts = now
         b.endTs = now
@@ -202,6 +232,8 @@ export function startServer(
       const lk = sessionKey(s.sessionID, s.name)
       const busy = liveBusy.get(lk)
       if (busy !== undefined) s.busy = busy
+      // 盲点显式化：拿不到 agent/实时流状态时，busy 回退取状态文件（可能是命令执行前写的旧值，未必可靠）
+      else logBusy(lk, !!s.busy, "状态文件回退(无 agent 状态)")
       seen.add(sessionKey(s.sessionID, s.name))
     }
     const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
@@ -306,6 +338,14 @@ export function startServer(
           agents.get(ws)!.add(k)
           agentBySession.set(k, ws)
         }
+        {
+          // 记录 agent 上报的会话列表（批量实例注册同一列表时按内容去重），便于对齐 server 侧视角
+          const keys = [...(agents.get(ws) ?? [])]
+          infoDedup(
+            `agent-register:${keys.slice().sort().join(",")}`,
+            `agent 注册 ${keys.length} 个会话: ${keys.length ? keys.map(keyTag).join(", ") : "无"}`,
+          )
+        }
         return
       }
 
@@ -316,6 +356,7 @@ export function startServer(
         if (!sid || !command) return
         const k = sessionKey(sid, name)
         seqHold.delete(k) // 新命令开始：本条正在运行，busy 由 streamBuf 反映
+        logBusy(k, true, "cmdStart")
         const existing = streamBuf.get(k)
         streamBuf.set(k, {
           data: existing && existing.done ? "" : existing?.data ?? "",
@@ -387,6 +428,7 @@ export function startServer(
         } else {
           streamBuf.set(k, { data: "", done: true, ts: Date.now(), endTs: typeof msg.endTs === "number" ? msg.endTs : Date.now(), command: "" })
         }
+        logBusy(k, msg.more === true, msg.more === true ? "cmdDone(more 保持 busy)" : "cmdDone")
         finalizeCommand(k)
         pushSessions()
         return
@@ -502,6 +544,7 @@ export function startServer(
         const k = sessionKey(sid, name)
         const existing = streamBuf.get(k)
         streamBuf.set(k, { data: existing && existing.done ? "" : existing?.data ?? "", done: false, ts: Date.now(), command })
+        logBusy(k, true, "exec")
         pushSessions()
         send(agent, { type: "run-exec", reqId: `${sid}:${name}:${Date.now()}`, sessionID: sid, name, command })
         return
@@ -532,6 +575,7 @@ export function startServer(
         } catch { /* 目录不存在忽略 */ }
         streamBuf.delete(sessionKey(sid, name))
         rawBuf.delete(sessionKey(sid, name))
+        busyState.delete(sessionKey(sid, name))
         log.info(`Web 页删除终端 ${sid}/${name}`)
         pushSessions()
         return
@@ -541,8 +585,11 @@ export function startServer(
     ws.on("close", () => {
       const reg = agents.get(ws)
       if (reg) {
+        // 盲点显式化：agent 断开时记录受影响的终端列表（仅 agent 连接，web 订阅者不在此列）
+        const keys = [...reg]
         for (const k of reg) agentBySession.delete(k)
         agents.delete(ws)
+        infoDedup(`agent-disconnect:${keys.slice().sort().join(",")}`, `agent 断开（受影响终端: ${keys.length ? keys.map(keyTag).join(", ") : "无"}）`)
       }
     })
   })

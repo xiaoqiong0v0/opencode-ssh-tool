@@ -13,7 +13,7 @@ import {
   SYNTAX_MAX_WAIT_MS,
   INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC,
 } from "./constants.js"
-import log from "./log.js"
+import log, { debug, tailLines, tailSummary } from "./log.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart, stripTrailingPromptLine } from "./utils.js"
 import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
@@ -211,8 +211,8 @@ export abstract class BaseSession {
   async exec(command: string): Promise<ExecResult> {
     const startTs = Date.now()
     if (!this._ready()) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
-    if (this._remoteBusy) { log.info(`exec quick-fail busy: ${command} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: tr("cmd_busy", this._lang) } }
-    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation: ${command}`); return { ok: false, output: "", error: tr("cmd_continuation", this._lang) } }
+    if (this._remoteBusy) { log.info(`exec quick-fail busy ${this._logTag}: ${tailLines(command, 3)} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: tr("cmd_busy", this._lang) } }
+    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation ${this._logTag}: ${tailLines(command, 3)}`); return { ok: false, output: "", error: tr("cmd_continuation", this._lang) } }
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
@@ -220,18 +220,15 @@ export abstract class BaseSession {
 
     const outcome = await this._waitCompletion(0, startTs)
 
-    log.info(`exec ${command} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos} (busy=${this._remoteBusy})`)
+    log.info(`exec ${this._logTag} seq=${this._runningSeq} ${tailLines(command, 3)} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos+" exitCode="+outcome.exitCode+" duration="+(Date.now()-startTs)+"ms"} (busy=${this._remoteBusy})`)
 
     switch (outcome.kind) {
       case "done": {
-        this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
-        const raw = this._buffer.slice(captureStart, outcome.markerPos ?? this._buffer.length)
-        this._cursor = Math.max(0, outcome.markerPos ?? this._buffer.length)
-        const out = this._extractOutput(raw, command, outcome.syntaxError === true)
-        this._history.append(command, out, this._runningStartTs, Date.now(), outcome.exitCode ?? undefined)
-        this._emitDone(outcome.exitCode ?? null, Date.now(), out)
-        this._stopInterruptCycle("命令完成")
-        this._clearRunningContext()
+        // 同步完成：复用 _completeRunning 统一收尾（history/done/busy/[run] 结束日志/清上下文/停 watch），
+        // 避免此处二次实现导致结束日志缺失与收尾逻辑漂移；syntaxError 收尾按 syntaxMode 先提取输出再传入
+        const endPos = outcome.markerPos ?? this._buffer.length
+        const out = this._extractOutput(this._buffer.slice(captureStart, endPos), command, outcome.syntaxError === true)
+        this._completeRunning(captureStart, endPos, outcome.exitCode ?? null, command, out, outcome.syntaxError ? "direct(syntax)" : "direct")
         return { ok: true, output: this._truncate(await toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
       case "interactive": {
@@ -245,7 +242,7 @@ export abstract class BaseSession {
       }
       case "running": {
         this._runningStartPos = 0
-        this._remoteBusy = true
+        this._setBusy(true, "cmdRunning")
         this._cursor = this._buffer.length
         this._startBackgroundWatch(captureStart, command)
         // 等待后台 watch 完成（不设硬超时，模型可通过 Ctrl-C 中断）
@@ -277,7 +274,7 @@ export abstract class BaseSession {
       const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
       if (marker.done) {
         // 与后台 watch 完成路径复用同一收尾（history/done/busy/停 watch），避免 busy 卡死
-        const raw = this._completeRunning(this._runningStartPos, marker.pos, marker.exitCode, this._runningCommand)
+        const raw = this._completeRunning(this._runningStartPos, marker.pos, marker.exitCode, this._runningCommand, undefined, "readBuffer")
         // readBuffer 语义：读取后消费标记及之前部分（缓冲区坐标重置，cursor 归零）
         this._buffer = this._buffer.slice(marker.pos)
         this._cursor = 0
@@ -308,7 +305,7 @@ export abstract class BaseSession {
       .replace(/\\x1a/gi, "\x1a")
       .replace(/\\r/g, "\r")
       .replace(/\\n/g, "\r")
-    log.info(`send -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
+    log.info(`send ${this._logTag} -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
     // 真实中断输入：标记本次命令已发过 Ctrl-C；写完中断键后进入中断周期，
     // 周期内**立即**补发首条探针、之后按配置间隔（默认 5s）补发探针标记来收尾被中断的命令。
     // 防抖：周期内重复 Ctrl-C 被 _startInterruptCycle 抑制（不重启周期、不额外补探针），
@@ -347,7 +344,19 @@ export abstract class BaseSession {
    */
   setHoldBusy(hold: boolean): void {
     this._holdBusy = hold
-    if (!hold) this._remoteBusy = false
+    if (!hold) this._setBusy(false, "holdRelease")
+  }
+
+  /**
+   * 更新终端 busy 状态：仅在值翻转时记一行（会话/终端/当前 seq/翻转原因），
+   * 供事后对齐状态时间线（busy 每次翻转都能对应到具体原因，不再出现"忙了却查不出为何"）。
+   * @param next 目标 busy 值
+   * @param reason 翻转原因（cmdStart / cmdRunning / cmdDone / holdRelease / 会话关闭 / 断连补 done 等）
+   */
+  protected _setBusy(next: boolean, reason: string): void {
+    if (this._remoteBusy === next) return
+    this._remoteBusy = next
+    log.info(`[busy] ${this._logTag} seq=${this._runningSeq} busy=${next} reason=${reason}`)
   }
 
   /** 触发命令开始事件 */
@@ -400,7 +409,7 @@ export abstract class BaseSession {
     this._stopInterruptCycle("会话关闭")
     this._closeTransport()
     this._connected = false
-    this._remoteBusy = false
+    this._setBusy(false, "会话关闭")
     this._history.dispose()
   }
 
@@ -480,7 +489,7 @@ export abstract class BaseSession {
     const seq = this._runningSeq
     this._probeSeqs.add(seq)
     const probe = this._composeProbe(seq)
-    log.info(`中断探针 -> seq=${seq} ${JSON.stringify(probe)} (busy=${this._remoteBusy})`)
+    debug(`中断探针 ${this._logTag} seq=${seq} ${JSON.stringify(probe)} (busy=${this._remoteBusy})`)
     this._write(probe)
   }
 
@@ -499,7 +508,7 @@ export abstract class BaseSession {
     if (this._runningStartPos === null || this._runningCommand === "") return
     const seq = this._runningSeq
     const intervalSec = this._interruptProbeIntervalMs / 1000
-    log.info(`中断周期开始 -> seq=${seq}，已立即补发首条探针，之后每 ${intervalSec}s 一条`)
+    log.info(`中断周期开始 ${this._logTag} seq=${seq}，已立即补发首条探针，之后每 ${intervalSec}s 一条`)
     // 写完 \x03 后立即补发首条探针（t0），后续 setInterval 自此刻起按间隔补发（t0+N、t0+2N…）
     this._sendInterruptProbe()
     this._interruptTimer = setInterval(() => { this._onInterruptTick() }, this._interruptProbeIntervalMs)
@@ -528,7 +537,7 @@ export abstract class BaseSession {
     if (this._interruptTimer === null) return
     clearInterval(this._interruptTimer)
     this._interruptTimer = null
-    log.info(`中断周期结束 -> ${reason}`)
+    log.info(`中断周期结束 ${this._logTag} seq=${this._runningSeq}，原因=${reason}`)
   }
 
   /**
@@ -653,8 +662,9 @@ export abstract class BaseSession {
     this._interruptSent = false // 新命令：清除上一条/空闲期发出的 Ctrl-C 标记
     this._cmdSeq += 1
     this._runningSeq = this._cmdSeq
-    this._remoteBusy = true
+    this._setBusy(true, "cmdStart")
     this._lastActive = Date.now()
+    log.info(`[run] 开始 ${this._logTag} seq=${this._runningSeq} startPos=0 cmd=${JSON.stringify(command.slice(0, 120))}`)
     this._emitStart(command, this._runningStartTs)
   }
 
@@ -784,8 +794,12 @@ export abstract class BaseSession {
     this._watchTimer = setInterval(() => {
       if (!this._connected) {
         // 断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
-        if (this._runningCommand) this._emitDone(null, Date.now())
-        this._remoteBusy = false
+        if (this._runningCommand) {
+          this._emitDone(null, Date.now())
+          // 断连收尾也是"结束"：补记 [run] 结束；不附 tail（输出窗口从未定案，无可信尾部可摘）
+          log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${this._buffer.length} exitCode=null duration=${Date.now()-this._runningStartTs}ms reason=disconnect`)
+        }
+        this._setBusy(false, "断连补 done")
         this._clearRunningContext()
         if (this._watchTimer) clearInterval(this._watchTimer)
         return
@@ -815,7 +829,7 @@ export abstract class BaseSession {
         }
         if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
           const out = this._extractOutput(this._buffer.slice(startPos), command, true)
-          this._completeRunning(startPos, this._buffer.length, null, command, out)
+          this._completeRunning(startPos, this._buffer.length, null, command, out, "watch(syntax)")
           return
         }
       }
@@ -823,22 +837,26 @@ export abstract class BaseSession {
   }
 
   /**
-   * 统一命令完成收尾（供后台 watch 与 readBuffer 复用，避免两处收尾逻辑漂移）：
+   * 统一命令完成收尾（供 exec 同步完成、后台 watch 与 readBuffer 复用，避免多处收尾逻辑漂移）：
    * 提取/追加 history、补发 done 事件、定位 cursor、翻转 busy、清 running 上下文、停后台 watch。
    * @param startPos 命令捕获窗口起点（相对 buffer；watch 的捕获起点与 _runningStartPos 可能不同，须显式传入）
    * @param endPos 完成位置（marker/中断回显在 buffer 中的偏移）
    * @param exitCode 退出码（语法错误收尾为 null，^C 为 130）
    * @param command 原始命令（history 记录用）
    * @param out 已提取的纯输出；缺省时由 [startPos, endPos) 窗口经 _extractOutput 提取
+   * @param reason 完成来源（direct / direct(syntax) / watch / watch(syntax) / readBuffer），仅用于日志
    * @returns 本次完成窗口的原始片段（readBuffer 返回给调用方用）
    */
-  private _completeRunning(startPos: number, endPos: number, exitCode: number | null, command: string, out?: string): string {
+  private _completeRunning(startPos: number, endPos: number, exitCode: number | null, command: string, out?: string, reason = "watch"): string {
     const raw = this._buffer.slice(startPos, endPos)
     const output = out ?? this._extractOutput(raw, command)
     this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
     this._emitDone(exitCode, Date.now(), output)
     this._cursor = Math.max(startPos, endPos)
-    this._remoteBusy = this._holdBusy // 排队序列中间命令：保持 busy 到序列结束
+    this._setBusy(this._holdBusy, this._holdBusy ? "cmdDone(holdBusy)" : "cmdDone") // 排队序列中间命令：保持 busy 到序列结束
+    // 结束日志附"有界输出尾部"：仅当输出 > 3 行时附加末 3 行（单行、换行转义），短输出不重复；关闭时不拼装
+    const outTail = tailSummary(output)
+    log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${endPos} exitCode=${exitCode} duration=${Date.now()-this._runningStartTs}ms reason=${reason}${outTail ? ` tail=${outTail}` : ""}`)
     this._stopInterruptCycle("命令完成")
     this._clearRunningContext()
     if (this._watchTimer) clearInterval(this._watchTimer)
@@ -857,5 +875,14 @@ export abstract class BaseSession {
   private _truncate(s: string): string {
     if (s.length <= MAX_OUTPUT_LEN) return s
     return `${s.slice(0, MAX_OUTPUT_LEN)}\n... [output truncated, ${s.length} chars total]`
+  }
+
+  /**
+   * 日志身份前缀 `<主会话ID>/<终端名>`（会话/终端上下文的日志行统一带上，便于 `grep ses_xxx` 过滤）；
+   * 需要命令坐标的行再自行追加 ` seq=<this._runningSeq>`。
+   * @returns 形如 `ses_abc123/default` 的标签
+   */
+  protected get _logTag(): string {
+    return `${this.sessionID}/${this.name}`
   }
 }
