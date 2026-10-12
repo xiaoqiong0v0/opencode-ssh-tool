@@ -138,6 +138,18 @@ function syncSessionState(sessionID: string, name = DEFAULT_NAME, reason = "sync
   }, reason)
 }
 
+/**
+ * 为终端挂接 busy 翻转监听：命令运行期间把 busy=true 写入状态文件，结束写回 false，
+ * 使状态文件里的 busy 不停留在命令执行前落盘的过期值（server 拿不到 agent 状态、
+ * 回退读状态文件时读到的是实时值）。复用既有 syncSessionState → writeSessionState，不新增写盘路径。
+ * @param session 已注册的终端会话（SshSession / LocalSession）
+ * @param sessionID opencode 会话 ID
+ * @param name 终端名
+ */
+function hookBusyState(session: SshSession | LocalSession, sessionID: string, name: string): void {
+  session.setBusyListener((_busy, reason) => syncSessionState(sessionID, name, `busy:${reason}`))
+}
+
 /** 按 sessionID 取本地/容器终端表（无则返回 undefined） */
 function getLocalSessionMap(sessionID: string): Map<string, LocalSession> | undefined {
   return localSessions.get(sessionID)
@@ -349,6 +361,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     }
     if (!map) sshSessions.set(ctx.sessionID, new Map())
     sshSessions.get(ctx.sessionID)!.set(name, session)
+    hookBusyState(session, ctx.sessionID, name)
     syncSessionState(ctx.sessionID, name, "connect")
     refreshAgent()
     return tr("connect_ok", toolLang).replace("{user}", user).replace("{host}", host).replace("{port}", String(port ?? 22)).replace("{sid}", ctx.sessionID).replace("{name}", name)
@@ -376,6 +389,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     }
     if (!map) localSessions.set(ctx.sessionID, new Map())
     localSessions.get(ctx.sessionID)!.set(name, session)
+    hookBusyState(session, ctx.sessionID, name)
     syncSessionState(ctx.sessionID, name, "local")
     refreshAgent()
     return tr("local_connect_ok", toolLang).replace("{cmd}", command).replace("{name}", name)

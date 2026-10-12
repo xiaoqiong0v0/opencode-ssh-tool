@@ -166,19 +166,25 @@ export function startAgent(
       // 连接事件跨进程按"第 N 次 + 地址"合并（批量实例首连 connSeq 均为 1，合并为一行 + 计数）
       infoDedupShared(`agent-open:${wsUrl}:${connSeq}`, `代理已连接 ${wsUrl}（第 ${connSeq} 次）`, 10000)
       register()
-      // 重连后记录本进程仍在运行中的会话：当前不补播 cmdStart（server 端 streamBuf 已随其重启丢失），
-      // 至少把"发现 N 个运行中会话、未补播"这一事实落盘，便于事后判断 busy 状态是否失联。
-      const running: string[] = []
+      // WS 建立后（含重连）补齐 server 缺失的运行状态：发现某终端当前有正在运行的命令时，
+      // 补播一次 cmdStart（携带命令文本），让 server 重建该终端的 streamBuf / busy 状态。
+      // 原因：server 内存 streamBuf 可能随其重启丢失，或已按"无 agent"降级；不补播则 server
+      // 手里没有运行状态，web 会显示"无 busy"。命令真实结束仍由生命周期 cmdDone 上报（当前 seq 标记）。
+      const running: Array<{ sessionID: string; name: string; command: string }> = []
       const all: string[] = []
       for (const { sessionID, name } of listSessions()) {
         const k = `${sessionID}/${name}`
         all.push(k)
         const s = resolveSession(sessionID, name)
-        if (s?.hasRunningStream()) running.push(k)
+        if (!s?.hasRunningStream()) continue
+        const command = s.getRunningCommand()
+        if (!command) continue
+        running.push({ sessionID, name, command })
+        send({ type: "cmdStart", sessionID, name, command, ts: Date.now() })
       }
       const tag = connSeq > 1 ? "重连" : "首连"
       if (running.length) {
-        log.info(`代理${tag}发现 ${running.length} 个运行中会话（未补播 cmdStart，busy 以本进程为准）: ${running.join(", ")}`)
+        log.info(`代理${tag}发现 ${running.length} 个运行中会话，已补播 cmdStart: ${running.map((r) => `${r.sessionID}/${r.name}`).join(", ")}`)
       } else {
         // 空态属周期性噪声，降到 debug（置 SSH_TOOL_DEBUG=1 才落盘）；仍带上本进程会话 key，便于按主会话 ID 关联
         debug(`代理${tag}未发现运行中会话（${wsUrl}）本进程会话: ${all.length ? all.join(", ") : "无"}`)

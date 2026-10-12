@@ -149,6 +149,11 @@ export abstract class BaseSession {
   /** 生命周期监听器（命令开始/完成事件，agent 转报 server） */
   private _lifecycle: ((ev: LifecycleEvent) => void) | null = null
   /**
+   * busy 状态翻转监听器（插件挂接）：命令运行期间收到 true、结束写回 false，
+   * 供插件把实时 busy 同步到跨进程状态文件，避免命令执行前落盘的旧值一直"过期"。
+   */
+  private _busyListener: ((busy: boolean, reason: string) => void) | null = null
+  /**
    * 本次命令期间是否真实发送过中断（Ctrl-C）。
    * 中断判定不依赖"命令回显定位"：超宽命令被 readline 折行重绘时回显会多出字符，
    * 精确匹配必然失败（echoEnd=0），若再以 echoEnd 为前置条件则 ^C 永远检测不到 → busy 卡死。
@@ -338,6 +343,16 @@ export abstract class BaseSession {
   }
 
   /**
+   * 设置 busy 状态翻转监听器（命令开始/结束/断连等每次 busy 翻转时回调）：
+   * 供插件把最新 busy 同步到跨进程状态文件（server 拿不到 agent 状态回退读状态文件时，
+   * 读到的是命令运行期间的实时值，而非命令执行前落盘的过期值）。
+   * @param listener 回调（busy 目标值 + 翻转原因；null 表示清除）
+   */
+  setBusyListener(listener: ((busy: boolean, reason: string) => void) | null): void {
+    this._busyListener = listener
+  }
+
+  /**
    * 设置是否保持 busy（排队命令序列期间为 true）：
    * true 时中间命令完成不清 busy；置 false 时立即清 busy。
    * @param hold 是否保持
@@ -357,6 +372,8 @@ export abstract class BaseSession {
     if (this._remoteBusy === next) return
     this._remoteBusy = next
     log.info(`[busy] ${this._logTag} seq=${this._runningSeq} busy=${next} reason=${reason}`)
+    // 通知插件同步状态文件（busy 已更新，getStatus 读到新值）；监听器异常不打断执行
+    try { this._busyListener?.(next, reason) } catch { /* 监听器异常不打断执行 */ }
   }
 
   /** 触发命令开始事件 */

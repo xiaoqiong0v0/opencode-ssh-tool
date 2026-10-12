@@ -208,19 +208,18 @@ export function startServer(
     const seen = new Set<string>()
     const liveKey = new Set(agentBySession.keys())
     const liveBusy = new Map<string, boolean>()
-    const now = Date.now()
-    // 兜底：streamBuf 中 agent 连接已消失的 key 强制清 busy（agent 崩溃/退出防卡死）。
-    // 注意不能用"无 out 超时"判定——交互命令（sudo/read 等输入）等待期间无输出，
-    // 但 agent 仍在，命令未完成，busy 必须保持 true（完成由 agent 生命周期钩子兜底，仅断连时 watch 补发 done，无超时强杀）
+    // 兜底：streamBuf 中 agent 连接已消失的 key —— **不假报完成**。
+    // agent 掉线 ≠ 命令完成：此处不 finalizeCommand、不发 diff done、不改 done 标志，
+    // 保持"未完成（busy 不变）"并仅把"agent 离线、命令状态未知"显式落盘（短窗去重防每 2s 刷屏）；
+    // agent 重连会补播 cmdStart 恢复状态。注意不能用"无 out 超时"判定——交互命令（sudo/read 等输入）
+    // 等待期间无输出，但 agent 仍在、命令未完成，busy 必须保持 true。
+    // 命令真实结束只认 agent 上报的当前 seq 完成标记（cmdDone），会话拆除路径另算。
     for (const [key, b] of streamBuf) {
       if (b && !b.done && !agentBySession.has(key)) {
-        // 盲点显式化：server 侧找不到该 key 的 agent 连接，直接判命令完成（行为不变，仅补日志）
-        log.info(`[fallback] 无 agent 连接即判完成 ${keyTag(key)} command=${JSON.stringify((b.command ?? "").slice(0, 120))} ts=${b.ts}（server 不再追踪该命令，busy→false）`)
-        logBusy(key, false, "无 agent 连接强制 done")
-        b.done = true
-        b.ts = now
-        b.endTs = now
-        finalizeCommand(key)
+        infoDedup(
+          `agent-offline:${key}`,
+          `[fallback] ${keyTag(key)} 无 agent 连接：命令状态未知（保持未完成，不判完成/不发 diff done）command=${JSON.stringify((b.command ?? "").slice(0, 120))} ts=${b.ts}`,
+        )
       }
       if (!agentBySession.has(key)) seqHold.delete(key) // agent 已消失：清排队序列 busy 保持
       liveBusy.set(key, (!!b && !b.done) || seqHold.has(key))
