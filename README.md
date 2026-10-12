@@ -9,6 +9,8 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
 - **命令完成判定**：完成标记法（`<SSH_DONE:seq:退出码>`）+ 静默窗口 + 动画检测（进度条等长输出自动识别）三重判定；**断连兜底，不设超时强杀**（长命令由 Ctrl-C 干预）；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
+- **直接输入（焦点驱动）**：浏览器内直接向交互式程序输入。默认「命令框优先」——按键留在浏览器，回车走 `exec` 提交命令；点终端区域（transcript `#term` / raw `#xt`）或入口按钮 `#cmdKey` 切换为直接输入，按键按**真实控制字节**经 `send` keystroke 通道发往终端（**不产生 `exec`、不写命令记录**）；焦点回到命令框等可编辑控件即自动关闭；状态**不持久化**，每次打开都从命令框优先开始；离线/断线时入口不可点击、按键一律不发送
+- **SSH 保活 + WS 心跳**：SSH 层按 `ServerAliveInterval` 语义定期发 `keepalive@openssh.com`（连接层**带外**消息，不写 channel/PTY），连续 3 次无响应判连接死亡并断连；WS 层 server 每 25s 下发 `ping`、10s 无 `pong` 判半开并断开，客户端静默超 2×间隔即主动断开重连——**保活与心跳都不写入 PTY，不污染终端输出与完成标记**
 - **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），重启不丢、会话关闭清理
 - **HTTP 终端查看**：默认开启本地服务，浏览器打开可查看终端记录（WebSocket 实时推送，无轮询）
 - **多语言**：`toolLang`（工具描述/CLI/session 文案）与 `webLang`（页面 UI）独立配置，默认英文；环境变量 `SSH_TOOL_LANG` / `SSH_WEB_LANG` 分别覆盖
@@ -125,7 +127,7 @@ term_cli exec(command)
 浏览器访问 http://127.0.0.1:<port> 查看终端记录（WebSocket 实时推送）
 ```
 
-页面按会话/终端切换，transcript 展示「命令 + 输出」历史对，raw 展示 xterm.js 实时画面。
+页面按会话/终端切换，transcript 展示「命令 + 输出」历史对，raw 展示 xterm.js 实时画面。底部命令框提交命令；交互式程序（sudo 密码、REPL 等）需要逐键输入时，点终端区域或入口按钮切到**直接输入**（见「特性」），按键实时发往终端。
 
 ## 架构
 
@@ -146,6 +148,7 @@ npm run build    # tsc：src → dist
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`
+- **`SERVER_PROTO_VERSION`**（`src/constants.ts`）：独立 HTTP 服务的代码/协议版本，server 启动写入 `server.json` 的 `proto` 字段，`ensureServer` 发现不符即杀旧进程重启。**改动服务端注入的页面模板（`web/src/index.html`）或 i18n 文案后必须递增该值**——否则常驻旧 server 注入的 `__I18N__`/占位符会与新版前端不一致，页面渲染出 `undefined`（旧注入 + 新前端）
 - 本地测试：编译产物挂载到测试项目 `.opencode/` 文件夹，在该项目启动 opencode 验证
 - 日志：`@xiaoqiong0v0/opencode-plugin-logger` 按天滚动落盘
 
