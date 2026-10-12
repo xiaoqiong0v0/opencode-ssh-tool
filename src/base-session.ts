@@ -13,7 +13,8 @@ import {
   SYNTAX_MAX_WAIT_MS,
   INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC,
 } from "./constants.js"
-import log, { debug, tailLines, tailSummary } from "./log.js"
+import log, { debug, describeSend, tailLines, tailSummary } from "./log.js"
+import { decodeTerminalEscapes } from "./escapes.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart, stripTrailingPromptLine } from "./utils.js"
 import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
@@ -23,7 +24,6 @@ import { tr, type Lang } from "./i18n.js"
 export interface ExecResult {
   ok: boolean
   output: string
-  interactive?: boolean
   running?: boolean
   submitted?: boolean
   error?: string
@@ -36,10 +36,6 @@ export interface ExecResult {
 export type LifecycleEvent =
   | { type: "start"; command: string; ts: number }
   | { type: "done"; exitCode: number | null; endTs: number; output?: string }
-
-/** 交互触发词（sudo 密码 / 分页器 / 确认提示），含中英文 */
-const INTERACTIVE_RE =
-  /(\[sudo\] password for|password for \S+:|\*\*\*\s*$|Password:|密码:|--More--|\(END\)|\[y\/N\]|\[Y\/n\]|yes\/no|是\/否)/i
 
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
@@ -236,15 +232,6 @@ export abstract class BaseSession {
         this._completeRunning(captureStart, endPos, outcome.exitCode ?? null, command, out, outcome.syntaxError ? "direct(syntax)" : "direct")
         return { ok: true, output: this._truncate(await toModelText(out)), command, duration: Date.now() - startTs, ...this._extraResult }
       }
-      case "interactive": {
-        // 交互程序（sudo 密码 / 确认提示）：命令仍在等待用户输入，
-        // 保留 running 上下文与 busy 状态，转后台 watch 持续监听完成标记；
-        // 用户 send 输入后命令完成时由 watch 完整收集输出并翻转 busy（防新命令被当 exec 塞进运行中 shell）
-        const raw = this._buffer.slice(captureStart)
-        const out = this._extractOutput(raw, command)
-        this._startBackgroundWatch(captureStart, command)
-        return { ok: true, output: this._truncate(await toModelText(out)), interactive: true, command, duration: Date.now() - startTs, ...this._extraResult }
-      }
       case "running": {
         this._runningStartPos = 0
         this._setBusy(true, "cmdRunning")
@@ -297,20 +284,17 @@ export abstract class BaseSession {
 
   /**
    * 发送文本/按键到终端（交互场景：sudo 密码、确认、中断等）
-   * 转义序列：\r 或 \n = 回车，\x03 = Ctrl-C，\x04 = Ctrl-D，\x1a = Ctrl-Z，\x1b = ESC
-   * @param text 要发送的文本或按键序列
+   * 转义写法统一由 decodeTerminalEscapes 解码（见 src/escapes.ts）：
+   * \xHH 任意字节、\t TAB、\r/\n 回车、\\ 字面反斜杠；非法/不完整写法原样保留。
+   * 前端直接发送的真实控制字节（0x7f/0x09/ESC 序列等）不含反斜杠，逐字节原样通过，同一实现两条路径共用。
+   * @param text 要发送的文本或按键序列（转义文本或真实字节）
    * @returns 是否发送成功
    */
   send(text: string): { ok: boolean; error?: string } {
     if (!this._connected) return { ok: false, error: tr("err_not_connected", this._lang) }
-    const payload = text
-      .replace(/\\x1b/gi, "\x1b")
-      .replace(/\\x03/gi, "\x03")
-      .replace(/\\x04/gi, "\x04")
-      .replace(/\\x1a/gi, "\x1a")
-      .replace(/\\r/g, "\r")
-      .replace(/\\n/g, "\r")
-    log.info(`send ${this._logTag} -> ${JSON.stringify(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
+    const payload = decodeTerminalEscapes(text)
+    // 只记长度与类型，绝不打印载荷内容（用户会把密码/密钥粘进命令框或按键）
+    log.info(`send ${this._logTag} -> ${describeSend(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
     // 真实中断输入：标记本次命令已发过 Ctrl-C；写完中断键后进入中断周期，
     // 周期内**立即**补发首条探针、之后按配置间隔（默认 5s）补发探针标记来收尾被中断的命令。
     // 防抖：周期内重复 Ctrl-C 被 _startInterruptCycle 抑制（不重启周期、不额外补探针），
@@ -735,7 +719,7 @@ export abstract class BaseSession {
   }
 
   /**
-   * 同步等待命令完成：轮询语法错误 / 完成标记 / 交互提示 / ^C 中断，超动画窗口仍未完成则转后台 watch。
+   * 同步等待命令完成：轮询语法错误 / 完成标记 / ^C 中断，超动画窗口仍未完成则转后台 watch。
    * @param startPos 捕获窗口起点（相对当前 buffer）
    * @param startTs 命令发起时刻（判定动画窗口用）
    * @returns kind=done 时 exitCode 为退出码（语法错误无标记可读，为 null）；markerPos 缺省表示窗口取到缓冲区末尾；
@@ -744,7 +728,7 @@ export abstract class BaseSession {
   private _waitCompletion(
     startPos: number,
     startTs: number,
-  ): Promise<{ kind: "done" | "interactive" | "running"; markerPos?: number; exitCode?: number | null; syntaxError?: boolean }> {
+  ): Promise<{ kind: "done" | "running"; markerPos?: number; exitCode?: number | null; syntaxError?: boolean }> {
     return new Promise((resolve) => {
       let lastLen = this._buffer.length
       // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
@@ -775,11 +759,6 @@ export abstract class BaseSession {
             resolve({ kind: "done", exitCode: null, syntaxError: true })
             return
           }
-        }
-        if (INTERACTIVE_RE.test(this._buffer.slice(startPos))) {
-          clearInterval(timer)
-          resolve({ kind: "interactive" })
-          return
         }
         // 完成判定（权威且唯一）：命令后追加的 printf 输出 <SSH_DONE:seq:code>。
         // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）。

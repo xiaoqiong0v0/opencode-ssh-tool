@@ -80,7 +80,7 @@ Subcommands:
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [-n name]
-      send text/keystrokes (\\r Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
+      send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   status [-n name]
       terminal state (busy/pending/connection); omit name to list all
   disconnect [-n name]
@@ -115,7 +115,7 @@ Examples:
   read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [-n name]
-      发送文本/按键（\\r 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
+      发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   status [-n name]
       终端状态（busy/pending/连接）；省略 name 列出全部
   disconnect [-n name]
@@ -268,7 +268,11 @@ Examples:
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
 web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
-  web_send_ctrlc: { en: "Keystroke", zh: "快捷键" },
+  web_direct_input: { en: "Direct input (type here for interactive prompts)", zh: "直接输入（交互输入请直接在此输入）" },
+  web_input_on: { en: "Direct input: ON — keys go to terminal", zh: "直接输入：已启用（按键发往终端）" },
+  web_input_off: { en: "Direct input: OFF — keys stay in browser", zh: "直接输入：已关闭（按键留在浏览器）" },
+  web_input_disconnected: { en: "Disconnected — input will not be sent", zh: "连接已断开，输入不会被送达" },
+  web_input_offline: { en: "Terminal offline — input will not be sent", zh: "终端未连接，输入不会被送达" },
   web_raw: { en: "Raw", zh: "原始" },
   disconnected_ok: {
     en: "Terminal closed ({host}).",

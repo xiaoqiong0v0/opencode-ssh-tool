@@ -2,7 +2,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { infoDedup } from "./log.js"
+import log from "./log.js"
 
 /** 跨进程会话状态（写入共享目录供聚合） */
 export interface SessionState {
@@ -34,9 +34,17 @@ function stateFile(sessionsDir: string, sessionID: string, name: string): string
 }
 
 /**
+ * 各状态文件上次记录的日志签名（`busy|connected|reason`）：内容未变时不再重复记。
+ * 周期性的 session-meta 写入（每次仅 updatedAt 变化）会命中同一签名，从而不再刷屏；
+ * 状态真正变化（busy/connected 翻转或写入原因不同）时照常记一行。
+ */
+const lastStateLog = new Map<string, string>()
+
+/**
  * 写/更新某会话状态文件（进程内会话变化时调用）。
- * 状态文件是 server 拿不到 agent 实时流时 busy 的回退来源，故每次写入记一行
- * （写入值 + 原因 + 目标终端；短窗去重防刷屏），便于事后判断 busy 来源是否陈旧。
+ * 状态文件是 server 拿不到 agent 实时流时 busy 的回退来源，故写入时记一行
+ * （写入值 + 原因 + 目标终端）。日志**只在内容变化时记**：签名为 `busy|connected|reason`，
+ * 与日志正文一致——重复写同样的值不再输出；状态翻转或原因变化才记。
  * @param cacheRoot 插件缓存根目录
  * @param state 会话状态（写入内容）
  * @param reason 写入原因（connect / exec前 / exec后 / send / session-meta 等）
@@ -45,11 +53,12 @@ export function writeSessionState(cacheRoot: string, state: SessionState, reason
   try {
     const dir = join(cacheRoot, SESSIONS_DIR)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(stateFile(dir, state.sessionID, state.name), JSON.stringify(state), "utf8")
-    infoDedup(
-      `state-write:${state.sessionID}|${state.name}|${reason}|${state.busy}|${state.connected}`,
-      `[state] 写状态文件 ${state.sessionID}/${state.name} busy=${state.busy} connected=${state.connected} reason=${reason}`,
-    )
+    const file = stateFile(dir, state.sessionID, state.name)
+    writeFileSync(file, JSON.stringify(state), "utf8")
+    const sig = `${state.busy}|${state.connected}|${reason}`
+    if (lastStateLog.get(file) === sig) return
+    lastStateLog.set(file, sig)
+    log.info(`[state] 写状态文件 ${state.sessionID}/${state.name} busy=${state.busy} connected=${state.connected} reason=${reason}`)
   } catch {
     /* 忽略写失败 */
   }
@@ -58,7 +67,9 @@ export function writeSessionState(cacheRoot: string, state: SessionState, reason
 /** 删除某会话状态文件（断开/会话删除时调用） */
 export function removeSessionState(cacheRoot: string, sessionID: string, name: string): void {
   try {
-    rmSync(stateFile(join(cacheRoot, SESSIONS_DIR), sessionID, name), { force: true })
+    const file = stateFile(join(cacheRoot, SESSIONS_DIR), sessionID, name)
+    lastStateLog.delete(file)
+    rmSync(file, { force: true })
   } catch {
     /* 忽略 */
   }
@@ -71,7 +82,9 @@ export function removeAllSessionStates(cacheRoot: string, sessionID: string): vo
     const prefix = `${sessionID}-`
     for (const f of readdirSync(dir)) {
       if (f.startsWith(prefix) && f.endsWith(".json")) {
-        rmSync(join(dir, f), { force: true })
+        const file = join(dir, f)
+        lastStateLog.delete(file)
+        rmSync(file, { force: true })
       }
     }
   } catch {

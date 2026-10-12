@@ -42,6 +42,41 @@ export const INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC = 5
 /** ssh2 认证超时（毫秒） */
 export const READY_TIMEOUT_MS = 10_000
 
+/**
+ * SSH 协议级保活间隔（毫秒）：向服务端发送 keepalive 全局请求的周期（对应 OpenSSH 的 ServerAliveInterval）。
+ * 空闲时防止路径上的 NAT/防火墙/远端 sshd 因空闲超时掐断长驻连接。
+ * 该请求是**连接层带外**消息（`keepalive@openssh.com` 全局请求），不写入任何 channel/PTY，
+ * 因此不会污染终端输出、也不干扰完成标记机制。
+ */
+export const SSH_KEEPALIVE_INTERVAL_MS = 20_000
+
+/**
+ * SSH 保活最大连续未响应次数（对应 OpenSSH 的 ServerAliveCountMax）：
+ * 连续这么多次 keepalive 未收到响应即判定连接死亡并断开（触发既有 error/close 处理标离线）。
+ */
+export const SSH_KEEPALIVE_COUNT_MAX = 3
+
+// ===== WebSocket 应用层心跳（server ↔ agent / server ↔ browser 两条 WS 共用） =====
+
+/**
+ * WS 应用层心跳发送间隔（毫秒）：server 每隔此时长向每条连接下发 `{type:"ping"}`。
+ * 心跳是**应用层消息**，只在 WS 通道上收发，绝不写入 PTY/终端，不污染终端输出与完成标记。
+ */
+export const HEARTBEAT_INTERVAL_MS = 25_000
+
+/**
+ * 心跳漏应答超时（毫秒）：server 发出 `{type:"ping"}` 后此时长内未收到 `{type:"pong"}`，
+ * 即判定该连接为**半开**（socket 已死但进程不知）并 terminate；对端随即收到 close、
+ * 走既有自动重连，从而把"半开"变成"可发现 + 可自愈"。
+ */
+export const HEARTBEAT_TIMEOUT_MS = 10_000
+
+/**
+ * 客户端（agent / 浏览器）心跳静默超时（毫秒）：超过此时长未收到 server 的 `{type:"ping"}`
+ * 即判定服务端半开，客户端主动 close 并走既有重连。取 2 倍发送间隔，容忍单次丢包/调度抖动。
+ */
+export const HEARTBEAT_CLIENT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 2
+
 /** 注入总超时（含重试）：超过此时长仍无首个标记则断连报错 */
 export const INJECT_TIMEOUT_MS = 30_000
 
@@ -83,4 +118,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  */
-export const SERVER_PROTO_VERSION = 14
+export const SERVER_PROTO_VERSION = 17

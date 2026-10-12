@@ -1,8 +1,8 @@
 // 代理客户端：插件进程连上独立服务（WS），注册本进程持有的会话，
 // 处理服务转发来的交互命令（run-exec / run-send / run-delete），并把实时流推给服务。
 
-import log, { debug, infoDedup, infoDedupShared } from "./log.js"
-import { INTERACTIVE_BUSY_MS } from "./constants.js"
+import log, { debug, describeSend, infoDedup, infoDedupShared } from "./log.js"
+import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS } from "./constants.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
 export interface AgentSession {
@@ -44,6 +44,10 @@ export function startAgent(
   let ws: WebSocket | null = null
   let closed = false
   let timer: ReturnType<typeof setInterval> | null = null
+  /** 心跳检测定时器（与 pushStreams 的 timer 分开，断开时一并清理） */
+  let hbTimer: ReturnType<typeof setInterval> | null = null
+  /** 最近一次收到 server 应用层 ping 的时刻（毫秒）；静默超过 HEARTBEAT_CLIENT_TIMEOUT_MS 即判定服务端半开 */
+  let lastPingAt = 0
   /** 连接成功次数（1=首次连接，>1=重连），用于在日志里区分首连与重连 */
   let connSeq = 0
 
@@ -152,6 +156,17 @@ export function startAgent(
     }
   }
 
+  /**
+   * 心跳检测：超过 HEARTBEAT_CLIENT_TIMEOUT_MS 未收到 server 的 ping，判定服务端半开，主动断开并触发重连。
+   * 半开（socket 已死但本端不知）时 server 的 close 不会到达，只有本端超时才能发现并自愈。
+   */
+  const checkServerAlive = (): void => {
+    if (closed || !ws) return
+    if (Date.now() - lastPingAt <= HEARTBEAT_CLIENT_TIMEOUT_MS) return
+    log.info(`代理心跳超时 ${HEARTBEAT_CLIENT_TIMEOUT_MS}ms 未收到服务端 ping，主动断开重连 ${wsUrl}`)
+    try { ws.close() } catch { /* onclose 兜底重连 */ }
+  }
+
   const connect = (): void => {
     if (closed) return
     try {
@@ -192,6 +207,11 @@ export function startAgent(
       // 重连后清空 raw 游标：server 可能已重启（rawBuf 丢失）或本进程原地重连，
       // 首帧统一以"新代次"重发全量并带 reset，server 端 replace 语义保证不重复累积
       rawPosMap.clear()
+      // 启动心跳检测：server 每 HEARTBEAT_INTERVAL_MS 下发 ping，本端回 pong 并据此刷新 lastPingAt；
+      // 长时间收不到 ping（服务端半开）时由 checkServerAlive 主动断开重连
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
+      lastPingAt = Date.now()
+      hbTimer = setInterval(checkServerAlive, HEARTBEAT_INTERVAL_MS)
       timer = setInterval(pushStreams, 100)
     }
     ws.onmessage = (ev: MessageEvent) => {
@@ -199,6 +219,8 @@ export function startAgent(
       try { msg = JSON.parse(String(ev.data)) } catch { return }
       const t = msg.type as string | undefined
       if (!t) return
+      // 应用层心跳：刷新存活时刻并回 pong（闭环即可，不触发重连）
+      if (t === "ping") { lastPingAt = Date.now(); send({ type: "pong" }); return }
       if (t === "run-exec") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
@@ -221,7 +243,7 @@ export function startAgent(
         // 不能走 send（那是给交互程序的输入），也不能直接 exec（hold busy 会 quick-fail）
         if ((execQueue.get(key)?.length ?? 0) > 0) {
           execQueue.get(key)!.push(command)
-          log.info(`agent run-exec 序列中排队 ${sid}/${name}: ${command} (队列 ${execQueue.get(key)!.length})`)
+          log.info(`agent run-exec 序列中排队 ${sid}/${name}: ${describeSend(command)} (队列 ${execQueue.get(key)!.length})`)
           return
         }
         if (session.hasRunningStream()) {
@@ -229,14 +251,14 @@ export function startAgent(
             const q = execQueue.get(key)
             if (q) q.push(command)
             else execQueue.set(key, [command])
-            log.info(`agent run-exec 排队 ${sid}/${name}: ${command} (队列 ${(execQueue.get(key) ?? []).length})`)
+            log.info(`agent run-exec 排队 ${sid}/${name}: ${describeSend(command)} (队列 ${(execQueue.get(key) ?? []).length})`)
             return
           }
-          log.info(`agent run-exec busy 超阈值按交互输入 ${sid}/${name}: ${command}`)
+          log.info(`agent run-exec busy 超阈值按交互输入 ${sid}/${name}: ${describeSend(command)}`)
           session.send(command + "\r")
           return
         }
-        log.info(`agent run-exec 直接执行 ${sid}/${name}: ${command}`)
+        log.info(`agent run-exec 直接执行 ${sid}/${name}: ${describeSend(command)}`)
         void execQueued(sid, name, command)
         return
       }
@@ -261,6 +283,7 @@ export function startAgent(
     }
     ws.onclose = () => {
       if (timer) { clearInterval(timer); timer = null }
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
       if (closed) return
       // 断开时记录受影响的终端列表；重连每 2s 重试一次，用 10s 窗口去重避免刷屏（重复次数附在汇总行）。
       // 去重键含受影响终端列表：同一批终端反复断连才合并，终端集合变化时立即另记一行，不丢会话归属信息。
@@ -281,6 +304,7 @@ export function startAgent(
     close: () => {
       closed = true
       if (timer) { clearInterval(timer); timer = null }
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
       try { ws?.close() } catch { /* ignore */ }
     },
     reRegister: register,

@@ -19,13 +19,16 @@
 </header>
 <pre id="term">{{web_loading}}</pre>
 <div id="xt"></div>
+<div id="connStatus" class="conn-status"></div>
 <div id="cmdbar">
-  <span id="cmdKey" title="{{web_send_ctrlc}}"></span>
+  <span id="cmdKey"></span>
   <textarea id="cmdInput" rows="1" placeholder="{{web_cmd_placeholder}}"></textarea>
 </div>
 <script>window.__I18N__ = __I18N_JSON__;</script>
 <script>window.__PTY_COLS__ = __PTY_COLS_VAL__;</script>
 <script>window.__PTY_ROWS__ = __PTY_ROWS_VAL__;</script>
+<script>window.__HEARTBEAT_INTERVAL_MS__ = __HEARTBEAT_INTERVAL_MS_VAL__;</script>
+<script>window.__HEARTBEAT_CLIENT_TIMEOUT_MS__ = __HEARTBEAT_CLIENT_TIMEOUT_MS_VAL__;</script>
 <script src="/web/app.js"></script>
 </body>
 </html>

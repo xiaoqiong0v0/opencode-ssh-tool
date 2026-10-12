@@ -4,6 +4,8 @@ import { Terminal } from "@xterm/xterm"
 import { Terminal as HeadlessTerminal } from "@xterm/headless"
 import type { IBufferCell, Terminal as HeadlessTerminalType } from "@xterm/headless"
 
+import { mapKeystroke } from "./keys.js"
+
 interface I18n {
   commands: string
   sessionGone: string
@@ -11,7 +13,16 @@ interface I18n {
   terminals: string
   local: string
   cmdPlaceholder: string
-  sendCtrlC: string
+  /** 直接输入入口标签/提示 */
+  directInput: string
+  /** 直接输入已启用（指示器文案） */
+  inputOn: string
+  /** 直接输入已关闭（指示器文案） */
+  inputOff: string
+  /** 页面 WS 断开、输入无法送达 */
+  inputDisconnected: string
+  /** 当前终端未连接 */
+  inputOffline: string
 }
 
 interface TerminalInfo {
@@ -51,9 +62,67 @@ function parseOutput(raw: string): { text: string; exitCode?: number } {
   return { text: raw }
 }
 
-const I18N: I18n = (window as unknown as { __I18N__: I18n }).__I18N__
+/**
+ * 注入文案缺失时的内置兜底，按页面语言（<html lang>）选择。
+ * 常驻 server 进程与磁盘 app.js 版本可能错配（旧进程注入的 __I18N__ 缺少新增键），
+ * 此时必须以对应语言的兜底文案渲染，绝不出现 undefined/空标签，也不把中文用户显示成英文。
+ */
+const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
+  en: {
+    commands: "commands",
+    sessionGone: "Session missing or disconnected",
+    noSession: "No terminal. Use term_cli connect (SSH) or term_cli local first.",
+    terminals: "terminals",
+    local: "local",
+    cmdPlaceholder: "Enter command (Shift+Enter new line)",
+    directInput: "Direct input (type here for interactive prompts)",
+    inputOn: "Direct input: ON — keys go to terminal",
+    inputOff: "Direct input: OFF — keys stay in browser",
+    inputDisconnected: "Disconnected — input will not be sent",
+    inputOffline: "Terminal offline — input will not be sent",
+  },
+  zh: {
+    commands: "条命令",
+    sessionGone: "会话不存在或已断开",
+    noSession: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。",
+    terminals: "终端",
+    local: "本地",
+    cmdPlaceholder: "输入命令（Shift+Enter 换行）",
+    directInput: "直接输入（交互输入请直接在此输入）",
+    inputOn: "直接输入：已启用（按键发往终端）",
+    inputOff: "直接输入：已关闭（按键留在浏览器）",
+    inputDisconnected: "连接已断开，输入不会被送达",
+    inputOffline: "终端未连接，输入不会被送达",
+  },
+}
+
+/** 页面语言：由 server 渲染的 `<html lang>` 决定（非 zh 一律按 en 兜底） */
+const DOC_LANG: "en" | "zh" = document.documentElement.lang === "zh" ? "zh" : "en"
+
+/**
+ * 合并注入文案与内置兜底：某键注入值不是非空字符串时回退**当前语言**的兜底，保证每个键都是可用文案。
+ * @param raw window.__I18N__ 注入对象（可能为 undefined 或缺键）
+ * @param lang 兜底语言（页面语言）
+ * @returns 每个键均为非空字符串的 I18n
+ */
+function mergeI18n(raw: Partial<I18n> | undefined, lang: "en" | "zh"): I18n {
+  const out: I18n = { ...I18N_FALLBACK[lang] }
+  for (const k of Object.keys(I18N_FALLBACK[lang]) as (keyof I18n)[]) {
+    const v = raw?.[k]
+    if (typeof v === "string" && v.length > 0) out[k] = v
+  }
+  return out
+}
+
+const I18N: I18n = mergeI18n((window as unknown as { __I18N__?: Partial<I18n> }).__I18N__, DOC_LANG)
 const PTY_COLS: number = (window as unknown as { __PTY_COLS__: number }).__PTY_COLS__ || 120
 const PTY_ROWS: number = (window as unknown as { __PTY_ROWS__: number }).__PTY_ROWS__ || 40
+/**
+ * 应用层心跳参数（由 server 渲染页面时注入，来自 src/constants.ts）。
+ * 缺省 0 = 旧缓存页面未注入：禁用心跳（不猜默认值），而非静默使用会漂移的魔法数。
+ */
+const HEARTBEAT_INTERVAL_MS: number = (window as unknown as { __HEARTBEAT_INTERVAL_MS__?: number }).__HEARTBEAT_INTERVAL_MS__ || 0
+const HEARTBEAT_CLIENT_TIMEOUT_MS: number = (window as unknown as { __HEARTBEAT_CLIENT_TIMEOUT_MS__?: number }).__HEARTBEAT_CLIENT_TIMEOUT_MS__ || 0
 
 const ANSI_BASE = ["#010101", "#de382b", "#39b54a", "#ffc005", "#006fb8", "#762671", "#2cb3e9", "#c9d1d9"]
 const ANSI_BRIGHT = ["#666666", "#ff7b72", "#3fb950", "#d29922", "#58a6ff", "#bc8cff", "#39c5cf", "#f0f6fc"]
@@ -235,6 +304,20 @@ class HeadlessScreen {
 
 // ===== 全局状态 =====
 let ws: WebSocket | null = null
+/** WS 是否处于已连接状态（输入可用性判定之一） */
+let wsUp = false
+/** 断线自动重连定时器（null 表示未排队，避免重复连接） */
+let reconnectTimer: number | null = null
+/** 最近一次收到 server 应用层 ping 的时刻（毫秒） */
+let lastPingAt = 0
+/** 心跳检测定时器（null 表示未启动；断开时清理） */
+let heartbeatTimer: number | null = null
+/** 命令框/直接输入当前是否可用（由 applyInputState 依据 WS 与终端连接状态维护） */
+let inputEnabled = false
+/** 直接输入开关的持久化键（localStorage） */
+const DIRECT_INPUT_PREF_KEY = "directInput"
+/** 直接输入开关（用户偏好，默认开＝一直可输入；关掉后按键回归浏览器/页面） */
+let directInputOn = localStorage.getItem(DIRECT_INPUT_PREF_KEY) !== "0"
 let sessionsData: SessionStatus[] = []
 let stickToBottom = true
 let runScreen: HeadlessScreen | null = null
@@ -256,11 +339,22 @@ function resetRunScreen(): void {
 }
 
 // ===== WS 连接 =====
+/** 断线自动重连间隔（毫秒） */
+const RECONNECT_MS = 2000
+
 function connectWs(): void {
+  wsUp = false
+  applyInputState()
   ws = new WebSocket("ws://" + window.location.host + "/ws")
   ws.onopen = () => {
+    wsUp = true
+    // 重连后强制重新订阅：清空去重键，否则 subscribe() 会因 sid/name 未变而跳过
+    subSid = ""
+    subName = ""
     ws!.send(JSON.stringify({ type: "list" }))
     subscribe()
+    applyInputState()
+    startHeartbeat()
   }
   ws.onmessage = (ev) => {
     let msg: Record<string, unknown>
@@ -270,6 +364,11 @@ function connectWs(): void {
       return
     }
     switch (msg.type) {
+      case "ping":
+        // 应用层心跳：刷新存活时刻并回 pong；本端只关心"是否还能收到 server 的 ping"
+        lastPingAt = Date.now()
+        ws!.send(JSON.stringify({ type: "pong" }))
+        break
       case "sessions": updateSessions(msg as unknown as { sessions: SessionStatus[] }); break
       case "snapshot": handleSnapshot(msg as unknown as { sessionID: string; name: string; pairs: TranscriptPair[]; notFound?: boolean }); break
       case "meta": handleMeta(msg as unknown as { sessionID: string; name: string; commands: number }); break
@@ -278,10 +377,44 @@ function connectWs(): void {
     }
   }
   ws.onclose = () => {
-    // 断线不做重连，页面死掉用户刷新
-    const pre = document.getElementById("term") as HTMLPreElement
-    pre.textContent = "WebSocket disconnected"
+    // 断线：禁用输入并显示原因，随后自动重连（恢复后 onopen 重新订阅并解除禁用）
+    stopHeartbeat()
+    wsUp = false
+    applyInputState()
+    scheduleReconnect()
   }
+}
+
+/**
+ * 启动心跳检测：server 每 HEARTBEAT_INTERVAL_MS 下发一次 ping，本端在 onmessage 回 pong 并刷新 lastPingAt。
+ * 持续静默超过 HEARTBEAT_CLIENT_TIMEOUT_MS 即判定服务端半开（socket 已死但本端不知、收不到 close），
+ * 主动 close → 走既有自动重连，实现"可发现 + 可自愈"。
+ */
+function startHeartbeat(): void {
+  if (HEARTBEAT_INTERVAL_MS <= 0) return
+  lastPingAt = Date.now()
+  if (heartbeatTimer !== null) return
+  heartbeatTimer = window.setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    if (Date.now() - lastPingAt > HEARTBEAT_CLIENT_TIMEOUT_MS) ws.close()
+  }, HEARTBEAT_INTERVAL_MS)
+}
+
+/** 停止心跳检测（连接关闭时调用，避免残留定时器） */
+function stopHeartbeat(): void {
+  if (heartbeatTimer !== null) {
+    window.clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
+}
+
+/** 断线自动重连：单一定时器排队，避免重复连接 */
+function scheduleReconnect(): void {
+  if (reconnectTimer !== null) return
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null
+    connectWs()
+  }, RECONNECT_MS)
 }
 
 // ===== 会话列表更新 =====
@@ -331,13 +464,8 @@ function updateSessions(msg: { sessions: SessionStatus[] }): void {
   updateTerminalSelect(prevTerminal)
 }
 
-/** 根据当前终端连接/忙状态更新输入框与快捷键按钮可用性 */
+/** 根据当前终端连接/忙状态更新输入框与直接输入入口可用性 */
 function updateCmdBar(): void {
-  const disabled = !(sessionsData.find((x) => x.sessionID === (document.getElementById("session") as HTMLSelectElement).value)
-    ?.terminals.find((t2) => (t2.name || "default") === (document.getElementById("terminal") as HTMLSelectElement).value)?.connected)
-  const key = document.getElementById("cmdKey") as HTMLSpanElement
-  key.classList.toggle("disabled", disabled)
-  key.title = disabled ? "" : (I18N.sendCtrlC || "")
   // Raw 开关始终可用：在线走实时流，离线历史会话由 server 从 history 重建 raw 流
   const rawCb = document.getElementById("debugMode") as HTMLInputElement
   const rawToggle = document.getElementById("rawToggle")
@@ -347,6 +475,39 @@ function updateCmdBar(): void {
   debugMode = effRaw()
   if (debugMode) showRawUi()
   else hideRawUi()
+  applyInputState()
+}
+
+/**
+ * 输入可用性判定：WS 在线 且 当前选中终端已连接
+ * @returns enabled=是否可用；reason=不可用原因（可用时为空串）
+ */
+function inputState(): { enabled: boolean; reason: string } {
+  if (!wsUp) return { enabled: false, reason: I18N.inputDisconnected }
+  const sid = (document.getElementById("session") as HTMLSelectElement).value
+  const name = (document.getElementById("terminal") as HTMLSelectElement).value
+  const term = sessionsData.find((x) => x.sessionID === sid)?.terminals.find((t2) => (t2.name || "default") === name)
+  if (!sid || !name || !term?.connected) return { enabled: false, reason: I18N.inputOffline }
+  return { enabled: true, reason: "" }
+}
+
+/**
+ * 应用输入可用性到界面：离线/终端断开时禁用命令框并显示原因，恢复后自动解除。
+ * 直接输入（文档级按键捕获）由 inputEnabled 同步约束。
+ */
+function applyInputState(): void {
+  const st = inputState()
+  inputEnabled = st.enabled
+  const cmdInput = document.getElementById("cmdInput") as HTMLTextAreaElement
+  cmdInput.disabled = !st.enabled
+  cmdInput.placeholder = st.enabled ? (I18N.cmdPlaceholder || "") : st.reason
+  cmdInput.title = st.reason
+  updateCmdKey()
+  const status = document.getElementById("connStatus")
+  if (status) {
+    status.textContent = st.enabled ? "" : st.reason
+    status.classList.toggle("show", !st.enabled)
+  }
 }
 
 function updateTerminalSelect(prevName?: string, forceSub = false): void {
@@ -915,77 +1076,68 @@ function autoGrowCmdInput(): void {
 }
 cmdInput.addEventListener("input", autoGrowCmdInput)
 
-// 快捷键捕获区：点击激活后按键即发送到终端（可连续输入），再点击取消
-const cmdKey = document.getElementById("cmdKey") as HTMLSpanElement
-const CMD_KEY_RESET = I18N.sendCtrlC || "Ctrl-C"
-let capActive = false
-/** 点击激活捕获状态：点一下激活（可连续输入多个键），再点一下取消 */
-let capLocked = false
-cmdKey.textContent = CMD_KEY_RESET
-function sendKeystroke(ev: KeyboardEvent): void {
-  if (!capActive) return
+// ===== 直接输入（交互输入）=====
+// 文档级按键捕获：默认启用（无需先点击激活），可点击指示器关闭（关闭后按键回归浏览器/页面）。
+// 按键一律走 type:"send"（keystroke 通道），不产生 exec、不写命令记录；命令框仍走 exec 发命令。
+// 按键 → 终端字节序列的映射（含 Home/End/PgUp/PgDn/Delete/Shift+Tab/Esc 等）集中在 ./keys.ts；
+// 发送的是**真实控制字节**（0x7f/0x09/ESC 引导序列），与后端通用解码口径一致（见 src/escapes.ts）。
+
+/** 当前按键事件是否落在可编辑/表单控件上（是则不拦截，交由其正常处理） */
+function isEditableTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null
+  if (!el || !el.tagName) return false
+  const tag = el.tagName.toUpperCase()
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || el.isContentEditable
+}
+
+/** 发送一段按键文本到当前终端（keystroke 通道，不写命令记录） */
+function sendKeystroke(text: string): void {
   const sid = (document.getElementById("session") as HTMLSelectElement).value
   const name = (document.getElementById("terminal") as HTMLSelectElement).value
   if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
-  let text: string
-  let label: string
-  if (ev.ctrlKey && ev.key !== "Control") {
-    const code = ev.key.toLowerCase().charCodeAt(0) - 96
-    if (code >= 1 && code <= 26) { text = "\\x" + code.toString(16).padStart(2, "0"); label = "Ctrl-" + ev.key.toUpperCase() }
-    else { text = ""; label = "" }
-  } else if (ev.key === "Enter") { text = "\\r"; label = "↵" }
-  else if (ev.key === "Escape") { text = "\\x1b"; label = "Esc" }
-  else if (ev.key === "Tab") { text = "\\t"; label = "Tab" }
-  else if (ev.key === "Backspace") { text = "\\x7f"; label = "⌫" }
-  else if (ev.key === " " || ev.key === "Space") { text = " "; label = "Space" }
-  else if (ev.key === "ArrowUp") { text = "\\x1b[A"; label = "↑" }
-  else if (ev.key === "ArrowDown") { text = "\\x1b[B"; label = "↓" }
-  else if (ev.key === "ArrowRight") { text = "\\x1b[C"; label = "→" }
-  else if (ev.key === "ArrowLeft") { text = "\\x1b[D"; label = "←" }
-  else if (ev.key === "Home") { text = "\\x1b[H"; label = "Home" }
-  else if (ev.key === "End") { text = "\\x1b[F"; label = "End" }
-  else if (ev.key === "PageUp") { text = "\\x1b[5~"; label = "PgUp" }
-  else if (ev.key === "PageDown") { text = "\\x1b[6~"; label = "PgDn" }
-  else if (/^F[1-4]$/.test(ev.key)) { text = "\\x1bO" + "PQRS"[Number(ev.key.slice(1)) - 1]; label = ev.key }
-  else if (/^F([5-9]|1[0-2])$/.test(ev.key)) {
-    const n = Number(ev.key.slice(1))
-    const tilde = { 5: 15, 6: 17, 7: 18, 8: 19, 9: 20, 10: 21, 11: 23, 12: 24 }[n]
-    text = "\\x1b[" + tilde + "~"; label = ev.key
-  }
-  else if (ev.key.length === 1) { text = ev.key; label = ev.key }
-  else return
-  if (text) ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text }))
-  cmdKey.textContent = label || CMD_KEY_RESET
-  setTimeout(() => { if (!capActive) cmdKey.textContent = CMD_KEY_RESET }, 1500)
+  ws.send(JSON.stringify({ type: "send", sessionID: sid, name, text }))
 }
+
+/**
+ * 刷新直接输入指示器：文案随开关状态（中/英），高亮随可用性。
+ * 默认开＝"一直可输入"；端点离线/WS 断开时叠加 disabled 样式（原因由 connStatus 显示）。
+ */
+function updateCmdKey(): void {
+  const key = document.getElementById("cmdKey") as HTMLSpanElement | null
+  if (!key) return
+  key.textContent = directInputOn ? (I18N.inputOn || I18N.directInput) : (I18N.inputOff || I18N.directInput)
+  key.classList.toggle("on", directInputOn)
+  key.classList.toggle("off", !directInputOn)
+  key.classList.toggle("disabled", !inputEnabled)
+  key.title = I18N.directInput || ""
+  key.setAttribute("aria-pressed", directInputOn ? "true" : "false")
+}
+
+// 指示器即开关：点击切换直接输入（关掉后按键回归浏览器/页面），状态持久化到 localStorage
+const cmdKey = document.getElementById("cmdKey") as HTMLSpanElement
+cmdKey.setAttribute("role", "switch")
 cmdKey.addEventListener("click", () => {
-  const sid = (document.getElementById("session") as HTMLSelectElement).value
-  if (!sid) return
-  // 点击切换捕获：点一下激活（可连续输入多个键），再点一下取消
-  capLocked = !capLocked
-  if (capLocked) {
-    capActive = true
-    cmdKey.classList.add("capture")
-    cmdKey.textContent = "..."
-    document.addEventListener("keyup", sendKeystroke)
-    // 激活快捷键捕获时退出输入框聚焦：按键经 document 捕获发送到终端，不再误输入到命令框
-    cmdInput.blur()
-  } else {
-    capActive = false
-    cmdKey.classList.remove("capture")
-    document.removeEventListener("keyup", sendKeystroke)
-    cmdKey.textContent = CMD_KEY_RESET
-  }
+  directInputOn = !directInputOn
+  localStorage.setItem(DIRECT_INPUT_PREF_KEY, directInputOn ? "1" : "0")
+  updateCmdKey()
 })
-// 输入框聚焦 → 自动取消快捷键捕获（回到正常命令输入，避免按键同时被输入框与快捷键消费）
-cmdInput.addEventListener("focus", () => {
-  if (!capActive) return
-  capLocked = false
-  capActive = false
-  cmdKey.classList.remove("capture")
-  document.removeEventListener("keyup", sendKeystroke)
-  cmdKey.textContent = CMD_KEY_RESET
-})
+
+/**
+ * 直接输入按键处理：开关开启且终端可用时生效（无需点击激活）。
+ * 焦点在命令框/选择框等控件上、浏览器快捷键、Cmd 组合、端点离线时一律不拦截。
+ * @param ev keydown 事件
+ */
+function onDirectInputKeydown(ev: KeyboardEvent): void {
+  if (!directInputOn) return
+  if (isEditableTarget(ev.target)) return
+  if (!inputEnabled) return
+  const seq = mapKeystroke(ev)
+  if (seq === null) return
+  ev.preventDefault()
+  sendKeystroke(seq)
+}
+document.addEventListener("keydown", onDirectInputKeydown, true)
+updateCmdKey()
 
 Object.assign(window, {
   onSessionChange,

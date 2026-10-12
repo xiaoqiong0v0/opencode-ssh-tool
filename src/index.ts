@@ -3,7 +3,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import stringArgv from "string-argv"
 import { parseArgs } from "node:util"
-import log, { infoDedupShared } from "./log.js"
+import log, { describeSend, infoDedupShared } from "./log.js"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -418,7 +418,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     syncSessionState(ctx.sessionID, name, "exec前")
     const result = values.waitResult ? await session.exec(command) : await session.submit(command)
     syncSessionState(ctx.sessionID, name, "exec后")
-    log.tool("term_exec", { sessionID: ctx.sessionID, name, command, ok: result.ok, submitted: result.submitted, interactive: result.interactive, running: result.running })
+    log.tool("term_exec", { sessionID: ctx.sessionID, name, command, ok: result.ok, submitted: result.submitted, running: result.running })
     if (result.submitted) return tr("submitted", toolLang)
     return result.ok ? result.output : result.error ?? tr("exec_failed", toolLang)
   }
@@ -458,7 +458,8 @@ export const OpenCodeSshTool: Plugin = async () => {
     const r = session.send(text)
     if (!r.ok) return tr("err_not_connected", toolLang)
     syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME, "send")
-    log.tool("term_send", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, text: text.slice(0, 60) })
+    // 只记长度与类型，绝不打印载荷内容（用户会把密码/密钥粘进命令框或按键）
+    log.tool("term_send", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, send: describeSend(text) })
     return tr("send_ok", toolLang).replace("{text}", text.slice(0, 60))
   }
 

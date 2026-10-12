@@ -10,7 +10,7 @@ import type { AddressInfo } from "node:net"
 import { WebSocketServer, WebSocket } from "ws"
 import { listAllSessions, removeSessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
-import { PTY_COLS, PTY_ROWS } from "./constants.js"
+import { PTY_COLS, PTY_ROWS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS, HEARTBEAT_CLIENT_TIMEOUT_MS } from "./constants.js"
 import log, { infoDedup } from "./log.js"
 
 export interface LiveSession {
@@ -43,6 +43,10 @@ interface WsClient extends WebSocket {
   _lastSessionsJson?: string
   _agentId?: string
   _regSessions?: Set<string>
+  /** 心跳：是否已发 ping 且尚未收到本连接的 pong（true=等待应答中） */
+  _awaitPong?: boolean
+  /** 等待本条 ping 的 pong 超时定时器（收到 pong 时清除） */
+  _pongTimer?: ReturnType<typeof setTimeout>
 }
 
 export interface TranscriptPair {
@@ -73,7 +77,6 @@ const PAGE_KEYS: FlatKey[] = [
   "web_local",
   "web_delete_terminal",
   "web_cmd_placeholder",
-  "web_send_ctrlc",
   "web_raw",
 ]
 
@@ -84,7 +87,11 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   local: "web_local",
   terminals: "web_terminals",
   cmdPlaceholder: "web_cmd_placeholder",
-  sendCtrlC: "web_send_ctrlc",
+  directInput: "web_direct_input",
+  inputOn: "web_input_on",
+  inputOff: "web_input_off",
+  inputDisconnected: "web_input_disconnected",
+  inputOffline: "web_input_offline",
 }
 
 const STATUS_PUSH_MS = 2000
@@ -125,6 +132,13 @@ export function startServer(
   const busyState = new Map<string, boolean>()
 
   /**
+   * 各 key 是否已处于"无 agent 连接且命令未完成"的 fallback 状态（仅用于日志：**边沿触发**）。
+   * buildSessions 每 2s（/state 轮询）被调用一次，故用 per-key 上一轮状态做**幂等**判定：
+   * 仅在进入该状态（首转 fallback）与离开该状态（agent 重连 / 命令收尾）各记一行，稳定期间不记。
+   */
+  const fallbackState = new Set<string>()
+
+  /**
    * 记录 server 侧 busy 翻转（仅在值变化时输出一行，带 session/终端/原因）：
    * 与终端侧 [busy] 行互补，便于对齐"server 认为忙/闲"的时间线。
    * @param sKey 会话键（sid:name）
@@ -150,7 +164,8 @@ export function startServer(
 
     if (path === "/") {
       const html = renderPage(lang, pageTemplate)
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
+      // 不缓存：页面内联的 __I18N__ 由本进程注入，若被浏览器缓存会在 server 重启后与磁盘上的 app.js 版本错配
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" })
       res.end(html)
       return
     }
@@ -179,6 +194,50 @@ export function startServer(
   const subscribersOf = (sid: string, name: string): WsClient[] => {
     return [...wss.clients as Set<WsClient>].filter(
       (c) => c.readyState === WebSocket.OPEN && c._sub?.sid === sid && c._sub?.name === name,
+    )
+  }
+
+  /**
+   * 收到客户端应用层 pong：清除"等待应答"标记与超时定时器（心跳闭环）。
+   * @param ws 收到 pong 的连接
+   */
+  const markPong = (ws: WsClient): void => {
+    ws._awaitPong = false
+    if (ws._pongTimer) { clearTimeout(ws._pongTimer); ws._pongTimer = undefined }
+  }
+
+  /** 所有已连 agent 认领的会话键并集（多实例：任一实例认领即视为有主） */
+  const claimedByAnyAgent = (): Set<string> => {
+    const claimed = new Set<string>()
+    for (const set of agents.values()) for (const k of set) claimed.add(k)
+    return claimed
+  }
+
+  /**
+   * 清理"无任何已连 agent 认领"的终端运行态（僵尸条目）：
+   * agent 断开后其运行态（streamBuf 的 done=false / rawBuf / 排队保持等）若无人接管会永久滞留，
+   * 导致 busy 恒为 ⏳、[fallback] 长期存在、离线终端仍被当成"运行中"。
+   * 多实例安全：只回收**所有已连 agent 都没认领**的 key——任一实例注册时都可安全回收孤儿；
+   * 仍被本实例或其它实例认领的条目一律不动。history 落盘历史**不删**（仅供离线查看）。
+   */
+  const cleanupOrphanRuntime = (): void => {
+    const claimed = claimedByAnyAgent()
+    const orphans: string[] = []
+    for (const k of streamBuf.keys()) if (!claimed.has(k)) orphans.push(k)
+    for (const k of rawBuf.keys()) if (!claimed.has(k) && !orphans.includes(k)) orphans.push(k)
+    for (const k of seqHold) if (!claimed.has(k) && !orphans.includes(k)) orphans.push(k)
+    if (!orphans.length) return
+    for (const k of orphans) {
+      streamBuf.delete(k)
+      rawBuf.delete(k)
+      seqHold.delete(k)
+      cmdCount.delete(k)
+      busyState.delete(k)
+      fallbackState.delete(k)
+    }
+    infoDedup(
+      `orphan-runtime:${orphans.slice().sort().join(",")}`,
+      `清理无 agent 认领的运行态 ${orphans.length} 个: ${orphans.map(keyTag).join(", ")}`,
     )
   }
 
@@ -215,25 +274,36 @@ export function startServer(
     // 等待期间无输出，但 agent 仍在、命令未完成，busy 必须保持 true。
     // 命令真实结束只认 agent 上报的当前 seq 完成标记（cmdDone），会话拆除路径另算。
     for (const [key, b] of streamBuf) {
-      if (b && !b.done && !agentBySession.has(key)) {
-        infoDedup(
-          `agent-offline:${key}`,
-          `[fallback] ${keyTag(key)} 无 agent 连接：命令状态未知（保持未完成，不判完成/不发 diff done）command=${JSON.stringify((b.command ?? "").slice(0, 120))} ts=${b.ts}`,
-        )
+      const inFallback = !!b && !b.done && !agentBySession.has(key)
+      if (inFallback && !fallbackState.has(key)) {
+        fallbackState.add(key)
+        // 边沿触发：仅在首次转入"无 agent 且未完成"时记一行（不含命令内容，防敏感载荷落盘）
+        log.info(`[fallback] ${keyTag(key)} 无 agent 连接：命令状态未知（保持未完成，不判完成/不发 diff done）ts=${b.ts}`)
+      } else if (!inFallback && fallbackState.has(key)) {
+        fallbackState.delete(key)
+        // 恢复：agent 重连（重新注册并补播 cmdStart）或命令被收尾，各记一行后回到稳定态不再记
+        const reason = agentBySession.has(key) ? "agent 重连" : b?.done ? "命令已收尾" : "状态已恢复"
+        log.info(`[fallback] ${keyTag(key)} 恢复：${reason}（退出"无 agent 且未完成"状态）`)
       }
       if (!agentBySession.has(key)) seqHold.delete(key) // agent 已消失：清排队序列 busy 保持
       liveBusy.set(key, (!!b && !b.done) || seqHold.has(key))
     }
+    // 清理已从 streamBuf 移除的 key（删除终端 / 缓冲回收）的 fallback 状态，避免同名 key 复用时漏记首次
+    for (const k of fallbackState) if (!streamBuf.has(k)) fallbackState.delete(k)
     for (const s of states) {
-      if (s.connected && !liveKey.has(sessionKey(s.sessionID, s.name))) {
+      const lk = sessionKey(s.sessionID, s.name)
+      const online = liveKey.has(lk)
+      if (s.connected && !online) {
         s.connected = false
       }
-      const lk = sessionKey(s.sessionID, s.name)
       const busy = liveBusy.get(lk)
       if (busy !== undefined) s.busy = busy
-      // 盲点显式化：拿不到 agent/实时流状态时，busy 回退取状态文件（可能是命令执行前写的旧值，未必可靠）
+      // 无 agent 连接 = 终端离线：busy 归零，不回退状态文件（进程异常退出时那里可能残留 busy=true，
+      // 会让离线终端一直显示 ⏳）。离线用既有 ○ 表达，不再叠加"忙"。
+      else if (!online) { s.busy = false; logBusy(lk, false, "无 agent 连接(离线)") }
+      // 盲点显式化：agent 在线但拿不到实时流状态时，busy 回退取状态文件（可能是命令执行前写的旧值，未必可靠）
       else logBusy(lk, !!s.busy, "状态文件回退(无 agent 状态)")
-      seen.add(sessionKey(s.sessionID, s.name))
+      seen.add(lk)
     }
     const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
     for (const s of states) {
@@ -318,6 +388,32 @@ export function startServer(
 
   const statusTimer = setInterval(() => { pushSessions() }, STATUS_PUSH_MS)
 
+  /**
+   * 应用层心跳（server 侧）：每隔 HEARTBEAT_INTERVAL_MS 向每条连接下发 {type:"ping"}，
+   * 并在 HEARTBEAT_TIMEOUT_MS 内未收到 pong 时 terminate。server↔agent、server↔browser 两条 WS 共用：
+   * terminate 后对端 close 事件触发既有自动重连，把"半开连接"变成可发现、可自愈。
+   * 心跳只在 WS 通道收发，不写 PTY/终端。
+   */
+  const heartbeatTimer = setInterval(() => {
+    for (const ws of wss.clients as Set<WsClient>) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      if (ws._awaitPong) {
+        // 上一条 ping 既没等到 pong、超时定时器也未生效（兜底路径）：判定半开，直接断开
+        log.info(`[heartbeat] 心跳无应答（兜底）断开连接 agent=${!!agents.get(ws)}`)
+        try { ws.terminate() } catch { /* 已关闭 */ }
+        continue
+      }
+      ws._awaitPong = true
+      send(ws, { type: "ping" })
+      ws._pongTimer = setTimeout(() => {
+        if (!ws._awaitPong) return
+        log.info(`[heartbeat] 心跳超时 ${HEARTBEAT_TIMEOUT_MS}ms 无 pong，断开连接 agent=${!!agents.get(ws)}`)
+        try { ws.terminate() } catch { /* 已关闭 */ }
+      }, HEARTBEAT_TIMEOUT_MS)
+      if (typeof ws._pongTimer.unref === "function") ws._pongTimer.unref()
+    }
+  }, HEARTBEAT_INTERVAL_MS)
+
   wss.on("connection", (ws: WsClient) => {
     ws.on("message", (raw) => {
       let msg: Record<string, unknown>
@@ -345,6 +441,9 @@ export function startServer(
             `agent 注册 ${keys.length} 个会话: ${keys.length ? keys.map(keyTag).join(", ") : "无"}`,
           )
         }
+        // 注册（含重连）后回收"无任何已连 agent 认领"的运行态：僵尸条目（agent 已消失仍 done=false）在此清干净
+        cleanupOrphanRuntime()
+        pushSessions()
         return
       }
 
@@ -528,7 +627,8 @@ export function startServer(
       }
 
       if (t === "unsubscribe") { ws._sub = undefined; ws._mode = undefined; return }
-      if (t === "ping") { send(ws, { type: "pong" }); return }
+      // 应用层心跳应答：客户端收到 server 的 {type:"ping"} 后回 {type:"pong"}，闭环即可
+      if (t === "pong") { markPong(ws); return }
 
       if (t === "exec") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
@@ -582,6 +682,7 @@ export function startServer(
     })
 
     ws.on("close", () => {
+      if (ws._pongTimer) { clearTimeout(ws._pongTimer); ws._pongTimer = undefined }
       const reg = agents.get(ws)
       if (reg) {
         // 盲点显式化：agent 断开时记录受影响的终端列表（仅 agent 连接，web 订阅者不在此列）
@@ -603,7 +704,7 @@ export function startServer(
         server,
         port: actualPort,
         url: `http://127.0.0.1:${actualPort}`,
-        close: () => { clearInterval(statusTimer); server.close(); wss.close() },
+        close: () => { clearInterval(statusTimer); clearInterval(heartbeatTimer); server.close(); wss.close() },
       })
     })
   })
@@ -622,6 +723,8 @@ function renderPage(lang: Lang, template: string): string {
   out = out.replaceAll("__I18N_JSON__", JSON.stringify(i18nObj))
   out = out.replaceAll("__PTY_COLS_VAL__", String(PTY_COLS))
   out = out.replaceAll("__PTY_ROWS_VAL__", String(PTY_ROWS))
+  out = out.replaceAll("__HEARTBEAT_INTERVAL_MS_VAL__", String(HEARTBEAT_INTERVAL_MS))
+  out = out.replaceAll("__HEARTBEAT_CLIENT_TIMEOUT_MS_VAL__", String(HEARTBEAT_CLIENT_TIMEOUT_MS))
   return out
 }
 
@@ -663,7 +766,8 @@ function serveStatic(res: import("node:http").ServerResponse, webDir: string, re
     return
   }
   const ext = extname(file).toLowerCase()
-  res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream" })
+  // 不缓存：静态资源（app.js/app.css）无哈希文件名，缓存会与页面注入的 __I18N__ 版本错配
+  res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream", "Cache-Control": "no-store" })
   res.end(readFileSync(file))
 }
 

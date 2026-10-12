@@ -129,6 +129,35 @@ export function tailSummary(s: string, n = 3): string {
   return lines.slice(-n).join("\\n")
 }
 
+/** 载荷类型判定用的控制键（含该字节 → 显示名）；仅用于**摘要**，绝不输出载荷内容 */
+const PAYLOAD_KEYS: { byte: string; label: string }[] = [
+  { byte: "\x03", label: "^C" },
+  { byte: "\x04", label: "^D" },
+  { byte: "\x1a", label: "^Z" },
+  { byte: "\x1b", label: "ESC" },
+]
+
+/**
+ * 生成发送载荷的**长度与类型**摘要（供 send / run-exec 类日志使用）：
+ * 用户会把密码、密钥等敏感内容粘进命令框或按键，日志**绝不打印载荷内容**，只记字节数与类型，
+ * 形如 `3 字节（含 ^C）` / `12 字节（文本）`；含多个控制键时以 `+` 连接（如 `含 ^C + 文本`），
+ * 既无控制键也无可打印字符（如仅回车）时记为"控制字符"。
+ * @param payload 即将发送的字符串（原始文本或已转义的 PTY 载荷）
+ * @returns 载荷摘要（`<字节数> 字节（<类型>）`）
+ */
+export function describeSend(payload: string): string {
+  const bytes = Buffer.byteLength(payload, "utf8")
+  const kinds = PAYLOAD_KEYS.filter((k) => payload.includes(k.byte)).map((k) => k.label)
+  const hasText = [...payload].some((ch) => {
+    const c = ch.codePointAt(0) ?? 0
+    return c >= 0x20 && c !== 0x7f
+  })
+  const segs = [...kinds]
+  if (hasText) segs.push("文本")
+  const type = kinds.length ? `含 ${segs.join(" + ")}` : hasText ? "文本" : "控制字符"
+  return `${bytes} 字节（${type}）`
+}
+
 /**
  * 单行日志化归一：CR 覆盖只保留最后一次回车之后的可见内容（行尾孤立 CR 无覆盖内容时回退为去 CR），再去行尾空白。
  * @param line 原始单行（已剥 ANSI，可能含行内 CR）

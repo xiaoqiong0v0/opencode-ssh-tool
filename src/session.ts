@@ -3,7 +3,14 @@
 
 import { Client, type ConnectConfig } from "ssh2"
 import log, { isDebugEnabled, ssh2Trace } from "./log.js"
-import { INJECT_TIMEOUT_MS, PTY_COLS, PTY_ROWS, READY_TIMEOUT_MS } from "./constants.js"
+import {
+  INJECT_TIMEOUT_MS,
+  PTY_COLS,
+  PTY_ROWS,
+  READY_TIMEOUT_MS,
+  SSH_KEEPALIVE_COUNT_MAX,
+  SSH_KEEPALIVE_INTERVAL_MS,
+} from "./constants.js"
 import { tr } from "./i18n.js"
 import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import type { ExecResult } from "./base-session.js"
@@ -66,6 +73,11 @@ export class SshSession extends BaseSession {
       port,
       username: opts.user,
       readyTimeout: READY_TIMEOUT_MS,
+      // 协议级保活（连接层带外，`keepalive@openssh.com` 全局请求，不写入 channel/PTY）：
+      // 空闲时定期发 keepalive，避免被路径上的 NAT/防火墙/远端 sshd 的空闲超时掐断长驻连接；
+      // 连续 SSH_KEEPALIVE_COUNT_MAX 次无响应则由 ssh2 判定连接死亡（error.level="client-timeout"）。
+      keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+      keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
       // ssh2 协议 trace 属 debug 级；仅在真正会输出时才注册回调，避免关闭时 ssh2 每次仍做无谓的消息拼装。
       // ssh2Trace 内部再丢弃随输出量增长的 CHANNEL_DATA 等行，只记有界的握手/认证事件。
       ...(isDebugEnabled() ? { debug: (msg: string) => ssh2Trace(this._logTag, msg) } : {}),
@@ -89,7 +101,13 @@ export class SshSession extends BaseSession {
           fail(err.message)
           return
         }
-        log.error(`SSH 会话错误 ${opts.host} (session ${this.sessionID}, term ${this.name})`, err)
+        // 保活判死（ssh2 在连续 keepalive 无响应后置 level="client-timeout"）与普通断线的日志可区分
+        const level = (err as Error & { level?: string }).level
+        if (level === "client-timeout") {
+          log.error(`SSH 保活超时，连接判定死亡 ${opts.host} (session ${this.sessionID}, term ${this.name})`, err)
+        } else {
+          log.error(`SSH 会话错误 ${opts.host} (session ${this.sessionID}, term ${this.name})`, err)
+        }
         this._connected = false
         this._setBusy(false, "SSH 会话错误")
         this._clearRunningContext()
