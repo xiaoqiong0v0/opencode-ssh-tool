@@ -14,6 +14,7 @@ opencode **npm 插件**（本项目提交 GitHub）：长驻交互式 SSH 会话
 | [design/多语言配置说明.md](design/多语言配置说明.md) | toolLang / webLang 分离与边界（web 只管页面 UI），agent/session 文案 i18n |
 | [design/多行命令包组与raw渲染修复说明.md](design/多行命令包组与raw渲染修复说明.md) | 多行命令统一 shell 组包组（删除多行拆分）、离线 raw 阶梯修复、ConPTY 行分隔符 `\r`（与匹配形式解耦）、续行/完整性检测修正、服务锁陈旧自愈；transcript 与模型文本改用 `@xterm/headless`（§11）、shell 语法/解析错误作为完成信号（§12）；取代 G10 拆分做法 |
 | [design/中断探针修复说明.md](design/中断探针修复说明.md) | Ctrl-C 中断收尾：写完 `\x03` **立即**补发中断探针（当前 seq 裸标记），之后按 `interruptProbeInterval`（秒，默认 5）周期补发；完成判定只认标记（`^C` 回显不再作完成依据）、seq 限定与迟到探针回显剔除；定时器不判完成 |
+| [design/直接输入与保活心跳说明.md](design/直接输入与保活心跳说明.md) | Web「直接输入」焦点驱动（默认命令框优先、keystroke 通道、不持久化、离线不可点）；SSH 协议级保活（`keepalive@openssh.com`，带外不写 PTY）与 WS 应用层心跳（ping/pong、半开自愈）；`SERVER_PROTO_VERSION` 注入内容改动须递增 |
 
 ## 变更说明
 
