@@ -8,7 +8,7 @@ import { join, dirname, extname, normalize } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { AddressInfo } from "node:net"
 import { WebSocketServer, WebSocket } from "ws"
-import { listAllSessions, removeSessionState } from "./session-store.js"
+import { listAllSessions, removeSessionState, sweepStaleOrphanStateFiles, type SessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
 import {
   PTY_COLS,
@@ -20,6 +20,7 @@ import {
   STATUS_PUSH_FALLBACK_MS,
   ORPHAN_STATE_GRACE_MS,
   ORPHAN_STATE_MIN_AGE_MS,
+  STALE_ORPHAN_MS,
 } from "./constants.js"
 import log, { infoDedup } from "./log.js"
 
@@ -108,6 +109,8 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   inputOff: "web_input_off",
   inputDisconnected: "web_input_disconnected",
   inputOffline: "web_input_offline",
+  deleteBlocked: "web_delete_blocked",
+  deleteFailed: "web_delete_failed",
 }
 
 const sessionKey = (sid: string, name: string): string => `${sid}:${name}`
@@ -250,33 +253,29 @@ export function startServer(
   }
 
   /**
-   * 清理"无任何已连 agent 认领"的**磁盘状态文件**：
+   * 清理"无任何已连 agent 认领"的**磁盘状态文件**（一次清完全部陈旧孤儿，收敛性由周期性调用保证）：
    * 正常关闭会调 removeSessionState 删文件，残留即属主进程异常退出（或进程退出兜底未清理）留下的孤儿；
-   * 其 connected=true/busy=true 不会自愈——旧实现只在 2s 轮询里读，故会长期误报"在线/忙"，
+   * 其 connected=true/busy=true 不会自愈——旧实现只在 register 时读，故会长期误报"在线/忙"，
    * 还会让 server-entry 的"无连接空闲自动关闭"永不触发。只删状态文件，**不动 history 目录**（离线历史仍可查看）。
    * 保守优先：
    * - **仅固定端口（port>0）服务执行**：port=0 时每实例各起一个服务（默认 config），本服务的"未认领"无法
-   *   区分孤儿与别的实例正在使用的活会话；且状态文件 updatedAt 不随空闲刷新，"陈旧"判据同样区分不了
-   *   → 直接跳过，宁可不清理也不删活数据（内存运行态回收在 cleanupOrphanRuntime 内照常执行，不受影响）；
-   * - 无 agent 代表（agents.size===0）时跳过——没有可信的"当前认领"视图，不判断；
+   *   区分孤儿与别的实例正在使用的活会话 → 直接跳过，宁可不清理也不删活数据；
    * - 服务启动不足 ORPHAN_STATE_GRACE_MS 时跳过——给存量 agent 重连、注册的窗口，防误删活进程文件；
    * - 仅清理 updatedAt 早于 ORPHAN_STATE_MIN_AGE_MS 的文件——避免误删刚写入、agent 尚未注册的文件。
+   * 说明：旧实现仅在 agent register 时触发且要求 agents.size>0，若孤儿在当轮尚未陈旧、或此后再无 agent 注册，
+   * 就会永远留下尾巴；现改为由 statusFallbackTimer 周期调用（每次清完全部匹配项并回报剩余数），可持续收敛。
    * @param claimed 所有已连 agent 认领的会话键并集
    */
   const sweepOrphanStateFiles = (claimed: Set<string>): void => {
     if (!isFixedPortServer) return
-    if (agents.size === 0) return
     if (Date.now() - serverStartedAt < ORPHAN_STATE_GRACE_MS) return
-    const now = Date.now()
-    const stale = listAllSessions(dir).filter((s) => {
-      if (claimed.has(sessionKey(s.sessionID, s.name))) return false
-      return now - (s.updatedAt ?? 0) > ORPHAN_STATE_MIN_AGE_MS
-    })
-    if (!stale.length) return
-    for (const s of stale) removeSessionState(dir, s.sessionID, s.name)
+    const { removed, remaining } = sweepStaleOrphanStateFiles(dir, claimed, Date.now(), ORPHAN_STATE_MIN_AGE_MS)
+    if (!removed.length && !remaining.length) return
     infoDedup(
-      `orphan-state:${stale.map((s) => sessionKey(s.sessionID, s.name)).sort().join(",")}`,
-      `清理无 agent 认领的孤儿状态文件 ${stale.length} 个: ${stale.map((s) => keyTag(sessionKey(s.sessionID, s.name))).join(", ")}`,
+      `orphan-state:${removed.length}:${remaining.length}:${removed.map((s) => sessionKey(s.sessionID, s.name)).sort().join(",")}`,
+      `清理无 agent 认领的孤儿状态文件 ${removed.length} 个，剩余未陈旧 ${remaining.length} 个` +
+        (removed.length ? `（已清: ${removed.map((s) => keyTag(sessionKey(s.sessionID, s.name))).join(", ")}）` : "") +
+        (remaining.length ? `（保留: ${remaining.map((s) => keyTag(sessionKey(s.sessionID, s.name))).join(", ")}）` : ""),
     )
   }
 
@@ -375,10 +374,11 @@ export function startServer(
       else logBusy(lk, !!s.busy, "状态文件回退(无 agent 状态)")
       seen.add(lk)
     }
-    const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number }[] }>()
+    const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number; canDelete: boolean; deleteReason?: string }[] }>()
     for (const s of states) {
       if (!bySession.has(s.sessionID)) bySession.set(s.sessionID, { title: s.title, directory: s.directory, terminals: [] })
-      bySession.get(s.sessionID)!.terminals.push({ name: s.name, kind: s.kind, host: s.host, user: s.user, port: s.port, program: s.program, connected: s.connected, busy: s.busy, pending: s.pending })
+      const elig = deleteEligibility(s.sessionID, s.name, s)
+      bySession.get(s.sessionID)!.terminals.push({ name: s.name, kind: s.kind, host: s.host, user: s.user, port: s.port, program: s.program, connected: s.connected, busy: s.busy, pending: s.pending, canDelete: elig.canDelete, deleteReason: elig.reasonKey ? tr(elig.reasonKey, lang) : undefined })
     }
     // 补：history 目录里存在但 state 缺失的历史终端（离线展示）
     for (const h of histTerms) {
@@ -386,7 +386,8 @@ export function startServer(
       if (seen.has(k)) continue
       seen.add(k)
       if (!bySession.has(h.sessionID)) bySession.set(h.sessionID, { terminals: [] })
-      bySession.get(h.sessionID)!.terminals.push({ name: h.name, kind: h.kind, connected: false, busy: false, pending: 0 })
+      const elig = deleteEligibility(h.sessionID, h.name)
+      bySession.get(h.sessionID)!.terminals.push({ name: h.name, kind: h.kind, connected: false, busy: false, pending: 0, canDelete: elig.canDelete, deleteReason: elig.reasonKey ? tr(elig.reasonKey, lang) : undefined })
     }
     const sessions = [...bySession.entries()].map(([sessionID, v]) => ({ sessionID, title: v.title, directory: v.directory, terminals: v.terminals }))
     return { port: actualPort, sessions }
@@ -408,6 +409,46 @@ export function startServer(
     // 两者都不存在 → 沿用 state 判定（在线 local 会话刚建历史未落盘时）
     const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
     return state?.kind === "local" ? `local-${name}` : name
+  }
+
+  /**
+   * 取某终端 history 目录的 mtime（毫秒；不存在返回 0）。
+   * 状态文件可能已被清理、仅剩历史目录，此时用目录写入时间作为"最近活动"的兜底判据。
+   * @param sid 主会话 ID
+   * @param name 终端名
+   * @returns 目录 mtime；不存在为 0
+   */
+  const historyDirMtimeMs = (sid: string, name: string): number => {
+    let latest = 0
+    for (const sub of [name, `local-${name}`]) {
+      try { latest = Math.max(latest, statSync(join(dir, sid, sub)).mtimeMs) } catch { /* 目录不存在 */ }
+    }
+    return latest
+  }
+
+  /**
+   * Web 删除前的"可删"判据（删除入口与终端列表按钮状态共用）：
+   * - 本实例的 agent 认领该终端（agentBySession 有此 key）→ 可删（保持既有行为）；
+   * - 否则需三者同时成立才可删：① 离线（本服务无该终端的 agent 连接）② 无任何已连 agent 认领
+   *   ③ 已陈旧（最近活动早于 STALE_ORPHAN_MS）。①②在本服务视图下由"非本实例认领"自动成立，
+   *   真正的门槛是③——它把"他实例正在使用的活终端"（活动频繁、状态文件新）与"真孤儿"区分开；
+   * - "最近活动"取状态文件 updatedAt 与 history 目录 mtime 的较大者，覆盖仅剩历史目录的离线终端。
+   * @param sid 主会话 ID
+   * @param name 终端名
+   * @param state 该终端的状态文件（来自 listAllSessions；缺失时仅用 history 目录判陈旧）
+   * @returns canDelete=是否可删；reasonKey=不可删时的 i18n 文案键
+   */
+  const deleteEligibility = (sid: string, name: string, state?: SessionState): { canDelete: boolean; reasonKey?: FlatKey } => {
+    const k = sessionKey(sid, name)
+    if (agentBySession.has(k)) return { canDelete: true }
+    // ① 离线：本服务无该终端的 agent 连接；② 无认领：不属于任一已连 agent 的认领集合。
+    // 本模块不变量下二者等价（agentBySession 与 agents 的认领集合同步维护），显式判断以表达判据、防未来解耦。
+    const offline = !agentBySession.has(k)
+    const unclaimed = !claimedByAnyAgent().has(k)
+    if (!offline || !unclaimed) return { canDelete: false, reasonKey: "web_delete_refused_active" }
+    const lastActive = Math.max(state?.updatedAt ?? 0, historyDirMtimeMs(sid, name))
+    if (Date.now() - lastActive <= STALE_ORPHAN_MS) return { canDelete: false, reasonKey: "web_delete_refused_recent" }
+    return { canDelete: true }
   }
 
   const buildSnapshot = (sid: string, name: string): { pairs: TranscriptPair[]; notFound?: boolean } => {
@@ -514,7 +555,12 @@ export function startServer(
 
   // 兜底：事件驱动已覆盖服务端内存态的全部变化；此低频周期只兜底**带外变化**（其他进程写入状态文件
   // 导致的新终端 / pending / 标题变化等，服务端无对应事件），保证这类变化最长 STATUS_PUSH_FALLBACK_MS 内可达前端。
-  const statusFallbackTimer = setInterval(() => { pushSessions() }, STATUS_PUSH_FALLBACK_MS)
+  // 同时周期重跑孤儿状态文件清理：单轮只清"当下已陈旧"的项，未陈旧者留待下一轮，从而**持续收敛**、
+  // 不再依赖 agent register 触发（旧实现只在注册时清，之后再无注册就会永远留下尾巴）。
+  const statusFallbackTimer = setInterval(() => {
+    sweepOrphanStateFiles(claimedByAnyAgent())
+    pushSessions()
+  }, STATUS_PUSH_FALLBACK_MS)
 
   /**
    * 应用层心跳（server 侧）：每隔 HEARTBEAT_INTERVAL_MS 向每条连接下发 {type:"ping"}，
@@ -809,15 +855,19 @@ export function startServer(
         if (!sid || !name) return
         const k = sessionKey(sid, name)
         const agent = agentBySession.get(k)
-        // 归属校验：仅当本服务**已被该 key 的 agent 认领**（agentBySession 内有此 key，即 agents 集合含它）
-        // 时才允许删盘上状态文件与 history 目录。port:0 多实例下每实例各起一个服务，未认领的 key 极可能
-        // 属于**别的 opencode 实例正在使用的活会话**，无条件删会 rmSync 掉别人的历史目录
-        // （本模块唯一真·数据丢失路径）→ 未认领一律拒绝删除并留一行日志便于排查。
-        if (!agent) {
-          log.info(`Web 页删除终端 ${sid}/${name} 被拒：本服务未认领该终端（无 agent 归属），跳过删除以免误删他实例数据`)
+        // "可删"判据（见 deleteEligibility）：本实例 agent 认领 → 可删；否则须"离线 + 无认领 + 陈旧"。
+        // 放宽后仍绝不误删他实例正在用的活终端（其状态文件新近被写、判为未陈旧而拒绝），
+        // 同时让 agent 已断开留下的离线孤儿（及仅剩 history 的历史终端）能被网页手动清掉。
+        const state = listAllSessions(dir).find((s) => s.sessionID === sid && s.name === name)
+        const elig = deleteEligibility(sid, name, state)
+        if (!elig.canDelete) {
+          const reason = tr(elig.reasonKey ?? "web_delete_blocked", lang)
+          log.info(`Web 页删除终端 ${sid}/${name} 被拒：${reason}`)
+          // 结构化、可读的拒绝原因回给发起连接（前端据此给可见反馈，不静默）
+          send(ws, { type: "deleteResult", sessionID: sid, name, ok: false, reason })
           return
         }
-        send(agent, { type: "run-delete", sessionID: sid, name })
+        if (agent) send(agent, { type: "run-delete", sessionID: sid, name })
         removeSessionState(dir, sid, name)
         // 删除该终端的 history 目录：buildSessions 会按 history 目录兜底列出离线历史终端，
         // 只删 state 文件不清目录会导致"删除后页面仍在"（残留被兜底扫描重新发现）
@@ -825,10 +875,11 @@ export function startServer(
           const histName = resolveHistName(sid, name)
           rmSync(join(dir, sid, histName), { recursive: true, force: true })
         } catch { /* 目录不存在忽略 */ }
-        streamBuf.delete(sessionKey(sid, name))
-        rawBuf.delete(sessionKey(sid, name))
-        busyState.delete(sessionKey(sid, name))
+        streamBuf.delete(k)
+        rawBuf.delete(k)
+        busyState.delete(k)
         log.info(`Web 页删除终端 ${sid}/${name}`)
+        send(ws, { type: "deleteResult", sessionID: sid, name, ok: true })
         requestStatusPush()
         return
       }

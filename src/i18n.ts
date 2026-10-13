@@ -267,6 +267,19 @@ Examples:
   web_no_session: { en: "No terminal. Use term_cli connect (SSH) or term_cli local first.", zh: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。" },
   web_new_messages: { en: "↓ New messages", zh: "↓ 新消息" },
   web_delete_terminal: { en: "Delete disconnected terminal", zh: "删除已断开终端" },
+  web_delete_refused_recent: {
+    en: "Not deleted: terminal still active (state file not stale yet); it may belong to another running opencode instance.",
+    zh: "未删除：该终端仍在活动（状态文件尚未陈旧），可能属于其他正在运行的 opencode 实例。",
+  },
+  web_delete_refused_active: {
+    en: "Not deleted: terminal is claimed by an agent (its instance is still online).",
+    zh: "未删除：该终端仍被 agent 认领（所属实例仍在线）。",
+  },
+  web_delete_blocked: {
+    en: "Cannot delete this terminal (still active or owned by another instance).",
+    zh: "无法删除该终端（仍在活动或属于其他实例）。",
+  },
+  web_delete_failed: { en: "Delete failed.", zh: "删除失败。" },
 web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
   web_direct_input: { en: "Direct input (type here for interactive prompts)", zh: "直接输入（交互输入请直接在此输入）" },
   web_input_on: { en: "Direct input: ON — keys go to terminal", zh: "直接输入：已启用（按键发往终端）" },

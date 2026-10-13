@@ -23,6 +23,10 @@ interface I18n {
   inputDisconnected: string
   /** 当前终端未连接 */
   inputOffline: string
+  /** 不可删除的兜底提示（后端未给原因时使用） */
+  deleteBlocked: string
+  /** 删除操作失败的兜底提示 */
+  deleteFailed: string
 }
 
 interface TerminalInfo {
@@ -34,6 +38,10 @@ interface TerminalInfo {
   program?: string
   connected: boolean
   busy: boolean
+  /** 该终端当前是否允许删除（后端 deleteEligibility 判定） */
+  canDelete?: boolean
+  /** 不可删除时的可读原因（后端本地化文案） */
+  deleteReason?: string
 }
 
 interface SessionStatus {
@@ -80,6 +88,8 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     inputOff: "Direct input: OFF — keys stay in browser",
     inputDisconnected: "Disconnected — input will not be sent",
     inputOffline: "Terminal offline — input will not be sent",
+    deleteBlocked: "Cannot delete this terminal (still active or owned by another instance).",
+    deleteFailed: "Delete failed.",
   },
   zh: {
     commands: "条命令",
@@ -93,6 +103,8 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     inputOff: "直接输入：已关闭（按键留在浏览器）",
     inputDisconnected: "连接已断开，输入不会被送达",
     inputOffline: "终端未连接，输入不会被送达",
+    deleteBlocked: "无法删除该终端（仍在活动或属于其他实例）。",
+    deleteFailed: "删除失败。",
   },
 }
 
@@ -326,6 +338,8 @@ let curBlock: HTMLDivElement | null = null
 let debugMode = false
 /** 用户配置的 raw 意图（历史会话可用 history 重建 raw 流，无需依赖实时连接） */
 let prefRaw = localStorage.getItem("debugMode") === "1"
+/** 删除按钮初始标题（server 渲染的默认提示；禁用时临时替换为不可删原因） */
+let delTitleDefault = ""
 
 /** 实际生效的 raw 模式：统一按用户意图（离线历史会话由 server 从 history 重建 raw 流） */
 function effRaw(): boolean {
@@ -374,6 +388,7 @@ function connectWs(): void {
       case "meta": handleMeta(msg as unknown as { sessionID: string; name: string; commands: number }); break
       case "diff": handleDiff(msg as unknown as { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number }); break
       case "raw": handleRaw(msg as unknown as { data: string; reset?: boolean }); break
+      case "deleteResult": handleDeleteResult(msg as unknown as { sessionID: string; name: string; ok: boolean; reason?: string }); break
     }
   }
   ws.onclose = () => {
@@ -533,9 +548,13 @@ function updateTerminalSelect(prevName?: string, forceSub = false): void {
   }
   if (prevName && [...tsel.options].some((o) => o.value === prevName)) tsel.value = prevName
   else tsel.selectedIndex = tsel.options.length ? 0 : -1
-  // 删除按钮：当前终端存在且已断开时显示
+  // 删除按钮：当前终端已断开时显示；能否点击由后端"可删"判据决定（不可删则禁用并给出原因提示）
   const cur = s?.terminals.find((t) => (t.name || "default") === tsel.value)
-  delBtn.classList.toggle("show", !!(cur && !cur.connected))
+  const showDel = !!(cur && !cur.connected)
+  delBtn.classList.toggle("show", showDel)
+  const canDelete = !!(cur && cur.canDelete)
+  delBtn.disabled = !canDelete
+  delBtn.title = showDel && !canDelete ? (cur?.deleteReason || I18N.deleteBlocked) : delTitleDefault
   updateCmdBar()
   updateMetaFromSessions()
   // 重订阅时机：用户主动切换（change 事件）强制重订阅；sessions 状态推送才用值比较去重，
@@ -971,20 +990,64 @@ function deleteTerminal(): void {
   const s = sessionsData.find((x) => x.sessionID === sid)
   const t = s?.terminals.find((t2) => (t2.name || "default") === name)
   if (!t || t.connected) return
+  // 后端判为不可删（仍活动/属他实例）：按钮通常已禁用，此处兜底给出可见原因，不发请求
+  if (!t.canDelete) {
+    showNotice(t.deleteReason || I18N.deleteBlocked)
+    return
+  }
+  // 删除结果由后端 deleteResult 回执驱动（成功才本地移除；被拒则显示原因），不做乐观删除
   ws.send(JSON.stringify({ type: "deleteTerminal", sessionID: sid, name }))
-  // 立即从本地状态移除，等下次 sessions 推送会同步
+}
+
+/**
+ * 处理后端删除回执：成功则本地移除该终端（即时反馈，随后 server 状态推送会再次对齐）；
+ * 失败则显示后端返回的可读原因（绝不静默无反应）。
+ * @param msg deleteResult 消息
+ */
+function handleDeleteResult(msg: { sessionID: string; name: string; ok: boolean; reason?: string }): void {
+  if (msg.ok) {
+    removeTerminalLocally(msg.sessionID, msg.name)
+    return
+  }
+  showNotice(msg.reason || I18N.deleteFailed)
+}
+
+/**
+ * 从本地 sessionsData 移除指定终端并刷新下拉/删除按钮；删光则清空界面。
+ * @param sid 主会话 ID
+ * @param name 终端名
+ */
+function removeTerminalLocally(sid: string, name: string): void {
+  const s = sessionsData.find((x) => x.sessionID === sid)
   if (s) {
     s.terminals = s.terminals.filter((t2) => (t2.name || "default") !== name)
     if (s.terminals.length === 0) sessionsData = sessionsData.filter((x) => x.sessionID !== sid)
   }
-  // 删光的最后一个会话：立即清空界面（server pushSessions 会再次触发 clearAllTerminals，幂等）
   if (sessionsData.length === 0) {
     clearAllTerminals()
     return
   }
-  // 切到第一个终端
   const prev = (document.getElementById("terminal") as HTMLSelectElement).value
   updateTerminalSelect(prev !== name ? prev : undefined)
+}
+
+/** 页面级提示自动消失定时器（null 表示当前无提示） */
+let noticeTimer: number | null = null
+
+/**
+ * 显示一条页面级提示并自动消失（删除被拒等需要可见反馈的场景）。
+ * @param text 提示文案
+ */
+function showNotice(text: string): void {
+  const el = document.getElementById("notice")
+  if (!el) return
+  el.textContent = text
+  el.classList.add("show")
+  if (noticeTimer !== null) window.clearTimeout(noticeTimer)
+  noticeTimer = window.setTimeout(() => {
+    el.classList.remove("show")
+    noticeTimer = null
+  }, 5000)
 }
 
 function scrollToNewest(): void {
@@ -1008,6 +1071,7 @@ else hideRawUi()
 
 const termPre = document.getElementById("term") as HTMLPreElement
 const toBottomBtn = document.getElementById("toBottom") as HTMLButtonElement
+delTitleDefault = (document.getElementById("delTerm") as HTMLButtonElement | null)?.getAttribute("title") || ""
 termPre.addEventListener("scroll", () => {
   if (termPre.scrollTop + termPre.clientHeight >= termPre.scrollHeight - 30) {
     stickToBottom = true

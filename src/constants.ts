@@ -117,6 +117,14 @@ export const ORPHAN_STATE_GRACE_MS = 60_000
  */
 export const ORPHAN_STATE_MIN_AGE_MS = 10_000
 
+/**
+ * 陈旧孤儿终端阈值（毫秒）：Web 页删除某终端时，若本实例 agent **未**认领它，
+ * 则需其"最近活动"（状态文件 updatedAt 与 history 目录 mtime 取较大者）早于此值才允许删除。
+ * 用途：把"他实例正在使用的活终端"（活动频繁、状态文件新）与"真正无人认领的孤儿"区分开，
+ * 在放宽删除校验（让离线孤儿可被手动删除）的同时，绝不误删别的实例正在用的活终端。
+ */
+export const STALE_ORPHAN_MS = 10 * 60 * 1000
+
 /** 注入总超时（含重试）：超过此时长仍无首个标记则断连报错 */
 export const INJECT_TIMEOUT_MS = 30_000
 

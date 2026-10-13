@@ -37,6 +37,10 @@ body:not(.show-time) .row .t { display: none; }
 .del-btn { background: none; border: 1px solid #30363d; color: #f85149; border-radius: 4px; cursor: pointer; padding: 2px 8px; font-size: 14px; line-height: 1; display: none; }
 .del-btn:hover { background: #f85149; color: #fff; }
 .del-btn.show { display: inline-block; }
+.del-btn:disabled { opacity: 0.4; cursor: not-allowed; border-color: #30363d; color: #8b949e; }
+.del-btn:disabled:hover { background: none; color: #8b949e; }
+.notice { display: none; flex: 0 0 auto; padding: 6px 16px; background: #3d2f1f; color: #e3b341; border-top: 1px solid #30363d; font-size: 13px; }
+.notice.show { display: block; }
 #cmdbar { flex: 0 0 auto; display: flex; gap: 6px; padding: 8px 16px; border-top: 1px solid #30363d; }
 #cmdInput { flex: 1; box-sizing: border-box; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-family: "CaskaydiaCove Nerd Font Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Noto Sans Mono", "Hack", Consolas, "Courier New", monospace; font-size: 13px; outline: none; resize: none; max-height: 120px; overflow-y: auto; }
 #cmdInput:focus { border-color: #58a6ff; }

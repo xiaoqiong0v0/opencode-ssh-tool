@@ -43,14 +43,21 @@ const lastStateLog = new Map<string, string>()
 /** 原子写临时文件序号：同进程同一毫秒内多次写也能得到唯一临时名 */
 let tmpSeq = 0
 
+/** rename 总尝试次数（含首次）：仅对 EPERM/EBUSY 重试，耗尽后按失败路径处理 */
+const RENAME_MAX_ATTEMPTS = 3
+/** rename 每次重试前的等待毫秒数：给 Windows 上目标的瞬时句柄占用留出释放时间 */
+const RENAME_RETRY_DELAY_MS = 40
+
 /**
  * 原子写 JSON 文件：先在**同目录**写唯一命名的临时文件，fsync 落盘后再 `rename` 覆盖目标。
  * 这样读方（server 聚合读状态文件、各实例读 server.json）**永远读不到半截内容**——
  * 要么读到旧的完整内容，要么读到新的完整内容，消除"先 truncate 再写"造成的瞬时损坏
  * （读方 try/catch 只能跳过损坏文件，表现为瞬时漏一条）。
  * 失败时**不抛异常**（调用方不崩）：清理临时文件、**保留旧文件**、记一行 warn 日志并返回 false。
- * 取舍：Windows 下若目标正被其他进程以打开句柄持有，`rename` 可能瞬时 EPERM 而失败——
- * 此时保留旧文件即安全（下次写会重试），故**不做**"先删除目标再 rename"的退化写法
+ * Windows 下若目标正被其他进程以句柄持有（或多进程读聚合场景下的瞬时占用），`rename` 覆盖目标
+ * 可能抛 **EPERM/EBUSY**——对此类错误**有限重试**（见 RENAME_MAX_ATTEMPTS / RENAME_RETRY_DELAY_MS），
+ * 瞬时占用多数在重试窗口内释放；其它错误码（ENOENT/EXDEV 等重试无意义）不重试直接走失败路径。
+ * 重试耗尽仍失败时保留旧文件即安全（下次写会再试），故**不做**"先删除目标再 rename"的退化写法
  * （那会引入文件短暂不存在的窗口，反而更差）；目录 fsync 在 Windows 不可用，忽略即可。
  * @param file 目标文件路径（其父目录须已存在，由调用方保证）
  * @param data 待写入对象（JSON.stringify 默认形态，与原直写行为一致）
@@ -73,7 +80,18 @@ export function atomicWriteJson(file: string, data: unknown): boolean {
     } catch {
       /* 目录 fsync 在部分平台不可用（如 Windows），忽略 */
     }
-    renameSync(tmp, file)
+    // rename 有限重试：EPERM/EBUSY（Windows 目标被句柄瞬时占用）等待后重试，其它错误码直接抛出
+    for (let attempt = 1; ; attempt++) {
+      try {
+        renameSync(tmp, file)
+        break
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code
+        if (attempt >= RENAME_MAX_ATTEMPTS || (code !== "EPERM" && code !== "EBUSY")) throw e
+        // 本函数为同步调用，用 Atomics.wait 同步挂起当前线程等待（不空转 CPU）
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RENAME_RETRY_DELAY_MS)
+      }
+    }
     return true
   } catch (e) {
     try { rmSync(tmp, { force: true }) } catch { /* 临时文件清理失败忽略 */ }
@@ -156,4 +174,41 @@ export function listAllSessions(cacheRoot: string): SessionState[] {
   // 按连接时间排序（新的在前）
   out.sort((a, b) => (b.connectedAt ?? 0) - (a.connectedAt ?? 0))
   return out
+}
+
+/** 会话键（`sid:name`），与 server 归属判定口径一致 */
+function orphanKey(s: SessionState): string {
+  return `${s.sessionID}:${s.name}`
+}
+
+/** 孤儿状态文件清理结果：本轮删除的项与仍未被认领但未陈旧的剩余项 */
+export interface OrphanSweepResult {
+  /** 本轮删除的状态文件（离线 + 无认领 + 陈旧） */
+  removed: SessionState[]
+  /** 未被认领但尚未陈旧、本轮保留的项（供日志显示"还剩几只"并等待下一轮收敛） */
+  remaining: SessionState[]
+}
+
+/**
+ * 清理"无任何已连 agent 认领且已陈旧"的状态文件——**一次清完全部匹配项**，
+ * 避免每轮只清一只、老文件迟迟清不掉留下尾巴（收敛性由调用方按固定周期重复调用保证）。
+ * 判据：会话键不在 claimed 内（离线且无认领）且 updatedAt 早于 minAgeMs（陈旧）。
+ * 只删状态文件，不动 history 目录（离线历史仍可查看）。
+ * @param cacheRoot 插件缓存根目录
+ * @param claimed 所有已连 agent 认领的会话键集合（`sid:name`）
+ * @param nowMs 当前时刻（毫秒；注入便于测试）
+ * @param minAgeMs 陈旧阈值（毫秒）
+ * @returns 本轮删除的项与未陈旧仍保留的孤儿项
+ */
+export function sweepStaleOrphanStateFiles(
+  cacheRoot: string,
+  claimed: ReadonlySet<string>,
+  nowMs: number,
+  minAgeMs: number,
+): OrphanSweepResult {
+  const orphans = listAllSessions(cacheRoot).filter((s) => !claimed.has(orphanKey(s)))
+  const stale = orphans.filter((s) => nowMs - (s.updatedAt ?? 0) > minAgeMs)
+  for (const s of stale) removeSessionState(cacheRoot, s.sessionID, s.name)
+  const removedKeys = new Set(stale.map(orphanKey))
+  return { removed: stale, remaining: orphans.filter((s) => !removedKeys.has(orphanKey(s))) }
 }
