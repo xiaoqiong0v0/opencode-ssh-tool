@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   // 原子写：其他实例可能在并发读 server.json，避免读到半截 JSON
   atomicWriteJson(join(dir, INFO_FILE), { port: handle.port, host: "127.0.0.1", pid: process.pid, startedAt: Date.now(), proto: SERVER_PROTO_VERSION })
 
-  log.info(`独立服务启动 ${handle.url} (pid ${process.pid}, proto ${SERVER_PROTO_VERSION})，内存流缓冲 streamBuf 初始为空（新进程不复用旧内存，旧进程追踪中的命令状态需 agent 重连后重新上报）`)
+  log.info(`独立服务启动 ${handle.url} (pid ${process.pid}, proto ${SERVER_PROTO_VERSION})`)
 
   // 空闲自动关闭：改为**事件驱动**——不再每 tick 读状态文件（I/O），也不受残留状态文件 connected=true 影响
   // （旧实现因此永不空闲）。空闲判定 = "是否还有 agent 连接"（等价于"是否还有插件进程在用本服务"）：

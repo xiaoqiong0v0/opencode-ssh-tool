@@ -14,10 +14,10 @@ import {
   FALLBACK_WATCH_INTERVAL_MS,
   INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC,
 } from "./constants.js"
-import log, { debug, describeSend, isDebugEnabled, tailLines, tailSummary } from "./log.js"
+import log, { debug, describeSend, infoDedup, isDebugEnabled, tailLines, tailSummary } from "./log.js"
 import { decodeTerminalEscapes } from "./escapes.js"
 import { SessionHistory } from "./history.js"
-import { toModelText, extractOutputStart, stripTrailingPromptLine, ECHO_REGEX_MAX_CMD_CHARS, echoRegexSourceLength } from "./utils.js"
+import { toModelText, extractOutputStart, stripTrailingPromptLine, removeProbeEchoLines, ECHO_REGEX_MAX_CMD_CHARS, echoRegexSourceLength } from "./utils.js"
 import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
@@ -315,7 +315,7 @@ export abstract class BaseSession {
 
     const outcome = await completion
 
-    log.info(`exec ${this._logTag} seq=${this._runningSeq} cmdLen=${command.length} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos+" exitCode="+outcome.exitCode+" duration="+(Date.now()-startTs)+"ms"} (busy=${this._remoteBusy})`)
+    debug(`exec ${this._logTag} seq=${this._runningSeq} cmdLen=${command.length} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos+" exitCode="+outcome.exitCode+" duration="+(Date.now()-startTs)+"ms"} (busy=${this._remoteBusy})`)
     debug(`exec ${this._logTag} seq=${this._runningSeq} cmd=${tailLines(command, 3)}`)
 
     switch (outcome.kind) {
@@ -446,11 +446,15 @@ export abstract class BaseSession {
    * 供事后对齐状态时间线（busy 每次翻转都能对应到具体原因，不再出现"忙了却查不出为何"）。
    * @param next 目标 busy 值
    * @param reason 翻转原因（cmdStart / cmdRunning / cmdDone / 会话关闭 / 断连补 done 等）
+   * @param quiet true 时该行降为 debug：用于"释放"与紧随其后的收尾行（如 [run] 结束）重复的场景，
+   *   避免同一事件打两条 info（busy 时间线仍可由该收尾行还原）
    */
-  protected _setBusy(next: boolean, reason: string): void {
+  protected _setBusy(next: boolean, reason: string, quiet = false): void {
     if (this._remoteBusy === next) return
     this._remoteBusy = next
-    log.info(`[busy] ${this._logTag} seq=${this._runningSeq} busy=${next} reason=${reason}`)
+    const line = `[busy] ${this._logTag} seq=${this._runningSeq} busy=${next} reason=${reason}`
+    if (quiet) debug(line)
+    else log.info(line)
     // 通知插件同步状态文件（busy 已更新，getStatus 读到新值）；监听器异常不打断执行
     try { this._busyListener?.(next, reason) } catch { /* 监听器异常不打断执行 */ }
     // busy 释放：事件驱动地兑现 exec 转后台后的等待者（替代旧的 200ms busy=false 轮询）
@@ -505,9 +509,7 @@ export abstract class BaseSession {
     }
     const raw = this._buffer.slice(this._streamPos, windowEnd)
     this._streamPos = windowEnd
-    let data = stripMarkers(raw)
-    if (this._adapter) data = data.replace(this._markerCmd(this._runningSeq), "")
-    data = this._stripProbeEchoes(data)
+    const data = this._stripProbeEchoes(stripMarkers(raw))
     return { data, done: marker.done }
   }
 
@@ -652,20 +654,20 @@ export abstract class BaseSession {
 
   /**
    * 从可见输出中剔除中断探针留下的痕迹（探针命令的回显）。
-   * 探针在用户中断时补发，其回显可能迟到落到后续命令的输出窗口里；按已记录探针 seq
-   * 生成精确回显文本并删除全部出现，从而无论何时到达都剔除。完成标记本身由 stripMarkers
-   * 按标记模式统一去除（不限 seq）。Raw 视图不经此函数，保留原始字节。
+   * 探针在用户中断时补发，其回显可能迟到落到后续命令的输出窗口里；这里对每个已记录探针 seq
+   * （以及当前命令自身的标记命令回显）做 **ANSI 容忍定位**：即便 pwsh 语法高亮在 token 间插入
+   * SGR、行首带提示符与 `\x1b[?25l`，也能命中并整段剔除（见 removeProbeEchoLines）。
+   * 三处调用点（本函数、_extractOutput 的 out.replace、getRunningStream 的 data.replace）
+   * 统一收敛至此，消除口径漂移。Raw 视图不经此函数，保留原始字节。
    * @param text 可见输出文本
    * @returns 剔除探针回显后的文本
    */
   private _stripProbeEchoes(text: string): string {
-    if (this._probeSeqs.size === 0) return text
-    let out = text
-    for (const seq of this._probeSeqs) {
-      const echo = this._markerCmd(seq)
-      if (out.includes(echo)) out = out.split(echo).join("")
-    }
-    return out
+    const needles: string[] = []
+    for (const seq of this._probeSeqs) needles.push(this._markerCmd(seq))
+    // 当前命令的标记命令回显：原 out.replace(_markerCmd(_runningSeq)) / data.replace(...) 两种口径并入此处
+    needles.push(this._markerCmd(this._runningSeq))
+    return removeProbeEchoLines(text, needles, this._promptRef)
   }
 
   /**
@@ -719,10 +721,9 @@ export abstract class BaseSession {
     const echoLen = echoText.trim().length
     // 超长回显：extractOutputStart 会降级为"首/尾锚点"匹配（否则模式源约 265×长度，JSC 下会抛 too large）
     if (echoLen > ECHO_REGEX_MAX_CMD_CHARS) {
-      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位降级为首/尾锚点: echoLen=${echoLen} regexSrcLen=${echoRegexSourceLength(echoText)} (>阈值 ${ECHO_REGEX_MAX_CMD_CHARS})`)
+      debug(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位降级为首/尾锚点: echoLen=${echoLen} regexSrcLen=${echoRegexSourceLength(echoText)} (>阈值 ${ECHO_REGEX_MAX_CMD_CHARS})`)
     }
     let end: number
-    const extractStart = Date.now()
     try {
       end = marker.done
         ? extractOutputStart(raw, echoText, marker.pos)
@@ -732,15 +733,10 @@ export abstract class BaseSession {
       log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位失败, 退回整窗: echoLen=${echoLen} err=${e instanceof Error ? e.message : String(e)}`)
       end = -1
     }
-    // 诊断：定位结果与耗时（ret<=0 显眼标注"定位失败"）
-    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 定位: inLen=${raw.length} patternLen=${echoRegexSourceLength(echoText)} ret=${end <= 0 ? `<${end}> 定位失败` : end} elapsedMs=${Date.now() - extractStart}`)
     // 诊断：输出窗口坐标 + 是否退回整窗（startPos=回显结束偏移，endPos=窗口末尾；窗口长=endPos-startPos）
     const winStart = end <= 0 ? 0 : end
     const winEnd = marker.done ? marker.pos : raw.length
-    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口: startPos=${winStart} endPos=${winEnd} 窗口长=${winEnd - winStart} markerSeq=${this._runningSeq} 是否退回整窗=${end <= 0 ? `是(定位失败, syntaxMode=${syntaxMode})` : "否"}`)
-    // 诊断：只扫本命令窗口 [winStart, winEnd) 内的完成标记（最多列 5 个，位置为相对窗口起点的偏移）——定位"输出里混进的标记来自哪条命令"
-    const hits = scanDoneMarkers(raw.slice(winStart, winEnd))
-    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口内含标记: ${hits.length === 0 ? "无" : hits.slice(0, 5).map((h) => `@${h.pos}=${h.seq ?? "?"}`).join(" ")}`)
+    debug(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口: startPos=${winStart} endPos=${winEnd} 窗口长=${winEnd - winStart} markerSeq=${this._runningSeq} 是否退回整窗=${end <= 0 ? `是(定位失败, syntaxMode=${syntaxMode})` : "否"}`)
     // 诊断：窗口前 120 字符（仅 SSH_TOOL_DEBUG=1 时落盘）
     debug(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口前120: ${escapeCtl(raw.slice(0, 120))}`)
     if (end <= 0) {
@@ -780,7 +776,6 @@ export abstract class BaseSession {
       const intr = detectInterrupt(raw, end)
       out = intr.interrupted ? raw.slice(end, intr.pos) : raw.slice(end)
     }
-    if (this._adapter) out = out.replace(this._markerCmd(this._runningSeq), "")
     return this._stripProbeEchoes(stripMarkers(out.replace(/^[\r\n]+/, "")))
   }
 
@@ -837,7 +832,7 @@ export abstract class BaseSession {
     // 诊断：本次窗口起点取自"自身找到的 lastMarkerPos"（无标记时为 0，即缓冲起点）；
     // captureStart=裁剪后残留长度（exec 的实际捕获起点，与缓冲内容相关，仅供参考）
     const winStartPos = marker.done ? marker.pos : 0
-    log.info(`[capture] ${this._logTag} seq=${this._cmdSeq + 1} 起点=${winStartPos} captureStart=${this._buffer.length}(参考) entryCursor=${entryCursor} bufLen=${entryBufLen} lastMarkerPos=${marker.done ? marker.pos : -1}`)
+    debug(`[capture] ${this._logTag} seq=${this._cmdSeq + 1} 起点=${winStartPos} captureStart=${this._buffer.length}(参考) entryCursor=${entryCursor} bufLen=${entryBufLen} lastMarkerPos=${marker.done ? marker.pos : -1}`)
     // 记录命令发起前缓冲末行（旧提示符行）：语法错误收尾时 shell 会重印同形提示符，供输出尾部剥离
     this._promptRef = this._buffer.split("\n").pop() ?? ""
     this._runningStartPos = 0
@@ -848,7 +843,7 @@ export abstract class BaseSession {
     this._runningSeq = this._cmdSeq
     this._setBusy(true, "cmdStart")
     this._lastActive = Date.now()
-    log.info(`[run] 开始 ${this._logTag} seq=${this._runningSeq} startPos=0 cmdLen=${command.length}`)
+    debug(`[run] 开始 ${this._logTag} seq=${this._runningSeq} startPos=0 cmdLen=${command.length}`)
     debug(`[run] 开始 ${this._logTag} seq=${this._runningSeq} cmd=${JSON.stringify(command.slice(0, 120))}`)
     this._emitStart(command, this._runningStartTs)
   }
@@ -874,7 +869,7 @@ export abstract class BaseSession {
     if (text.includes(DONE_TAG)) {
       const found = scanDoneMarkers(text).map((h) => h.seq ?? "?").join(",")
       // 非内容信息保持 info（排障主力）；命令/输出片段前缀（prefix）降级为 debug，避免泄漏内容
-      log.info(`[chunk] ${this._logTag} seq=${this._runningSeq} runningStart=${this._runningStartPos} chunkLen=${text.length} found=[${found}]`)
+      debug(`[chunk] ${this._logTag} seq=${this._runningSeq} runningStart=${this._runningStartPos} chunkLen=${text.length} found=[${found}]`)
       debug(`[chunk] ${this._logTag} seq=${this._runningSeq} prefix=${escapeCtl(text.slice(0, 60))}`)
     }
     // 数据已落缓冲：通知数据到达监听器（agent 据此做节流合并推流；异常不打断数据写入）
@@ -895,7 +890,7 @@ export abstract class BaseSession {
    */
   protected _sendBaselineMarker(): void {
     const baseline = this._markerCmd(0) + "\r"
-    log.info(`[baseline] ${this._logTag} 初始化完成，发送基线标记 nonce=${this._nonce} seq=0 cmd=${JSON.stringify(this._markerCmd(0))}`)
+    debug(`[baseline] ${this._logTag} 初始化完成，发送基线标记 nonce=${this._nonce} seq=0`)
     this._write(baseline)
   }
 
@@ -1117,7 +1112,7 @@ export abstract class BaseSession {
       this._checkCompletion(false)
     } catch (e) {
       // tick 内异常：记一行后继续下一轮监听（完成判定仍只认当前 seq 标记）
-      log.info(`[watch] ${this._logTag} seq=${this._runningSeq} tick 异常, 保持监听: err=${e instanceof Error ? e.message : String(e)}`)
+      infoDedup(`tick-exc:${this._logTag}:${this._runningSeq}`, `[watch] ${this._logTag} seq=${this._runningSeq} tick 异常, 保持监听: err=${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -1161,7 +1156,7 @@ export abstract class BaseSession {
     this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
     this._emitDone(exitCode, Date.now(), output)
     this._cursor = Math.max(startPos, endPos)
-    this._setBusy(false, "cmdDone") // 命令完成即清 busy（"保持 busy 到排队序列结束"的机制已移除）
+    this._setBusy(false, "cmdDone", true) // 命令完成即清 busy（"保持 busy 到排队序列结束"的机制已移除）；释放行紧随 [run] 结束，降 debug 免重复
     // 结束日志：非内容信息（长度/耗时/退出码/原因）保持 info；有界输出尾部摘要降级为 debug，避免泄漏输出内容
     log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${endPos} exitCode=${exitCode} outLen=${output.length} duration=${Date.now()-this._runningStartTs}ms reason=${reason}`)
     if (isDebugEnabled()) {

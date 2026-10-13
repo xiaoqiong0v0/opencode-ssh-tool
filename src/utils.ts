@@ -255,6 +255,100 @@ export function stripTrailingPromptLine(out: string, window: string, promptRef: 
 }
 
 /**
+ * 探针回显"单个匹配区间的跨度上限"（字符，含字符间插入的 ANSI 与空白）。
+ * 探针命令本身约 50 可见字符、pwsh 语法高亮插入的 SGR 约 20 → 正常跨度约 70；取 200 留足余量。
+ * 超限视作宽松匹配的误命中（如稀疏空白把命令字符拉开），不删——宁可留脏，不可误删。
+ */
+export const PROBE_ECHO_MAX_SPAN = 200
+
+/**
+ * ANSI 容忍定位 needle 在 text 中的**首次**出现：允许 needle 字符之间插入 ANSI 转义序列与任意空白
+ * （复用"去 ANSI + 压空白"的线性匹配，免疫 shell 语法高亮在 token 间插入的 SGR）。
+ * 绝不用提示符做锚点（提示符随 cwd/profile/主题变化，不可锚定）。
+ * @param text 待搜索文本（调用方按行传入）
+ * @param needle 待定位文本（探针命令，含会话 nonce，天然唯一）
+ * @returns 命中：{start,end}（相对 text 原文偏移，end 为末个可见字符后一位）；未命中：null
+ */
+export function findAnsiTolerantFirstRange(text: string, needle: string): { start: number; end: number } | null {
+  const target = compressForEcho(needle.replace(/\\033/gi, "\x1b")).text
+  if (!target) return null
+  const { text: body, idx } = compressForEcho(text)
+  const i = body.indexOf(target)
+  if (i < 0) return null
+  return { start: idx[i], end: idx[i + target.length - 1] + 1 }
+}
+
+/**
+ * 判定一行是否"仅剩提示符"（D1 判据）：剥净 ANSI、去行尾 \r 与尾空白后，与提示符基准逐字相等。
+ * 只认"整行恰为提示符"，不放宽；基准为空串时恒 false（宁可留脏，不可误删）。
+ * @param line 待判定行（原始，可含 ANSI）
+ * @param promptRef 提示符基准（命令发起前缓冲末行，与 stripTrailingPromptLine 同源判据）
+ * @returns true 表示该行可见内容恰为提示符
+ */
+export function isPromptOnlyLine(line: string, promptRef: string): boolean {
+  const ref = normLine(promptRef)
+  return ref !== "" && normLine(line) === ref
+}
+
+/**
+ * 行尾锚定的 ANSI 序列匹配：用于把删除起点**向前回退到紧邻的 ANSI 之前**。
+ * 只回退 ANSI 字节（不越过任何可见字符/提示符/真输出），使探针首 token 前的语法高亮色码
+ * 随回显一起删除，避免行中打断场景残留孤立色码污染后续输出。
+ */
+const ANSI_AT_END = new RegExp(`(?:${ANSI_SEQ_PATTERN})$`)
+
+/**
+ * 把位置 pos 向前回退，跳过紧邻其前的连续 ANSI 序列（不含可见字符）。
+ * @param line 行文本
+ * @param pos 起始位置
+ * @returns 回退后的位置（≥0）
+ */
+function backOverAnsi(line: string, pos: number): number {
+  let cut = pos
+  for (;;) {
+    const m = line.slice(0, cut).match(ANSI_AT_END)
+    if (!m || m[0].length === 0) break
+    cut -= m[0].length
+  }
+  return cut
+}
+
+/**
+ * 剔除探针命令回显行（含 shell 语法高亮插入的 ANSI 与提示符前缀）：
+ * 逐行处理，对每行 ANSI 容忍地定位任一 needle 的首次出现；命中且跨度不超 PROBE_ECHO_MAX_SPAN 时，
+ * 删除「探针回显起点（含其前紧邻 ANSI 色码）→ 该行行尾」——**只向后删、绝不向前越过可见字符**：
+ * 保留行中探针之前的真输出（行中打断场景），提示符前缀留在行首，
+ * 再由 D1 判据（该行可见内容 == 提示符）决定是否整行删除。
+ * 无命中行逐字节不变；Raw 视图不经此函数，保留原始字节。
+ * @param text 可见输出文本
+ * @param needles 探针命令文本（各 seq；含会话 nonce，故不会命中别的会话/nonce 的探针）
+ * @param promptRef 提示符基准（D1 用）
+ * @returns 剔除后文本
+ */
+export function removeProbeEchoLines(text: string, needles: string[], promptRef: string): string {
+  if (needles.length === 0 || text === "") return text
+  const kept: string[] = []
+  for (const line of text.split("\n")) {
+    // 取本行内最早出现的探针回显起点（多个 needle 时取最小 start）
+    let cut = -1
+    for (const needle of needles) {
+      const r = findAnsiTolerantFirstRange(line, needle)
+      if (!r) continue
+      if (r.end - r.start > PROBE_ECHO_MAX_SPAN) continue // 护栏②：跨度超限，疑误命中，不删
+      if (cut < 0 || r.start < cut) cut = r.start
+    }
+    if (cut < 0) {
+      kept.push(line) // 无命中：逐字节保留
+      continue
+    }
+    const head = line.slice(0, backOverAnsi(line, cut)) // 护栏③：只删探针起点→行尾，保留该行前半真输出
+    if (isPromptOnlyLine(head, promptRef)) continue // D1：删后仅剩提示符 → 整行丢弃
+    kept.push(head)
+  }
+  return kept.join("\n")
+}
+
+/**
  * 把原始终端流转为给模型看的干净文本：用 xterm headless 引擎忠实模拟终端屏幕
  * （处理光标移动/清行/清屏/覆盖/退格/SGR/OSC，含 scrollback），再逐行去尾空白并剔除空行。
  * 比纯文本正则更鲁棒地处理 PSReadLine 行内重绘、进度条 \r 覆盖等场景。
