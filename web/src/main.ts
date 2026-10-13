@@ -533,7 +533,7 @@ function updateTerminalSelect(prevName?: string, forceSub = false): void {
   }
   if (prevName && [...tsel.options].some((o) => o.value === prevName)) tsel.value = prevName
   else tsel.selectedIndex = tsel.options.length ? 0 : -1
-  // 删除按钮：仅非 default 且已断开时显示
+  // 删除按钮：当前终端存在且已断开时显示
   const cur = s?.terminals.find((t) => (t.name || "default") === tsel.value)
   delBtn.classList.toggle("show", !!(cur && !cur.connected))
   updateCmdBar()
@@ -843,8 +843,12 @@ function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 }
 
-/** 可见完成标记剥离（含序号式 <SSH_DONE:seq:code>，退出码在末尾；展示给用户/模型的输出前调用） */
-const DONE_RE = /<SSH_DONE:(?:\d+:)?(-?\d+)>/g
+/**
+ * 可见完成标记剥离（退出码恒在末尾；展示给用户/模型的输出前调用）。
+ * 兼容三种格式：`<SSH_DONE:code>`（旧）/`<SSH_DONE:seq:code>`（旧序号式）/
+ * `<SSH_DONE:nonce:seq:code>`（现用：nonce 为会话级随机串，可为字母数字）。与后端 shell-adapter 的 DONE_RE 保持一致。
+ */
+const DONE_RE = /<SSH_DONE:(?:[0-9A-Za-z]+:)?(?:\d+:)?(-?\d+)>/g
 function stripDone(s: string): string {
   return s.replace(DONE_RE, "")
 }

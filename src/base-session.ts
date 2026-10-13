@@ -11,12 +11,13 @@ import {
   DONE_TAG,
   SYNTAX_QUIET_MS,
   SYNTAX_MAX_WAIT_MS,
+  FALLBACK_WATCH_INTERVAL_MS,
   INTERRUPT_PROBE_INTERVAL_DEFAULT_SEC,
 } from "./constants.js"
-import log, { debug, describeSend, tailLines, tailSummary } from "./log.js"
+import log, { debug, describeSend, isDebugEnabled, tailLines, tailSummary } from "./log.js"
 import { decodeTerminalEscapes } from "./escapes.js"
 import { SessionHistory } from "./history.js"
-import { toModelText, extractOutputStart, stripTrailingPromptLine } from "./utils.js"
+import { toModelText, extractOutputStart, stripTrailingPromptLine, ECHO_REGEX_MAX_CMD_CHARS, echoRegexSourceLength } from "./utils.js"
 import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
@@ -36,6 +37,17 @@ export interface ExecResult {
 export type LifecycleEvent =
   | { type: "start"; command: string; ts: number }
   | { type: "done"; exitCode: number | null; endTs: number; output?: string }
+
+/** 命令完成判定结果（仅 exec 同步等待窗口使用；后台路径直接收尾、不返回） */
+interface CompletionOutcome {
+  kind: "done" | "running"
+  /** done 时的完成标记结束偏移（缺省表示无标记，窗口取到缓冲区末尾，如语法错误收尾） */
+  markerPos?: number
+  /** done 时的退出码（语法错误无标记可读，为 null） */
+  exitCode?: number | null
+  /** done 是否由语法/解析错误收尾（输出提取须改用 syntaxMode） */
+  syntaxError?: boolean
+}
 
 /** buffer 最大长度（未消费输出超限时截断头部，防内存膨胀） */
 const MAX_BUFFER_LEN = 2 * 1024 * 1024
@@ -95,25 +107,100 @@ function stripCommandTail(command: string): string {
   return (head + s).trimEnd()
 }
 
+/**
+ * 诊断辅助：转义控制字符，使日志单行可读（\r\n\t 转义、ESC 写成 \x1b）。
+ * 仅供日志打印使用，不参与任何控制流。
+ * @param s 原始字符串
+ * @returns 控制字符已转义的字符串
+ */
+function escapeCtl(s: string): string {
+  return s.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t").replace(/\x1b/g, "\\x1b")
+}
+
+/** 完成标记扫描命中项（宽松解析：求值式/回显式、新 nonce 式/旧式均识别） */
+interface DoneMarkerHit {
+  /** 标记起始偏移（`<` 处） */
+  pos: number
+  /** 标记结束偏移（`>` 之后一位，可作切片边界） */
+  end: number
+  /** 解析出的会话 nonce（旧格式/回显式无 nonce 时为空串） */
+  nonce: string
+  /** 解析出的命令序号（无法解析时为 null） */
+  seq: number | null
+}
+
+/**
+ * 扫描文本中所有完成标记（`<SSH_DONE:nonce:seq:code>` / `<SSH_DONE:seq:code>` / `<SSH_DONE:code>`）。
+ * 宽松解析（不要求退出码为纯数字）：既覆盖求值式标记，也覆盖**命令行回显**里的标记片段
+ * （重放内容中常见 `<SSH_DONE:2:$LASTEXITCODE>` 这种未求值的回显）。
+ * 用途：① 诊断日志（窗口内混入的标记来自哪条命令）；② 定位失败时按标记边界裁剪窗口。
+ * @param s 待扫描文本
+ * @returns 命中列表（按出现顺序）
+ */
+function scanDoneMarkers(s: string): DoneMarkerHit[] {
+  const out: DoneMarkerHit[] = []
+  let from = 0
+  for (;;) {
+    const i = s.indexOf(DONE_TAG, from)
+    if (i < 0) break
+    const gt = s.indexOf(">", i + DONE_TAG.length)
+    if (gt < 0) break // 未闭合：后续不再可能有完整标记
+    const segs = s.slice(i + DONE_TAG.length, gt).split(":")
+    let nonce = ""
+    let seq: number | null = null
+    if (segs.length >= 3) {
+      nonce = segs[0]
+      const n = Number.parseInt(segs[1], 10)
+      seq = Number.isNaN(n) ? null : n
+    } else if (segs.length === 2) {
+      const n = Number.parseInt(segs[0], 10)
+      seq = Number.isNaN(n) ? null : n
+    }
+    out.push({ pos: i, end: gt + 1, nonce, seq })
+    from = gt + 1
+  }
+  return out
+}
+
 /** 会话命令执行与读取的公共实现 */
 export abstract class BaseSession {
   protected _connected = false
   protected _remoteBusy = false
-  /**
-   * 是否保持 busy：排队命令顺序执行时，中间某条完成也不清 busy，
-   * 直到序列最后一条完成（否则 web/status 会在中间命令间隙闪 busy=false）。
-   */
-  private _holdBusy = false
   protected _buffer = ""
   protected _connectedAt = 0
   protected _lastActive = 0
   protected _runningStartPos: number | null = null
   protected _runningCommand = ""
   protected _watchTimer: ReturnType<typeof setInterval> | null = null
-  /** 命令序号（完成标记 <SSH_DONE:seq:code> 标识本次命令，防残留误判） */
+  /** 后台兜底判定的捕获窗口起点（相对 buffer；submit 为 0，exec 转后台为 captureStart） */
+  private _watchStartPos = 0
+  /** 后台兜底判定写入 history 用的命令（独立保存，避免运行上下文清理后取不到） */
+  private _watchCommand = ""
+  /** 语法错误安静窗口的一次性定时器（数据到达时重置；到点即收尾，非轮询） */
+  private _syntaxTimer: ReturnType<typeof setTimeout> | null = null
+  /** 语法错误首次识别时刻（0=尚未识别） */
+  private _syntaxSeenAt = 0
+  /** 语法错误静默判定起点（识别后输出最后一次变化的时刻） */
+  private _syntaxQuietAt = 0
+  /** 语法错误识别后观测到的输出长度（判断输出是否仍在变化） */
+  private _syntaxLen = 0
+  /** exec 同步等待完成的一次性 animation 定时器（到点未完成 → 兑现 "running" 转后台） */
+  private _animationTimer: ReturnType<typeof setTimeout> | null = null
+  /** exec 同步等待完成的 resolver（数据到达/语法静默命中时由 _settleCompletion 兑现） */
+  private _completionWaiter: { resolve: (o: CompletionOutcome) => void } | null = null
+  /** exec 转后台后等待 busy 释放的 resolver 列表（busy 翻转为 false 时统一兑现，替代 200ms 轮询） */
+  private _busyWaiters: Array<() => void> = []
+  /** 命令序号（完成标记 <SSH_DONE:nonce:seq:code> 标识本次命令，防残留误判） */
   private _cmdSeq = 0
   /** 当前命令序号（_beginCapture 递增，供检测/拼接用） */
   private _runningSeq = 0
+  /**
+   * 会话级随机短串（8 位十六进制，构造时生成）：写进完成标记 `<SSH_DONE:<nonce>:<seq>:<code>>`。
+   * 远端 Windows 控制台在新连接时会重放上一会话屏幕缓冲，其中含**别的会话**的完成标记；
+   * 新会话 seq 必然从 1 起、与重放会话撞号 → 无 nonce 时会把重放标记当自己的完成/边界。
+   * 只认自己 nonce：重放标记不再冒充本会话标记。
+   */
+  private readonly _nonce: string = randomUUID().replace(/-/g, "").slice(0, 8)
   /**
    * 命令发起前缓冲的末行（旧提示符行）：语法错误收尾时 shell 会重印同形提示符，
    * 据此把它从输出尾部剥掉（exec 的输出窗口自命令回显起，旧提示符在窗口之外，需单独记录）。
@@ -144,6 +231,8 @@ export abstract class BaseSession {
   readonly generation: string = randomUUID()
   /** 生命周期监听器（命令开始/完成事件，agent 转报 server） */
   private _lifecycle: ((ev: LifecycleEvent) => void) | null = null
+  /** 数据到达监听器（终端有新输出写入缓冲时回调，供 agent 事件驱动推流；null 清除） */
+  private _dataListener: (() => void) | null = null
   /**
    * busy 状态翻转监听器（插件挂接）：命令运行期间收到 true、结束写回 false，
    * 供插件把实时 busy 同步到跨进程状态文件，避免命令执行前落盘的旧值一直"过期"。
@@ -198,8 +287,9 @@ export abstract class BaseSession {
     if (this._adapter?.hasOpenContinuation(command)) return { ok: false, output: "", error: tr("cmd_continuation", this._lang) }
 
     this._beginCapture(command)
+    this._armTracking(0, command)
     this._write(this._composeCommand(command))
-    this._startBackgroundWatch(0, command)
+    this._startFallbackWatch()
 
     return { ok: true, output: "", submitted: true, command, duration: 0, ...this._extraResult }
   }
@@ -212,16 +302,21 @@ export abstract class BaseSession {
   async exec(command: string): Promise<ExecResult> {
     const startTs = Date.now()
     if (!this._ready()) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
-    if (this._remoteBusy) { log.info(`exec quick-fail busy ${this._logTag}: ${tailLines(command, 3)} (busy=${this._remoteBusy})`); return { ok: false, output: "", error: tr("cmd_busy", this._lang) } }
-    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation ${this._logTag}: ${tailLines(command, 3)}`); return { ok: false, output: "", error: tr("cmd_continuation", this._lang) } }
+    if (this._remoteBusy) { log.info(`exec quick-fail busy ${this._logTag} cmdLen=${command.length} (busy=${this._remoteBusy})`); debug(`exec quick-fail busy ${this._logTag} cmd=${tailLines(command, 3)}`); return { ok: false, output: "", error: tr("cmd_busy", this._lang) } }
+    if (this._adapter?.hasOpenContinuation(command)) { log.info(`exec quick-fail open continuation ${this._logTag} cmdLen=${command.length}`); debug(`exec quick-fail open continuation ${this._logTag} cmd=${tailLines(command, 3)}`); return { ok: false, output: "", error: tr("cmd_continuation", this._lang) } }
 
     this._beginCapture(command)
     const captureStart = this._buffer.length
+    this._armTracking(captureStart, command)
+    // 先挂同步等待者再写入：写命令可能同步回灌数据（本地 PTY 快速回显），事件驱动的 _settleCompletion
+    // 需要等待者已就位；否则完成会被判成后台收尾、exec 空等
+    const completion = this._awaitCompletion()
     this._write(this._composeCommand(command))
 
-    const outcome = await this._waitCompletion(0, startTs)
+    const outcome = await completion
 
-    log.info(`exec ${this._logTag} seq=${this._runningSeq} ${tailLines(command, 3)} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos+" exitCode="+outcome.exitCode+" duration="+(Date.now()-startTs)+"ms"} (busy=${this._remoteBusy})`)
+    log.info(`exec ${this._logTag} seq=${this._runningSeq} cmdLen=${command.length} -> ${outcome.kind}${outcome.kind==="running"?"":" markerPos="+outcome.markerPos+" exitCode="+outcome.exitCode+" duration="+(Date.now()-startTs)+"ms"} (busy=${this._remoteBusy})`)
+    debug(`exec ${this._logTag} seq=${this._runningSeq} cmd=${tailLines(command, 3)}`)
 
     switch (outcome.kind) {
       case "done": {
@@ -236,16 +331,10 @@ export abstract class BaseSession {
         this._runningStartPos = 0
         this._setBusy(true, "cmdRunning")
         this._cursor = this._buffer.length
-        this._startBackgroundWatch(captureStart, command)
-        // 等待后台 watch 完成（不设硬超时，模型可通过 Ctrl-C 中断）
-        await new Promise<void>((resolve) => {
-          const poll = setInterval(() => {
-            if (!this._remoteBusy) {
-              clearInterval(poll)
-              resolve()
-            }
-          }, 200)
-        })
+        // 转后台稀疏兜底监听（≥1s，仅覆盖断连等非数据事件）；完成判定仍由数据到达事件驱动
+        this._startFallbackWatch()
+        // 等待命令收尾：事件驱动（busy 翻转为 false 时兑现），不再 200ms 轮询
+        await new Promise<void>((resolve) => { this._busyWaiters.push(resolve) })
         // watch 已写入 history，取最后一条记录的输出
         const pairs = this._history.getPairs()
         const last = pairs[pairs.length - 1]
@@ -263,7 +352,7 @@ export abstract class BaseSession {
     if (!this._connected) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
     let out: string
     if (this._runningStartPos !== null && this._runningCommand) {
-      const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
+      const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._nonce, this._runningSeq)
       if (marker.done) {
         // 与后台 watch 完成路径复用同一收尾（history/done/busy/停 watch），避免 busy 卡死
         const raw = this._completeRunning(this._runningStartPos, marker.pos, marker.exitCode, this._runningCommand, undefined, "readBuffer")
@@ -309,6 +398,12 @@ export abstract class BaseSession {
 
   getHistory(): SessionHistory { return this._history }
 
+  /**
+   * 本会话完成标记的随机串（只读）：供诊断/测试按真实格式构造标记。
+   * @returns 8 位十六进制会话串
+   */
+  get nonce(): string { return this._nonce }
+
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
     return this._buffer.slice(this._runningStartPos)
@@ -327,6 +422,16 @@ export abstract class BaseSession {
   }
 
   /**
+   * 设置数据到达监听器（每次终端有新输出写入缓冲时回调）：
+   * SSH 的 `stream.on("data")` 与本地 PTY 的 data 回调最终都汇入 `_appendBuffer`，
+   * 在此统一触发，供 agent 做事件驱动的节流推流（不再依赖固定周期轮询）。
+   * @param listener 回调（null 表示清除）
+   */
+  setDataListener(listener: (() => void) | null): void {
+    this._dataListener = listener
+  }
+
+  /**
    * 设置 busy 状态翻转监听器（命令开始/结束/断连等每次 busy 翻转时回调）：
    * 供插件把最新 busy 同步到跨进程状态文件（server 拿不到 agent 状态回退读状态文件时，
    * 读到的是命令运行期间的实时值，而非命令执行前落盘的过期值）。
@@ -337,20 +442,10 @@ export abstract class BaseSession {
   }
 
   /**
-   * 设置是否保持 busy（排队命令序列期间为 true）：
-   * true 时中间命令完成不清 busy；置 false 时立即清 busy。
-   * @param hold 是否保持
-   */
-  setHoldBusy(hold: boolean): void {
-    this._holdBusy = hold
-    if (!hold) this._setBusy(false, "holdRelease")
-  }
-
-  /**
    * 更新终端 busy 状态：仅在值翻转时记一行（会话/终端/当前 seq/翻转原因），
    * 供事后对齐状态时间线（busy 每次翻转都能对应到具体原因，不再出现"忙了却查不出为何"）。
    * @param next 目标 busy 值
-   * @param reason 翻转原因（cmdStart / cmdRunning / cmdDone / holdRelease / 会话关闭 / 断连补 done 等）
+   * @param reason 翻转原因（cmdStart / cmdRunning / cmdDone / 会话关闭 / 断连补 done 等）
    */
   protected _setBusy(next: boolean, reason: string): void {
     if (this._remoteBusy === next) return
@@ -358,6 +453,14 @@ export abstract class BaseSession {
     log.info(`[busy] ${this._logTag} seq=${this._runningSeq} busy=${next} reason=${reason}`)
     // 通知插件同步状态文件（busy 已更新，getStatus 读到新值）；监听器异常不打断执行
     try { this._busyListener?.(next, reason) } catch { /* 监听器异常不打断执行 */ }
+    // busy 释放：事件驱动地兑现 exec 转后台后的等待者（替代旧的 200ms busy=false 轮询）
+    if (!next && this._busyWaiters.length > 0) {
+      const waiters = this._busyWaiters
+      this._busyWaiters = []
+      for (const w of waiters) {
+        try { w() } catch { /* 等待者异常不打断状态翻转 */ }
+      }
+    }
   }
 
   /** 触发命令开始事件 */
@@ -385,9 +488,15 @@ export abstract class BaseSession {
       return { data: "", done: false }
     }
     // 完成标记先定位（marker 唯一 seq，从命令起点搜索，免疫 echoEnd 被后序回显带偏）
-    const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._runningSeq)
+    const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._nonce, this._runningSeq)
     const markerEnd = marker.done ? marker.pos : this._buffer.length
-    const end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._composeEchoText(this._runningCommand), markerEnd - this._runningStartPos)
+    // 回显定位异常不得中断推流：按"未定位"处理（延续原有 end<=0 语义）
+    let end: number
+    try {
+      end = extractOutputStart(this._buffer.slice(this._runningStartPos), this._composeEchoText(this._runningCommand), markerEnd - this._runningStartPos)
+    } catch {
+      end = -1
+    }
     if (end <= 0) return { data: "", done: false }
     const echoEnd = this._runningStartPos + end
     const windowEnd = marker.done ? marker.pos : this._buffer.length
@@ -430,7 +539,7 @@ export abstract class BaseSession {
    * @returns 标记命令文本
    */
   private _markerCmd(seq: number): string {
-    return this._adapter ? this._adapter.markerCmd(seq) : `printf '\\n${DONE_TAG}${seq}:%s>' $?`
+    return this._adapter ? this._adapter.markerCmd(this._nonce, seq) : `printf '\\n${DONE_TAG}${this._nonce}:${seq}:%s>' $?`
   }
 
   /**
@@ -605,18 +714,52 @@ export abstract class BaseSession {
    */
   private _extractOutput(raw: string, command: string, syntaxMode = false): string {
     // 完成标记先定位：marker 自带唯一 seq，从窗口起点搜索即可（echoEnd 可能被连续输入的后序回显带偏）
-    const marker = detectLastDoneMarker(raw, 0, this._runningSeq)
+    const marker = detectLastDoneMarker(raw, 0, this._nonce, this._runningSeq)
     const echoText = this._composeEchoText(command)
-    const end = marker.done
-      ? extractOutputStart(raw, echoText, marker.pos)
-      : extractOutputStart(raw, echoText, raw.length, syntaxMode)
+    const echoLen = echoText.trim().length
+    // 超长回显：extractOutputStart 会降级为"首/尾锚点"匹配（否则模式源约 265×长度，JSC 下会抛 too large）
+    if (echoLen > ECHO_REGEX_MAX_CMD_CHARS) {
+      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位降级为首/尾锚点: echoLen=${echoLen} regexSrcLen=${echoRegexSourceLength(echoText)} (>阈值 ${ECHO_REGEX_MAX_CMD_CHARS})`)
+    }
+    let end: number
+    const extractStart = Date.now()
+    try {
+      end = marker.done
+        ? extractOutputStart(raw, echoText, marker.pos)
+        : extractOutputStart(raw, echoText, raw.length, syntaxMode)
+    } catch (e) {
+      // 回显定位异常绝不上抛（否则会中断完成收尾）：记一行后退回整窗输出
+      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位失败, 退回整窗: echoLen=${echoLen} err=${e instanceof Error ? e.message : String(e)}`)
+      end = -1
+    }
+    // 诊断：定位结果与耗时（ret<=0 显眼标注"定位失败"）
+    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 定位: inLen=${raw.length} patternLen=${echoRegexSourceLength(echoText)} ret=${end <= 0 ? `<${end}> 定位失败` : end} elapsedMs=${Date.now() - extractStart}`)
+    // 诊断：输出窗口坐标 + 是否退回整窗（startPos=回显结束偏移，endPos=窗口末尾；窗口长=endPos-startPos）
+    const winStart = end <= 0 ? 0 : end
+    const winEnd = marker.done ? marker.pos : raw.length
+    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口: startPos=${winStart} endPos=${winEnd} 窗口长=${winEnd - winStart} markerSeq=${this._runningSeq} 是否退回整窗=${end <= 0 ? `是(定位失败, syntaxMode=${syntaxMode})` : "否"}`)
+    // 诊断：只扫本命令窗口 [winStart, winEnd) 内的完成标记（最多列 5 个，位置为相对窗口起点的偏移）——定位"输出里混进的标记来自哪条命令"
+    const hits = scanDoneMarkers(raw.slice(winStart, winEnd))
+    log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口内含标记: ${hits.length === 0 ? "无" : hits.slice(0, 5).map((h) => `@${h.pos}=${h.seq ?? "?"}`).join(" ")}`)
+    // 诊断：窗口前 120 字符（仅 SSH_TOOL_DEBUG=1 时落盘）
+    debug(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口前120: ${escapeCtl(raw.slice(0, 120))}`)
     if (end <= 0) {
-      // 未定位到命令回显（超宽命令折行重绘等）：退回整窗；中断命令再截到首个 ^C 回显，
-      // 避免输出残留 ^C 与探针后 shell 重印的提示符（与旧版"中断收尾"输出语义一致）
-      let fallback = raw
+      // 未定位到命令回显（脏窗口含控制台屏幕重放/超宽命令折行重绘等）：
+      // **不得退回整窗**——整窗会把重放的别会话命令行/标记当输出落盘（旧 bug：outLen=14019 全是杂物）。
+      // 改为按窗口内已有标记边界裁剪：取"本命令自己的标记之前、所有非本 seq 标记之后"的边界，
+      // 先把重放段整段切掉，再剥行首残余控制码噪音；定位仍失败也只剩边界之后的少量内容。
+      const ownEnd = marker.done ? marker.pos : raw.length
+      const boundary = this._fallbackBoundary(raw, ownEnd)
+      let fallback = boundary > 0 ? raw.slice(boundary) : raw
+      // 边界裁剪后"再试一次定位"：此时窗口已剔除重放段，回显残片可能恢复成可匹配的连续文本
+      const retry = extractOutputStart(fallback, echoText, fallback.length, false)
+      if (retry > 0) fallback = fallback.slice(retry)
+      else fallback = this._stripLeadingControlNoise(fallback)
+      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 定位失败改用标记边界: boundary=${boundary} retry=${retry} 裁剪后长=${fallback.length} 原窗长=${raw.length}`)
+      // 中断命令再截到首个 ^C 回显，避免输出残留 ^C 与探针后 shell 重印的提示符（与旧版中断收尾语义一致）
       if (this._interruptSent) {
-        const intr = detectInterrupt(raw, 0)
-        if (intr.interrupted) fallback = raw.slice(0, intr.pos)
+        const intr = detectInterrupt(fallback, 0)
+        if (intr.interrupted) fallback = fallback.slice(0, intr.pos)
       }
       return this._stripProbeEchoes(stripMarkers(fallback))
     }
@@ -641,20 +784,60 @@ export abstract class BaseSession {
     return this._stripProbeEchoes(stripMarkers(out.replace(/^[\r\n]+/, "")))
   }
 
+  /**
+   * 回显定位失败时的标记边界裁剪：扫描窗口内所有完成标记，返回"本命令自己的标记之前、
+   * 所有非本 seq 标记之后"的边界偏移（无合适标记时为 0）。
+   * 用于把控制台屏幕重放（含上一会话的命令行与标记）整段切掉，避免其被当输出落盘。
+   * 判定：只按 seq 区分——seq 等于当前命令序号的标记（求值式或命令行回显式）属于本次命令，
+   * 不作边界（否则会把本次命令的回显一起切掉）；其余标记（重放的别会话标记）取最后一个的结束位置。
+   * @param raw 待裁剪窗口原始字节流
+   * @param ownEnd 本命令完成标记的结束偏移（无标记时为窗口末尾）
+   * @returns 裁剪起点偏移（相对 raw）
+   */
+  private _fallbackBoundary(raw: string, ownEnd: number): number {
+    let start = 0
+    for (const h of scanDoneMarkers(raw)) {
+      if (h.pos >= ownEnd) break
+      if (h.seq === this._runningSeq) continue
+      start = Math.max(start, h.end)
+    }
+    return start
+  }
+
+  /**
+   * 剥掉文本开头的控制码/重绘噪音（光标定位、颜色、OSC 标题等非打印序列）与空白，
+   * 直到首个可见字符；用于标记边界裁剪后仍残留的重绘噪音清理。
+   * @param s 待清理文本
+   * @returns 去掉行首控制噪音后的文本
+   */
+  private _stripLeadingControlNoise(s: string): string {
+    return s.replace(/^(?:[\s\x00-\x1f\x7f]|\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[^\x1b])+/, "")
+  }
+
   /** 命令执行/提交前准备：裁剪已消费缓冲 + 丢弃上一条命令的迟到残留标记 */
   private _beginCapture(command: string): void {
+    // 诊断用：记录进入时的缓冲/游标快照（仅用于日志，不参与裁剪决策）
+    const entryBufLen = this._buffer.length
+    const entryCursor = this._cursor
     // 开始新命令：停掉上一条命令遗留的中断周期（新命令有自己的 seq 与收尾）
     this._stopInterruptCycle("开始新命令")
-    // 用上一条命令完成标记（<SSH_DONE:seq:N>，此刻 _runningSeq 仍是上一条的）定位命令起点；
-    // 备屏重放等场景下 buffer 可能含旧标记，裁剪到最后一个标记之后即可
-    const marker = detectLastDoneMarker(this._buffer, 0, this._runningSeq)
+    // 用上一条命令完成标记（<SSH_DONE:nonce:seq:N>，此刻 _runningSeq 仍是上一条的）定位命令起点；
+    // 只认自己 nonce：别的会话经控制台重放混入的旧标记不会被误当本会话边界
+    const marker = detectLastDoneMarker(this._buffer, 0, this._nonce, this._runningSeq)
     if (marker.done) {
       this._buffer = this._buffer.slice(marker.pos)
-      this._cursor = 0
+    } else {
+      // 无本会话标记（首命令且基线标记尚未到达/不可用）：至少按"非本 seq 标记"边界剥掉屏幕重放段
+      const replayBoundary = this._fallbackBoundary(this._buffer, this._buffer.length)
+      if (replayBoundary > 0) this._buffer = this._buffer.slice(replayBoundary)
     }
-    // fallback：无标记时依赖 _cursor 裁剪
+    // fallback：再依赖 _cursor 裁剪
     this._buffer = this._buffer.slice(this._cursor)
     this._cursor = 0
+    // 诊断：本次窗口起点取自"自身找到的 lastMarkerPos"（无标记时为 0，即缓冲起点）；
+    // captureStart=裁剪后残留长度（exec 的实际捕获起点，与缓冲内容相关，仅供参考）
+    const winStartPos = marker.done ? marker.pos : 0
+    log.info(`[capture] ${this._logTag} seq=${this._cmdSeq + 1} 起点=${winStartPos} captureStart=${this._buffer.length}(参考) entryCursor=${entryCursor} bufLen=${entryBufLen} lastMarkerPos=${marker.done ? marker.pos : -1}`)
     // 记录命令发起前缓冲末行（旧提示符行）：语法错误收尾时 shell 会重印同形提示符，供输出尾部剥离
     this._promptRef = this._buffer.split("\n").pop() ?? ""
     this._runningStartPos = 0
@@ -665,7 +848,8 @@ export abstract class BaseSession {
     this._runningSeq = this._cmdSeq
     this._setBusy(true, "cmdStart")
     this._lastActive = Date.now()
-    log.info(`[run] 开始 ${this._logTag} seq=${this._runningSeq} startPos=0 cmd=${JSON.stringify(command.slice(0, 120))}`)
+    log.info(`[run] 开始 ${this._logTag} seq=${this._runningSeq} startPos=0 cmdLen=${command.length}`)
+    debug(`[run] 开始 ${this._logTag} seq=${this._runningSeq} cmd=${JSON.stringify(command.slice(0, 120))}`)
     this._emitStart(command, this._runningStartTs)
   }
 
@@ -686,6 +870,33 @@ export abstract class BaseSession {
       this._rawLog = this._rawLog.slice(trimmed)
       this._rawDiscarded += trimmed
     }
+    // 诊断：仅当本 chunk 含完成标记时记一行（回答"后续命令的标记为何在当前命令结束前就到"）
+    if (text.includes(DONE_TAG)) {
+      const found = scanDoneMarkers(text).map((h) => h.seq ?? "?").join(",")
+      // 非内容信息保持 info（排障主力）；命令/输出片段前缀（prefix）降级为 debug，避免泄漏内容
+      log.info(`[chunk] ${this._logTag} seq=${this._runningSeq} runningStart=${this._runningStartPos} chunkLen=${text.length} found=[${found}]`)
+      debug(`[chunk] ${this._logTag} seq=${this._runningSeq} prefix=${escapeCtl(text.slice(0, 60))}`)
+    }
+    // 数据已落缓冲：通知数据到达监听器（agent 据此做节流合并推流；异常不打断数据写入）
+    try { this._dataListener?.() } catch { /* 监听器异常不打断数据写入 */ }
+    // 完成判定改为事件驱动：每个数据块落入缓冲后立即判定完成标记/语法错误（异常不打断数据写入）
+    this._onDataArrived()
+  }
+
+  /**
+   * 会话初始化完成后发送**基线标记**（seq=0）：作为第一条命令的"前驱"。
+   *
+   * 背景：新连接时远端 Windows 控制台会重放上一会话的屏幕缓冲，其内容落在缓冲区开头。
+   * 旧实现首条命令 `_beginCapture` 没有"上一条标记"可依，窗口被迫从缓冲起点（=重放内容）开始，
+   * 回显定位失败便退回整窗 → 重放杂物被当输出落盘。
+   * 发一条 seq=0 的求值标记后，首条命令能像后续命令一样"裁剪到上一条标记之后"，起点即干净。
+   * 须在 shell 探测完成（adapter 已定）之后调用，使标记命令语法正确；写入方式与中断探针一致（尾随提交分隔符）。
+   * @returns 无
+   */
+  protected _sendBaselineMarker(): void {
+    const baseline = this._markerCmd(0) + "\r"
+    log.info(`[baseline] ${this._logTag} 初始化完成，发送基线标记 nonce=${this._nonce} seq=0 cmd=${JSON.stringify(this._markerCmd(0))}`)
+    this._write(baseline)
   }
 
   /** 探测 shell 类型：按各适配器 probeCommand 逐个探测（POSIX 系优先，pwsh/cmd 用各自独有命令），
@@ -719,117 +930,211 @@ export abstract class BaseSession {
   }
 
   /**
-   * 同步等待命令完成：轮询语法错误 / 完成标记 / ^C 中断，超动画窗口仍未完成则转后台 watch。
-   * @param startPos 捕获窗口起点（相对当前 buffer）
-   * @param startTs 命令发起时刻（判定动画窗口用）
-   * @returns kind=done 时 exitCode 为退出码（语法错误无标记可读，为 null）；markerPos 缺省表示窗口取到缓冲区末尾；
-   *          syntaxError=true 表示本次是语法/解析错误收尾（输出提取须改用首次回显匹配 + 剥尾部提示符）
+   * 挂起 exec 的同步完成等待（事件驱动，无轮询）：
+   * - 数据到达（`_appendBuffer` → `_checkCompletion`）命中完成标记/语法静默时由 `_settleCompletion` 兑现；
+   * - 超过 ANIMATION_WINDOW_MS 仍未完成则由一次性 animation 定时器兑现 "running"（转后台继续追踪，不设硬超时）。
+   * @returns 完成结果（done 携带标记位置/退出码/语法错误标志；running 表示转后台）
    */
-  private _waitCompletion(
-    startPos: number,
-    startTs: number,
-  ): Promise<{ kind: "done" | "running"; markerPos?: number; exitCode?: number | null; syntaxError?: boolean }> {
-    return new Promise((resolve) => {
-      let lastLen = this._buffer.length
-      // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
-      let syntaxSeenAt = 0
-      let syntaxQuietAt = 0
-      let syntaxLen = 0
-      const timer = setInterval(() => {
-        const now = Date.now()
-        const curLen = this._buffer.length
-        if (curLen !== lastLen) lastLen = curLen
-        // 语法/解析错误：**每轮最先判定**（优先于交互提示与"判为 running"），命中即进入静默等待再收尾。
-        // 整行命令作废（含同行拼装的完成标记也不会执行）→ 视为命令已结束。
-        // 不立即收尾：pwsh 的多行错误块由格式化器异步/批量渲染，须等输出安静一小段再收尾，
-        // 否则只截到 `ParserError:` 首行、丢掉 Line | 等后续行；安静窗口 300ms，自识别起上限 1s。
-        // 禁止"无标记超时即完成"式兜底：静默长命令（如 sleep）会被误判为已完成。
-        if (detectSyntaxError(this._adapter, this._buffer, startPos)) {
-          if (syntaxSeenAt === 0) {
-            syntaxSeenAt = now
-            syntaxQuietAt = now
-            syntaxLen = curLen
-          } else if (curLen !== syntaxLen) {
-            syntaxLen = curLen
-            syntaxQuietAt = now
-          }
-          if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
-            clearInterval(timer)
-            // 无标记可读 → exitCode=null；markerPos 缺省 → 输出窗口取到缓冲区末尾（含整段错误）
-            resolve({ kind: "done", exitCode: null, syntaxError: true })
-            return
-          }
+  private _awaitCompletion(): Promise<CompletionOutcome> {
+    return new Promise<CompletionOutcome>((resolve) => {
+      this._completionWaiter = { resolve }
+      this._animationTimer = setTimeout(() => {
+        this._animationTimer = null
+        const w = this._completionWaiter
+        if (w) {
+          this._completionWaiter = null
+          w.resolve({ kind: "running" })
         }
-        // 完成判定（权威且唯一）：命令后追加的 printf 输出 <SSH_DONE:seq:code>。
-        // marker 自带唯一 seq，从命令起点直接搜索即可（不依赖命令回显定位）。
-        // ^C 回显不作为完成依据：捕获/忽略 SIGINT 的程序（mysql/REPL）同样回显 ^C 但命令未结束，
-        // 据此判完成会把后续命令喂进运行中的程序；中断收尾改由 send() 补发的探针标记触发。
-        const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
-        if (marker.done) {
-          clearInterval(timer)
-          resolve({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
-          return
-        }
-        // 超过动画窗口仍未出现完成信号 → 交给后台 watch 继续监听（不设硬超时）
-        if (now - startTs >= ANIMATION_WINDOW_MS) {
-          clearInterval(timer)
-          resolve({ kind: "running" })
-          return
-        }
-      }, 50)
+      }, ANIMATION_WINDOW_MS)
     })
   }
 
-  /** 后台监听：轮询 done 标记 / 语法错误 / ^C 中断 → 收集输出进 history + busy=false */
-  private _startBackgroundWatch(startPos: number, command: string): void {
-    if (this._watchTimer) clearInterval(this._watchTimer)
-    // 语法错误收尾状态：syntaxSeenAt=0 表示尚未识别；quietAt=识别后输出最后一次变化的时刻
-    let syntaxSeenAt = 0
-    let syntaxQuietAt = 0
-    let syntaxLen = 0
-    this._watchTimer = setInterval(() => {
-      if (!this._connected) {
-        // 断连：命令视为结束（可能从未完成），补发 done 防 server busy 卡死
-        if (this._runningCommand) {
-          this._emitDone(null, Date.now())
-          // 断连收尾也是"结束"：补记 [run] 结束；不附 tail（输出窗口从未定案，无可信尾部可摘）
-          log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${this._buffer.length} exitCode=null duration=${Date.now()-this._runningStartTs}ms reason=disconnect`)
-        }
-        this._setBusy(false, "断连补 done")
-        this._clearRunningContext()
-        if (this._watchTimer) clearInterval(this._watchTimer)
-        return
-      }
-      // 完成判定只认当前 seq 的标记：^C 回显不作为完成依据（捕获/忽略 SIGINT 的程序
-      // 同样回显 ^C 但命令未结束，据此判完成会把后续命令喂进运行中的程序）。
-      // 中断收尾由 send() 补发的探针标记触发（见 _sendInterruptProbe）。
-      const marker = detectLastDoneMarker(this._buffer, startPos, this._runningSeq)
+  /**
+   * 数据到达事件钩子（由 `_appendBuffer` 在每个数据块落入缓冲后调用）：
+   * 仅在追踪运行命令时触发完成判定，异常不打断数据写入。
+   * @returns 无
+   */
+  private _onDataArrived(): void {
+    if (this._runningStartPos === null || this._runningCommand === "") return
+    try {
+      this._checkCompletion(true)
+    } catch (e) {
+      log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 数据到达判定异常, 保持监听: err=${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  /**
+   * 完成判定（唯一入口，事件驱动）：
+   * 断连优先处理；其次判当前 seq 完成标记（权威且唯一）；再次判语法/解析错误（安静窗口后收尾）。
+   * ^C 回显不作为完成依据：捕获/忽略 SIGINT 的程序（mysql/REPL）同样回显 ^C 但命令未结束，
+   * 据此判完成会把后续命令喂进运行中的程序；中断收尾由 send() 补发的探针标记触发。
+   * @param fromData true=数据到达触发（推进语法静默计时）；false=后台兜底 tick（不重置已挂的静默计时，避免无限顺延）
+   * @returns 无
+   */
+  private _checkCompletion(fromData: boolean): void {
+    if (this._runningStartPos === null || !this._runningCommand) return
+    if (!this._connected) {
+      this._handleDisconnect()
+      return
+    }
+    try {
+      // 完成判定（权威且唯一）：命令后追加的 printf 输出 <SSH_DONE:seq:code>；marker 自带唯一 seq，从命令起点搜索
+      const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._nonce, this._runningSeq)
       if (marker.done) {
-        this._completeRunning(startPos, marker.pos, marker.exitCode, command)
+        this._settleCompletion({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
         return
       }
-      // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后按完成收尾，
-      // 走与正常完成一致的路径（history / done 事件 / 清 running / 翻转 busy）；
-      // exitCode=null（无标记可读），输出窗口 = 回显结束 → 缓冲区末尾（含整段多行错误块，
-      // 回显取首次匹配并剥掉尾部重印的提示符行，见 _extractOutput 的 syntaxMode）
-      if (detectSyntaxError(this._adapter, this._buffer, startPos)) {
-        const now = Date.now()
-        const len = this._buffer.length
-        if (syntaxSeenAt === 0) {
-          syntaxSeenAt = now
-          syntaxQuietAt = now
-          syntaxLen = len
-        } else if (len !== syntaxLen) {
-          syntaxLen = len
-          syntaxQuietAt = now
-        }
-        if (now - syntaxQuietAt >= SYNTAX_QUIET_MS || now - syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
-          const out = this._extractOutput(this._buffer.slice(startPos), command, true)
-          this._completeRunning(startPos, this._buffer.length, null, command, out, "watch(syntax)")
-          return
-        }
+      // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后按完成收尾
+      if (detectSyntaxError(this._adapter, this._buffer, this._watchStartPos)) {
+        // 兜底 tick 不重置已挂的静默计时（否则每周期顺延、永不收尾）；数据到达时才推进
+        if (fromData || this._syntaxTimer === null) this._armSyntaxQuiet()
       }
-    }, 200)
+    } catch (e) {
+      log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 判定异常, 保持监听: err=${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  /**
+   * 兑现一次完成判定：有 exec 同步等待者时只回传结果（由 exec 走统一收尾）；
+   * 无等待者（submit / exec 转后台）时直接调用 `_completeRunning` 收尾。
+   * @param o 完成结果
+   * @returns 无
+   */
+  private _settleCompletion(o: CompletionOutcome): void {
+    const w = this._completionWaiter
+    if (w) {
+      this._completionWaiter = null
+      this._clearAnimationTimer()
+      w.resolve(o)
+      return
+    }
+    if (o.kind !== "done") return
+    if (o.syntaxError) {
+      // 语法错误：输出窗口 = 回显结束 → 缓冲区末尾（含整段多行错误块），syntaxMode 提取
+      let out: string
+      try {
+        out = this._extractOutput(this._buffer.slice(this._watchStartPos), this._watchCommand, true)
+      } catch (e) {
+        // 输出提取异常绝不影响收尾：退化为整窗原始输出，保证 history/done/busy 一定落地
+        log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 语法错误输出提取异常, 使用整窗输出: err=${e instanceof Error ? e.message : String(e)}`)
+        out = this._buffer.slice(this._watchStartPos)
+      }
+      this._completeRunning(this._watchStartPos, this._buffer.length, null, this._watchCommand, out, "watch(syntax)")
+      return
+    }
+    this._completeRunning(this._watchStartPos, o.markerPos ?? this._buffer.length, o.exitCode ?? null, this._watchCommand)
+  }
+
+  /**
+   * 推进语法错误安静窗口（一次性定时器，非轮询）：识别到语法错误后等输出停止增长 SYNTAX_QUIET_MS 再收尾，
+   * 确保 pwsh 异步/批量渲染的多行错误块被完整收进输出窗口；自首次识别起上限 SYNTAX_MAX_WAIT_MS。
+   * 数据到达（输出变化）时重置安静窗口；兜底 tick 不重置（见 _checkCompletion）。
+   * @returns 无
+   */
+  private _armSyntaxQuiet(): void {
+    const now = Date.now()
+    const len = this._buffer.length
+    if (this._syntaxSeenAt === 0) {
+      this._syntaxSeenAt = now
+      this._syntaxQuietAt = now
+      this._syntaxLen = len
+    } else if (len !== this._syntaxLen) {
+      this._syntaxLen = len
+      this._syntaxQuietAt = now
+    }
+    if (now - this._syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
+      this._clearSyntaxTimer()
+      this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
+      return
+    }
+    const remain = Math.max(0, SYNTAX_QUIET_MS - (now - this._syntaxQuietAt))
+    this._clearSyntaxTimer()
+    this._syntaxTimer = setTimeout(() => {
+      this._syntaxTimer = null
+      if (this._runningStartPos === null) return
+      try {
+        this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
+      } catch (e) {
+        log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 语法静默收尾异常: err=${e instanceof Error ? e.message : String(e)}`)
+      }
+    }, remain)
+  }
+
+  /**
+   * 断连收尾（由后台兜底 tick 判定 _connected=false 触发）：命令视为结束（可能从未完成），
+   * 补发 done 防 server busy 卡死；不写 history（输出窗口从未定案，无可信尾部可摘）。
+   * @returns 无
+   */
+  private _handleDisconnect(): void {
+    if (this._runningCommand) {
+      this._emitDone(null, Date.now())
+      // 断连收尾也是"结束"：补记 [run] 结束；不附 tail（输出窗口从未定案，无可信尾部可摘）
+      log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${this._buffer.length} exitCode=null duration=${Date.now()-this._runningStartTs}ms reason=disconnect`)
+    }
+    this._setBusy(false, "断连补 done")
+    this._clearRunningContext()
+    if (this._watchTimer) {
+      clearInterval(this._watchTimer)
+      this._watchTimer = null
+    }
+  }
+
+  /**
+   * 开始一次命令的后台追踪：记录兜底判定所需的捕获窗口起点/命令，并复位语法静默状态。
+   * 不做任何轮询——完成判定由数据到达事件驱动（见 `_onDataArrived`）。
+   * @param startPos 捕获窗口起点（相对当前 buffer；submit 为 0，exec 转后台为 captureStart）
+   * @param command 命令（history 记录用）
+   * @returns 无
+   */
+  private _armTracking(startPos: number, command: string): void {
+    this._watchStartPos = startPos
+    this._watchCommand = command
+    this._syntaxSeenAt = 0
+    this._syntaxQuietAt = 0
+    this._syntaxLen = 0
+    this._clearSyntaxTimer()
+  }
+
+  /**
+   * 启动稀疏兜底监听（≥1s，非高频轮询）：完成判定已由数据到达事件驱动，此定时器仅覆盖
+   * 断连（子类只置 `_connected=false`、不回调基类）与极端漏判保护；命令已不在追踪中则不启动。
+   * @returns 无
+   */
+  private _startFallbackWatch(): void {
+    if (this._runningStartPos === null || !this._runningCommand) return
+    if (this._watchTimer) return
+    this._watchTimer = setInterval(() => { this._fallbackTick() }, FALLBACK_WATCH_INTERVAL_MS)
+  }
+
+  /** 后台兜底一次：断连优先处理，否则复用统一完成判定（异常不得让监听中断，否则 busy 卡死） */
+  private _fallbackTick(): void {
+    try {
+      if (this._runningStartPos === null || !this._runningCommand) return
+      if (!this._connected) {
+        this._handleDisconnect()
+        return
+      }
+      this._checkCompletion(false)
+    } catch (e) {
+      // tick 内异常：记一行后继续下一轮监听（完成判定仍只认当前 seq 标记）
+      log.info(`[watch] ${this._logTag} seq=${this._runningSeq} tick 异常, 保持监听: err=${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  /** 清除 exec 同步等待的 animation 一次性定时器（幂等） */
+  private _clearAnimationTimer(): void {
+    if (this._animationTimer) {
+      clearTimeout(this._animationTimer)
+      this._animationTimer = null
+    }
+  }
+
+  /** 清除语法静默一次性定时器（幂等） */
+  private _clearSyntaxTimer(): void {
+    if (this._syntaxTimer) {
+      clearTimeout(this._syntaxTimer)
+      this._syntaxTimer = null
+    }
   }
 
   /**
@@ -845,14 +1150,24 @@ export abstract class BaseSession {
    */
   private _completeRunning(startPos: number, endPos: number, exitCode: number | null, command: string, out?: string, reason = "watch"): string {
     const raw = this._buffer.slice(startPos, endPos)
-    const output = out ?? this._extractOutput(raw, command)
+    let output: string
+    try {
+      output = out ?? this._extractOutput(raw, command)
+    } catch (e) {
+      // 输出提取异常绝不影响收尾：退化为整窗原始输出，保证 history/done/busy 一定落地
+      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 输出提取异常, 使用整窗输出: cmdLen=${command.length} err=${e instanceof Error ? e.message : String(e)}`)
+      output = raw
+    }
     this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
     this._emitDone(exitCode, Date.now(), output)
     this._cursor = Math.max(startPos, endPos)
-    this._setBusy(this._holdBusy, this._holdBusy ? "cmdDone(holdBusy)" : "cmdDone") // 排队序列中间命令：保持 busy 到序列结束
-    // 结束日志附"有界输出尾部"：仅当输出 > 3 行时附加末 3 行（单行、换行转义），短输出不重复；关闭时不拼装
-    const outTail = tailSummary(output)
-    log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${endPos} exitCode=${exitCode} duration=${Date.now()-this._runningStartTs}ms reason=${reason}${outTail ? ` tail=${outTail}` : ""}`)
+    this._setBusy(false, "cmdDone") // 命令完成即清 busy（"保持 busy 到排队序列结束"的机制已移除）
+    // 结束日志：非内容信息（长度/耗时/退出码/原因）保持 info；有界输出尾部摘要降级为 debug，避免泄漏输出内容
+    log.info(`[run] 结束 ${this._logTag} seq=${this._runningSeq} endPos=${endPos} exitCode=${exitCode} outLen=${output.length} duration=${Date.now()-this._runningStartTs}ms reason=${reason}`)
+    if (isDebugEnabled()) {
+      const outTail = tailSummary(output)
+      if (outTail) debug(`[run] 结束 ${this._logTag} seq=${this._runningSeq} tail=${outTail}`)
+    }
     this._stopInterruptCycle("命令完成")
     this._clearRunningContext()
     if (this._watchTimer) clearInterval(this._watchTimer)
@@ -861,6 +1176,8 @@ export abstract class BaseSession {
 
   protected _clearRunningContext(): void {
     this._stopInterruptCycle("运行上下文清理")
+    this._clearSyntaxTimer()
+    this._clearAnimationTimer()
     this._runningStartPos = null
     this._runningCommand = ""
     this._streamPos = null

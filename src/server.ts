@@ -10,7 +10,17 @@ import type { AddressInfo } from "node:net"
 import { WebSocketServer, WebSocket } from "ws"
 import { listAllSessions, removeSessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
-import { PTY_COLS, PTY_ROWS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS, HEARTBEAT_CLIENT_TIMEOUT_MS } from "./constants.js"
+import {
+  PTY_COLS,
+  PTY_ROWS,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS,
+  HEARTBEAT_CLIENT_TIMEOUT_MS,
+  STATUS_PUSH_DEBOUNCE_MS,
+  STATUS_PUSH_FALLBACK_MS,
+  ORPHAN_STATE_GRACE_MS,
+  ORPHAN_STATE_MIN_AGE_MS,
+} from "./constants.js"
 import log, { infoDedup } from "./log.js"
 
 export interface LiveSession {
@@ -23,6 +33,12 @@ export interface ServerHandle {
   port: number
   url: string
   close(): void
+  /**
+   * 订阅"是否有 agent 连接"的**边沿**回调（true=至少一个 agent 已连；false=最后一个 agent 已断开）。
+   * 供 server-entry 做事件驱动的空闲关闭：不再周期轮询状态文件，改为在最后一个 agent 断开时起计时。
+   * 订阅时会立即回调一次当前状态，避免订阅方错过此前发生的边沿。回调异常不影响服务。
+   */
+  onAgentPresence(cb: (present: boolean) => void): void
 }
 
 export interface SessionEntry {
@@ -94,8 +110,6 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   inputOffline: "web_input_offline",
 }
 
-const STATUS_PUSH_MS = 2000
-
 const sessionKey = (sid: string, name: string): string => `${sid}:${name}`
 
 /**
@@ -119,9 +133,31 @@ export function startServer(
   let actualPort = port
   const webDir = join(dirname(fileURLToPath(import.meta.url)), "web")
   const pageTemplate = readTemplate(webDir)
+  /** 服务启动时刻（孤儿状态文件清理的启动宽限基准，见 ORPHAN_STATE_GRACE_MS） */
+  const serverStartedAt = Date.now()
+  /**
+   * 本服务是否绑定在固定端口（port>0）。
+   * port=0 表示每个 opencode 实例各自起一个随机端口服务，本服务只能看见连到自己的 agent，
+   * "无已连 agent 认领"无法区分孤儿与**别的实例正在使用的活会话**，故磁盘孤儿清理不安全（见 sweepOrphanStateFiles）。
+   */
+  const isFixedPortServer = port !== 0
 
   const agents = new Map<WsClient, Set<string>>()
   const agentBySession = new Map<string, WsClient>()
+
+  /** 当前是否存在 agent 连接（边沿状态，供 notifyAgentPresence 去重） */
+  let agentPresent = false
+  /** "存在 agent 连接"边沿的订阅者（server-entry 用于事件驱动空闲关闭） */
+  const presenceListeners: Array<(present: boolean) => void> = []
+  /** 在 agents 集合发生"空 ↔ 非空"翻转时通知订阅者（无翻转则不发） */
+  const notifyAgentPresence = (): void => {
+    const present = agents.size > 0
+    if (present === agentPresent) return
+    agentPresent = present
+    for (const cb of presenceListeners) {
+      try { cb(present) } catch { /* 订阅回调异常不影响服务 */ }
+    }
+  }
   const streamBuf = new Map<string, StreamBufEntry>()
   const rawBuf = new Map<string, { data: string; pos: number; generation: string }>()
   const cmdCount = new Map<string, number>()
@@ -133,7 +169,7 @@ export function startServer(
 
   /**
    * 各 key 是否已处于"无 agent 连接且命令未完成"的 fallback 状态（仅用于日志：**边沿触发**）。
-   * buildSessions 每 2s（/state 轮询）被调用一次，故用 per-key 上一轮状态做**幂等**判定：
+   * buildSessions 由状态事件驱动（及低频兜底）被调用，故用 per-key 上一轮状态做**幂等**判定：
    * 仅在进入该状态（首转 fallback）与离开该状态（agent 重连 / 命令收尾）各记一行，稳定期间不记。
    */
   const fallbackState = new Set<string>()
@@ -214,11 +250,43 @@ export function startServer(
   }
 
   /**
+   * 清理"无任何已连 agent 认领"的**磁盘状态文件**：
+   * 正常关闭会调 removeSessionState 删文件，残留即属主进程异常退出（或进程退出兜底未清理）留下的孤儿；
+   * 其 connected=true/busy=true 不会自愈——旧实现只在 2s 轮询里读，故会长期误报"在线/忙"，
+   * 还会让 server-entry 的"无连接空闲自动关闭"永不触发。只删状态文件，**不动 history 目录**（离线历史仍可查看）。
+   * 保守优先：
+   * - **仅固定端口（port>0）服务执行**：port=0 时每实例各起一个服务（默认 config），本服务的"未认领"无法
+   *   区分孤儿与别的实例正在使用的活会话；且状态文件 updatedAt 不随空闲刷新，"陈旧"判据同样区分不了
+   *   → 直接跳过，宁可不清理也不删活数据（内存运行态回收在 cleanupOrphanRuntime 内照常执行，不受影响）；
+   * - 无 agent 代表（agents.size===0）时跳过——没有可信的"当前认领"视图，不判断；
+   * - 服务启动不足 ORPHAN_STATE_GRACE_MS 时跳过——给存量 agent 重连、注册的窗口，防误删活进程文件；
+   * - 仅清理 updatedAt 早于 ORPHAN_STATE_MIN_AGE_MS 的文件——避免误删刚写入、agent 尚未注册的文件。
+   * @param claimed 所有已连 agent 认领的会话键并集
+   */
+  const sweepOrphanStateFiles = (claimed: Set<string>): void => {
+    if (!isFixedPortServer) return
+    if (agents.size === 0) return
+    if (Date.now() - serverStartedAt < ORPHAN_STATE_GRACE_MS) return
+    const now = Date.now()
+    const stale = listAllSessions(dir).filter((s) => {
+      if (claimed.has(sessionKey(s.sessionID, s.name))) return false
+      return now - (s.updatedAt ?? 0) > ORPHAN_STATE_MIN_AGE_MS
+    })
+    if (!stale.length) return
+    for (const s of stale) removeSessionState(dir, s.sessionID, s.name)
+    infoDedup(
+      `orphan-state:${stale.map((s) => sessionKey(s.sessionID, s.name)).sort().join(",")}`,
+      `清理无 agent 认领的孤儿状态文件 ${stale.length} 个: ${stale.map((s) => keyTag(sessionKey(s.sessionID, s.name))).join(", ")}`,
+    )
+  }
+
+  /**
    * 清理"无任何已连 agent 认领"的终端运行态（僵尸条目）：
    * agent 断开后其运行态（streamBuf 的 done=false / rawBuf / 排队保持等）若无人接管会永久滞留，
    * 导致 busy 恒为 ⏳、[fallback] 长期存在、离线终端仍被当成"运行中"。
    * 多实例安全：只回收**所有已连 agent 都没认领**的 key——任一实例注册时都可安全回收孤儿；
    * 仍被本实例或其它实例认领的条目一律不动。history 落盘历史**不删**（仅供离线查看）。
+   * 同时（同一注册时机）清理无人认领的**状态文件**（见 sweepOrphanStateFiles），不留孤儿文件。
    */
   const cleanupOrphanRuntime = (): void => {
     const claimed = claimedByAnyAgent()
@@ -226,7 +294,6 @@ export function startServer(
     for (const k of streamBuf.keys()) if (!claimed.has(k)) orphans.push(k)
     for (const k of rawBuf.keys()) if (!claimed.has(k) && !orphans.includes(k)) orphans.push(k)
     for (const k of seqHold) if (!claimed.has(k) && !orphans.includes(k)) orphans.push(k)
-    if (!orphans.length) return
     for (const k of orphans) {
       streamBuf.delete(k)
       rawBuf.delete(k)
@@ -235,10 +302,13 @@ export function startServer(
       busyState.delete(k)
       fallbackState.delete(k)
     }
-    infoDedup(
-      `orphan-runtime:${orphans.slice().sort().join(",")}`,
-      `清理无 agent 认领的运行态 ${orphans.length} 个: ${orphans.map(keyTag).join(", ")}`,
-    )
+    if (orphans.length) {
+      infoDedup(
+        `orphan-runtime:${orphans.slice().sort().join(",")}`,
+        `清理无 agent 认领的运行态 ${orphans.length} 个: ${orphans.map(keyTag).join(", ")}`,
+      )
+    }
+    sweepOrphanStateFiles(claimed)
   }
 
   const buildSessions = (): Record<string, unknown> => {
@@ -374,6 +444,47 @@ export function startServer(
     return [key.slice(0, sep), key.slice(sep + 1)]
   }
 
+  /**
+   * 注册时的运行态对账（修复"断线丢 cmdDone → server 内存僵尸 busy"）：
+   * agent 注册时上报"本进程认领的全部终端"（register.sessions）与"其中真正在运行命令的子集"（register.running）。
+   * 对**本 agent 认领、但不在运行子集内**的终端，把 server 仍标记 done=false 的残留流收尾
+   * （置 done、广播 diff done、busy 归 false）——这正是"命令在 agent 断线期间完成、cmdDone 发往已死 socket 而丢失"的僵尸。
+   * 只在对账可确定时收尾：register 未携带 running（旧 agent / agent 自身无法确定）时**不臆测**，
+   * 仅记一行"未能对账"后保持现状（宁可保留僵尸，也不误判在线命令已完成）。
+   * @param claimKeys 本 agent 本次认领的会话键集合
+   * @param runningRaw register 消息里的 running 字段（未知类型，需运行时校验）
+   */
+  const reconcileAgentRuntime = (claimKeys: Set<string>, runningRaw: unknown): void => {
+    if (!Array.isArray(runningRaw)) {
+      log.info(`[reconcile] agent 注册未携带运行集合（未能对账），保持现状不臆测（认领 ${claimKeys.size} 个终端）`)
+      return
+    }
+    const running = new Set<string>()
+    for (const r of runningRaw as Array<{ sessionID?: unknown; name?: unknown }>) {
+      if (r && typeof r.sessionID === "string" && typeof r.name === "string") running.add(sessionKey(r.sessionID, r.name))
+    }
+    let finalized = 0
+    for (const k of claimKeys) {
+      if (running.has(k)) continue // 确在运行：保留 busy（agent 紧随其后的 cmdStart 会补播命令文本）
+      const b = streamBuf.get(k)
+      if (b && !b.done) {
+        b.done = true
+        b.endTs = b.endTs ?? Date.now()
+        logBusy(k, false, "register 对账(cmdDone 丢失)")
+        finalizeCommand(k)
+        finalized++
+        continue
+      }
+      if (seqHold.has(k)) {
+        // 排队保持也一并放开：其最后一条 cmdDone 同样可能随断线丢失，否则 busy 仍会被 hold 住
+        seqHold.delete(k)
+        logBusy(k, false, "register 对账(队列保持释放)")
+        finalized++
+      }
+    }
+    if (finalized) log.info(`[reconcile] agent 注册对账收尾 ${finalized} 个终端（认领但未运行，cmdDone 丢失）`)
+  }
+
   /** 广播 sessions（json 变化去重；busy 翻转必然变化） */
   const pushSessions = (): void => {
     const payload = buildSessions()
@@ -386,7 +497,24 @@ export function startServer(
     }
   }
 
-  const statusTimer = setInterval(() => { pushSessions() }, STATUS_PUSH_MS)
+  /** 状态推送合并定时器（事件驱动的去抖合并；null=空闲无待推） */
+  let statusPushTimer: ReturnType<typeof setTimeout> | null = null
+
+  /**
+   * 请求一次状态推送（去抖合并）：所有**状态变化事件**（cmdStart/cmdDone/exec/busy 翻转/连接变化/会话增删/客户端拉取）
+   * 调用它，窗口内多次只推一次全量最新状态。不变化时不推（pushSessions 内按 json 逐客户端去重）。
+   */
+  const requestStatusPush = (): void => {
+    if (statusPushTimer !== null) return
+    statusPushTimer = setTimeout(() => {
+      statusPushTimer = null
+      pushSessions()
+    }, STATUS_PUSH_DEBOUNCE_MS)
+  }
+
+  // 兜底：事件驱动已覆盖服务端内存态的全部变化；此低频周期只兜底**带外变化**（其他进程写入状态文件
+  // 导致的新终端 / pending / 标题变化等，服务端无对应事件），保证这类变化最长 STATUS_PUSH_FALLBACK_MS 内可达前端。
+  const statusFallbackTimer = setInterval(() => { pushSessions() }, STATUS_PUSH_FALLBACK_MS)
 
   /**
    * 应用层心跳（server 侧）：每隔 HEARTBEAT_INTERVAL_MS 向每条连接下发 {type:"ping"}，
@@ -428,11 +556,14 @@ export function startServer(
         if (!Array.isArray(sessions)) return
         for (const old of agents.get(ws) ?? []) agentBySession.delete(old)
         agents.set(ws, new Set())
+        const claimKeys = new Set<string>()
         for (const s of sessions) {
           const k = sessionKey(s.sessionID, s.name)
           agents.get(ws)!.add(k)
           agentBySession.set(k, ws)
+          claimKeys.add(k)
         }
+        notifyAgentPresence()
         {
           // 记录 agent 上报的会话列表（批量实例注册同一列表时按内容去重），便于对齐 server 侧视角
           const keys = [...(agents.get(ws) ?? [])]
@@ -441,9 +572,10 @@ export function startServer(
             `agent 注册 ${keys.length} 个会话: ${keys.length ? keys.map(keyTag).join(", ") : "无"}`,
           )
         }
-        // 注册（含重连）后回收"无任何已连 agent 认领"的运行态：僵尸条目（agent 已消失仍 done=false）在此清干净
+        // 运行态对账：先按本 agent 上报的"运行子集"收尾断线丢 cmdDone 的僵尸 busy，再回收无人认领的运行态与状态文件
+        reconcileAgentRuntime(claimKeys, msg.running)
         cleanupOrphanRuntime()
-        pushSessions()
+        requestStatusPush()
         return
       }
 
@@ -468,7 +600,7 @@ export function startServer(
           c._txPos = 0
           send(c, { type: "diff", sessionID: sid, name, event: "cmd", command, ts: streamBuf.get(k)!.ts })
         }
-        pushSessions()
+        requestStatusPush()
         return
       }
 
@@ -528,7 +660,7 @@ export function startServer(
         }
         logBusy(k, msg.more === true, msg.more === true ? "cmdDone(more 保持 busy)" : "cmdDone")
         finalizeCommand(k)
-        pushSessions()
+        requestStatusPush()
         return
       }
 
@@ -564,6 +696,18 @@ export function startServer(
       }
 
       // ===== web 请求 =====
+
+      if (t === "list") {
+        // web 连接/重连后主动拉取一次会话列表（原依赖 2s 轮询被动收；改事件驱动后必须显式响应，
+        // 否则新开标签页要等兜底周期才有内容）。只回本连接，并按 json 去重。
+        const payload = buildSessions()
+        const json = JSON.stringify(payload)
+        if (json !== ws._lastSessionsJson) {
+          ws._lastSessionsJson = json
+          send(ws, { type: "sessions", ...payload })
+        }
+        return
+      }
 
       if (t === "subscribe") {
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
@@ -644,7 +788,7 @@ export function startServer(
         const existing = streamBuf.get(k)
         streamBuf.set(k, { data: existing && existing.done ? "" : existing?.data ?? "", done: false, ts: Date.now(), command })
         logBusy(k, true, "exec")
-        pushSessions()
+        requestStatusPush()
         send(agent, { type: "run-exec", reqId: `${sid}:${name}:${Date.now()}`, sessionID: sid, name, command })
         return
       }
@@ -663,8 +807,17 @@ export function startServer(
         const sid = typeof msg.sessionID === "string" ? msg.sessionID : ""
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid || !name) return
-        const agent = agentBySession.get(sessionKey(sid, name))
-        if (agent) send(agent, { type: "run-delete", sessionID: sid, name })
+        const k = sessionKey(sid, name)
+        const agent = agentBySession.get(k)
+        // 归属校验：仅当本服务**已被该 key 的 agent 认领**（agentBySession 内有此 key，即 agents 集合含它）
+        // 时才允许删盘上状态文件与 history 目录。port:0 多实例下每实例各起一个服务，未认领的 key 极可能
+        // 属于**别的 opencode 实例正在使用的活会话**，无条件删会 rmSync 掉别人的历史目录
+        // （本模块唯一真·数据丢失路径）→ 未认领一律拒绝删除并留一行日志便于排查。
+        if (!agent) {
+          log.info(`Web 页删除终端 ${sid}/${name} 被拒：本服务未认领该终端（无 agent 归属），跳过删除以免误删他实例数据`)
+          return
+        }
+        send(agent, { type: "run-delete", sessionID: sid, name })
         removeSessionState(dir, sid, name)
         // 删除该终端的 history 目录：buildSessions 会按 history 目录兜底列出离线历史终端，
         // 只删 state 文件不清目录会导致"删除后页面仍在"（残留被兜底扫描重新发现）
@@ -676,7 +829,7 @@ export function startServer(
         rawBuf.delete(sessionKey(sid, name))
         busyState.delete(sessionKey(sid, name))
         log.info(`Web 页删除终端 ${sid}/${name}`)
-        pushSessions()
+        requestStatusPush()
         return
       }
     })
@@ -690,6 +843,10 @@ export function startServer(
         for (const k of reg) agentBySession.delete(k)
         agents.delete(ws)
         infoDedup(`agent-disconnect:${keys.slice().sort().join(",")}`, `agent 断开（受影响终端: ${keys.length ? keys.map(keyTag).join(", ") : "无"}）`)
+        // 连接变化是状态事件：立即推一次（原靠 2s 轮询，最坏 2s 才反映离线；改事件驱动后即时）；
+        // 同时通知"agent 存在性"边沿（server-entry 据最后一个 agent 断开启动空闲计时）
+        notifyAgentPresence()
+        requestStatusPush()
       }
     })
   })
@@ -704,7 +861,18 @@ export function startServer(
         server,
         port: actualPort,
         url: `http://127.0.0.1:${actualPort}`,
-        close: () => { clearInterval(statusTimer); clearInterval(heartbeatTimer); server.close(); wss.close() },
+        close: () => {
+          if (statusPushTimer) { clearTimeout(statusPushTimer); statusPushTimer = null }
+          clearInterval(statusFallbackTimer)
+          clearInterval(heartbeatTimer)
+          server.close()
+          wss.close()
+        },
+        onAgentPresence: (cb) => {
+          presenceListeners.push(cb)
+          // 立即回报一次当前状态：订阅方（server-entry）据此决定是否已空闲（无 agent）
+          try { cb(agents.size > 0) } catch { /* 订阅回调异常不影响服务 */ }
+        },
       })
     })
   })

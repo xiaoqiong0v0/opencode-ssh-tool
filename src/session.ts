@@ -162,6 +162,8 @@ export class SshSession extends BaseSession {
 
               this._buffer = ""
               this._cursor = 0
+              // 初始化完成：发基线标记（seq=0），让首条命令也有"前驱"可裁剪，免疫控制台屏幕重放
+              this._sendBaselineMarker()
               resolve({ ok: true, host: opts.user, user: opts.user, port })
             })()
           },

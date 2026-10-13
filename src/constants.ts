@@ -21,6 +21,14 @@ export const INTERACTIVE_BUSY_MS = 500
 export const ANIMATION_WINDOW_MS = 5_000
 
 /**
+ * 后台收尾兜底监听间隔（毫秒）：命令进入后台（submit / exec 超动画窗口）后的**稀疏兜底**周期。
+ * 完成判定已改为**数据到达事件驱动**（`_appendBuffer` → `_checkCompletion`），此定时器不参与常规判定，
+ * 仅覆盖两类"非数据事件"：① 断连（子类只置 `_connected=false`、不回调基类）；
+ * ② 极端漏判保护（数据事件被异常吞掉）。空闲（无运行命令）时不挂任何定时器。
+ */
+export const FALLBACK_WATCH_INTERVAL_MS = 1_000
+
+/**
  * 语法/解析错误收尾的安静窗口（毫秒）：识别到 shell 语法错误后，先等输出停止增长此时长再收尾，
  * 确保 pwsh 异步/批量渲染的多行错误块被完整收进输出窗口。
  */
@@ -77,6 +85,38 @@ export const HEARTBEAT_TIMEOUT_MS = 10_000
  */
 export const HEARTBEAT_CLIENT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 2
 
+/**
+ * agent 实时推流最小间隔（毫秒）：推流改为**数据到达事件驱动**，同一间隔内到达的多次数据
+ * 合并为一帧（上限约 10Hz），避免高频输出时逐 chunk 打爆 WS；空闲无数据时不挂任何定时器。
+ */
+export const AGENT_PUSH_MIN_INTERVAL_MS = 100
+
+// ===== 会话状态（sessions）推送节奏：事件驱动 + 低频兜底 =====
+
+/**
+ * 状态推送合并窗口（毫秒）：状态改为**事件驱动**（cmdStart/cmdDone/busy 翻转/连接变化/会话增删/客户端拉取）即时触发，
+ * 多个事件在此窗口内合并为一次全量 build+广播，避免注册+cmdStart 之类的连发造成多次全量构建。
+ */
+export const STATUS_PUSH_DEBOUNCE_MS = 80
+
+/**
+ * 状态推送兜底周期（毫秒）：事件驱动已覆盖全部服务端内存态变化，此周期仅兜底**带外变化**
+ * （其他进程写状态文件导致的新终端 / pending / 标题变化等，服务端无对应事件），故取低频（≥10s）。
+ */
+export const STATUS_PUSH_FALLBACK_MS = 15_000
+
+/**
+ * 孤儿状态文件清理的服务启动宽限（毫秒）：服务刚启动时给存量 agent 一个"重连并注册"的窗口，
+ * 窗口内不按"未被认领"清理状态文件，避免把仍在运行、尚未重连的进程的文件误删。
+ */
+export const ORPHAN_STATE_GRACE_MS = 60_000
+
+/**
+ * 孤儿状态文件的最小陈旧阈值（毫秒）：状态文件 updatedAt 早于此值才允许按"未认领"清理，
+ * 避免误删刚写入、agent 尚未完成注册的文件。
+ */
+export const ORPHAN_STATE_MIN_AGE_MS = 10_000
+
 /** 注入总超时（含重试）：超过此时长仍无首个标记则断连报错 */
 export const INJECT_TIMEOUT_MS = 30_000
 
@@ -117,5 +157,6 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * 独立 HTTP 服务协议/代码版本号：插件的 server/agent 协议或服务端逻辑变更时递增。
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
+ * v18：register 增加 running 运行集合（注册时对账僵尸 busy）；状态推送改事件驱动+兜底；空闲关闭改事件驱动。
  */
-export const SERVER_PROTO_VERSION = 17
+export const SERVER_PROTO_VERSION = 18

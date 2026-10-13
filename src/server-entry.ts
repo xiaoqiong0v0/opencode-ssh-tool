@@ -2,11 +2,10 @@
 // 从状态文件+历史文件读取会话数据，并接受插件进程作为"代理"注册以转发交互命令。
 
 import { startServer, type SessionEntry } from "./server.js"
-import { listAllSessions } from "./session-store.js"
+import { atomicWriteJson } from "./session-store.js"
 import { loadConfig } from "./config.js"
 import { getWebLang } from "./i18n.js"
 import { SERVER_PROTO_VERSION } from "./constants.js"
-import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import log from "./log.js"
 
@@ -33,29 +32,32 @@ async function main(): Promise<void> {
   const handle = await startServer(port, getSessions, dir, lang, streamTickMs)
 
   // 写服务信息文件（供其他进程探测复用；proto 标识代码/协议版本，版本不符会触发重启）
-  writeFileSync(
-    join(dir, INFO_FILE),
-    JSON.stringify({ port: handle.port, host: "127.0.0.1", pid: process.pid, startedAt: Date.now(), proto: SERVER_PROTO_VERSION }),
-    "utf8",
-  )
+  // 原子写：其他实例可能在并发读 server.json，避免读到半截 JSON
+  atomicWriteJson(join(dir, INFO_FILE), { port: handle.port, host: "127.0.0.1", pid: process.pid, startedAt: Date.now(), proto: SERVER_PROTO_VERSION })
 
   log.info(`独立服务启动 ${handle.url} (pid ${process.pid}, proto ${SERVER_PROTO_VERSION})，内存流缓冲 streamBuf 初始为空（新进程不复用旧内存，旧进程追踪中的命令状态需 agent 重连后重新上报）`)
 
-  // 空闲自动关闭：无任何 connected 会话持续 idleShutdownMs 后退出（0=不关闭）
+  // 空闲自动关闭：改为**事件驱动**——不再每 tick 读状态文件（I/O），也不受残留状态文件 connected=true 影响
+  // （旧实现因此永不空闲）。空闲判定 = "是否还有 agent 连接"（等价于"是否还有插件进程在用本服务"）：
+  // 最后一个 agent 断开时启动计时，任一 agent 连接即取消；全程无 agent 时按同一超时关闭。
   if (idleShutdownMs > 0) {
-    let idleSince = Date.now()
-    setInterval(() => {
-      const anyConnected = listAllSessions(dir).some((s) => s.connected)
-      if (anyConnected) {
-        idleSince = Date.now()
-        return
-      }
-      if (Date.now() - idleSince >= idleShutdownMs) {
-        log.info(`空闲超过 ${idleShutdownMs}ms，独立服务自动关闭`)
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+    /** 启动（重置）空闲关闭计时器：到点仍无 agent 连接则关闭本服务 */
+    const scheduleIdle = (): void => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        log.info(`空闲超过 ${idleShutdownMs}ms（无 agent 连接），独立服务自动关闭`)
         handle.close()
         process.exit(0)
+      }, idleShutdownMs)
+    }
+    handle.onAgentPresence((present) => {
+      if (present) {
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+        return
       }
-    }, Math.min(30000, Math.max(5000, idleShutdownMs)))
+      scheduleIdle()
+    })
   }
 
   const shutdown = (): void => {

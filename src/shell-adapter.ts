@@ -24,8 +24,14 @@ export interface ShellAdapter {
    */
   readonly windowsShell: boolean
   parseProbe(output: string): boolean
-  /** 每条命令后追加的完成标记命令（seq 为命令序号，独立一行执行） */
-  markerCmd(seq: number): string
+  /**
+   * 每条命令后追加的完成标记命令（独立一行执行）。
+   * 标记格式 `<SSH_DONE:<nonce>:<seq>:<退出码>>`：`nonce` 为**会话级随机短串**，
+   * 用于区分"本会话的标记"与"别的会话经控制台重放混入的标记"——只认自己 nonce，防跨会话冒充。
+   * @param nonce 本会话随机串（每会话固定，构造时生成）
+   * @param seq 命令序号
+   */
+  markerCmd(nonce: string, seq: number): string
   /**
    * 多行命令的组包裹：把多行命令包成**一条**命令（一次输入 = 一条命令 = 一段输出），
    * 避免 shell 逐行执行导致回显与输出交错、中间输出在提取时丢失；heredoc 分隔符行必须独占一行，
@@ -52,27 +58,33 @@ export interface ShellAdapter {
   readonly syntaxErrorRe: RegExp | null
 }
 
-// ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:seq:退出码>） =====
+// ===== 完成标记检测（在原始字节流中定位/剥离 <SSH_DONE:[nonce:]seq:退出码>） =====
+// 标记格式演进：旧 `<SSH_DONE:seq:code>` / `<SSH_DONE:code>`；新 `<SSH_DONE:nonce:seq:code>`（nonce 为会话级随机串）。
+// 剥离与检测须同时兼容两者（重放的历史字节可能是旧格式），但**只认自己 nonce** 的标记作为完成依据。
 
-/** 匹配任意完成标记（含序号式 <SSH_DONE:seq:code> 与无序号 <SSH_DONE:code>，退出码在末尾）；前缀取自 DONE_TAG，< 与 : 在正则中均为字面量 */
-const DONE_RE = new RegExp(DONE_TAG + "(?:\\d+:)?(-?\\d+)>", "g")
+/** 匹配任意求值后的完成标记（含 nonce 式 / 序号式 / 无序号，退出码在末尾）；前缀取自 DONE_TAG，< 与 : 在正则中均为字面量 */
+const DONE_RE = new RegExp(DONE_TAG + "(?:[0-9A-Za-z]+:)?(?:\\d+:)?(-?\\d+)>", "g")
 
-/** 检测指定序号命令的完成标记 */
-function doneSeqRe(seq: number): RegExp {
-  return new RegExp(`${DONE_TAG}${seq}:(-?\\d+)>`, "g")
+/** 检测指定会话、指定序号命令的完成标记（nonce 精确匹配，别会话重放的标记不会被误认） */
+function doneSeqRe(nonce: string, seq: number): RegExp {
+  const esc = nonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(`${DONE_TAG}${esc}:${seq}:(-?\\d+)>`, "g")
 }
 
 /** 终端中断回显：Ctrl-C 由 TTY 层回显为 ^C（ECHOCTL 开启），与 shell 框架无关 */
 const INTERRUPT_ECHO = "^C"
 
 /**
- * 判断命令是否完成：检测指定序号 <SSH_DONE:seq:<码>> 的完成标记（只认当前命令，防残留误判）
+ * 判断命令是否完成：检测本会话 nonce + 指定序号 `<SSH_DONE:nonce:seq:<码>>` 的完成标记。
+ * 同时要求 nonce 与 seq 精确匹配：既防同会话残留标记误判，也防**别的会话经控制台重放**
+ * 混入的标记被当成本命令完成（旧格式只有 seq，新会话首条命令的 seq 必然与重放会话撞号）。
  * @param buffer 原始字节流
  * @param fromPos 搜索起点
+ * @param nonce 本会话随机串
  * @param seq 当前命令序号
  */
-export function detectLastDoneMarker(buffer: string, fromPos: number, seq: number): { done: boolean; exitCode: number; pos: number } {
-  const m = findLastMatch(doneSeqRe(seq), buffer, fromPos)
+export function detectLastDoneMarker(buffer: string, fromPos: number, nonce: string, seq: number): { done: boolean; exitCode: number; pos: number } {
+  const m = findLastMatch(doneSeqRe(nonce, seq), buffer, fromPos)
   if (!m) return { done: false, exitCode: 0, pos: 0 }
   return { done: true, exitCode: parseInt(m[1], 10) || 0, pos: m.index + m[0].length }
 }
@@ -329,9 +341,9 @@ class ZshAdapter implements ShellAdapter {
   readonly stmtSep = ";"
   readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
   readonly syntaxErrorRe = POSIX_SYNTAX_ERROR_RE
-  markerCmd(seq: number): string {
+  markerCmd(nonce: string, seq: number): string {
     // 结尾补换行：否则 zsh 判定"上条输出未以换行结束"，会补印 PROMPT_EOL_MARK（root 为 #）污染画面
-    return `printf '\\n${DONE_TAG}${seq}:%s>\\n' $?`
+    return `printf '\\n${DONE_TAG}${nonce}:${seq}:%s>\\n' $?`
   }
   groupWrap(body: string): string | null {
     // `{ }` 命令组在当前作用域执行（保留 cd/变量）；未闭合的 `{` 会让 zsh 进入 PS2 续行，
@@ -354,9 +366,9 @@ class BashAdapter implements ShellAdapter {
   readonly stmtSep = ";"
   readonly windowsShell = false // POSIX shell 走 Unix PTY，\n 可正常提交行，无需改写为 \r
   readonly syntaxErrorRe = POSIX_SYNTAX_ERROR_RE
-  markerCmd(seq: number): string {
+  markerCmd(nonce: string, seq: number): string {
     // bash 无 PROMPT_EOL_MARK，标记无需补尾换行（补了反而在 raw 里多顶一行）
-    return `printf '\\n${DONE_TAG}${seq}:%s>' $?`
+    return `printf '\\n${DONE_TAG}${nonce}:${seq}:%s>' $?`
   }
   groupWrap(body: string): string | null {
     // `{ }` 命令组在当前作用域执行（保留 cd/变量）；未闭合的 `{` 会让 bash 进入 PS2 续行
@@ -378,10 +390,10 @@ class PwshAdapter implements ShellAdapter {
   readonly stmtSep = ";"
   readonly windowsShell = true // pwsh 运行在 Windows 控制台（ConPTY），裸 \n 不提交行，多行命令写入须用 \r
   readonly syntaxErrorRe = PWSH_SYNTAX_ERROR_RE
-  markerCmd(seq: number): string {
+  markerCmd(nonce: string, seq: number): string {
     // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
     // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
-    return `Write-Output "${DONE_TAG}${seq}:$LASTEXITCODE>"`
+    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$LASTEXITCODE>"`
   }
   groupWrap(body: string): string | null {
     // 点源 `. { }` 在当前作用域执行（保留变量/状态）；不可用 `& { }`（子作用域会丢变量/状态）。
@@ -407,8 +419,8 @@ class CmdAdapter implements ShellAdapter {
   // `命令语法不正确。`），按字节无法稳定识别；且 cmd 错误以 `&` 分隔的后续命令仍会执行，
   // 完成标记照常输出，标记法已完成判定，无需该信号
   readonly syntaxErrorRe = null
-  markerCmd(seq: number): string {
-    return `echo ${DONE_TAG}${seq}:%errorlevel%>`
+  markerCmd(nonce: string, seq: number): string {
+    return `echo ${DONE_TAG}${nonce}:${seq}:%errorlevel%>`
   }
   groupWrap(_body: string): string | null {
     // cmd 不包组：组内 `%errorlevel%` 是解析期展开，退出码会失真；保持原样逐行执行

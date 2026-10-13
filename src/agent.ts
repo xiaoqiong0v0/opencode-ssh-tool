@@ -1,8 +1,8 @@
 // 代理客户端：插件进程连上独立服务（WS），注册本进程持有的会话，
 // 处理服务转发来的交互命令（run-exec / run-send / run-delete），并把实时流推给服务。
 
-import log, { debug, describeSend, infoDedup, infoDedupShared } from "./log.js"
-import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS } from "./constants.js"
+import log, { debug, describeSend, infoDedup, infoDedupShared, tailLines } from "./log.js"
+import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS, AGENT_PUSH_MIN_INTERVAL_MS } from "./constants.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
 export interface AgentSession {
@@ -12,10 +12,10 @@ export interface AgentSession {
   hasRunningStream(): boolean
   getRunningStream(): { data: string; done: boolean }
   getRunningCommand(): string
-  /** 设置是否保持 busy（排队序列期间为 true，最后一条完成才清） */
-  setHoldBusy(hold: boolean): void
   /** 设置命令生命周期监听器（cmdStart/cmdDone 事件源） */
   setLifecycle(listener: ((ev: { type: "start"; command: string; ts: number } | { type: "done"; exitCode: number | null; endTs: number; output?: string }) => void) | null): void
+  /** 设置数据到达监听器（终端有新输出时回调，供事件驱动推流；null 清除） */
+  setDataListener(listener: (() => void) | null): void
   /** 读取原始字节流增量 */
   readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
   /** 会话实例代次：同名重建/进程重启后变化，用于判定新会话并重置 raw 增量游标 */
@@ -43,8 +43,11 @@ export function startAgent(
 ): AgentHandle {
   let ws: WebSocket | null = null
   let closed = false
-  let timer: ReturnType<typeof setInterval> | null = null
-  /** 心跳检测定时器（与 pushStreams 的 timer 分开，断开时一并清理） */
+  /** 推流合并定时器（数据事件驱动：一次只挂一个 setTimeout，把窗口内多次到达合并成一帧） */
+  let pushTimer: ReturnType<typeof setTimeout> | null = null
+  /** 最近一次实际推流时刻（毫秒），用于计算下一次最早可推时刻（节流合流） */
+  let lastPushAt = 0
+  /** 心跳检测定时器（与推流合并定时器分开，断开时一并清理） */
   let hbTimer: ReturnType<typeof setInterval> | null = null
   /** 最近一次收到 server 应用层 ping 的时刻（毫秒）；静默超过 HEARTBEAT_CLIENT_TIMEOUT_MS 即判定服务端半开 */
   let lastPingAt = 0
@@ -56,21 +59,72 @@ export function startAgent(
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
   }
 
+  /**
+   * 收集"当前正在运行命令"的终端集合（供 server 注册时对账）。
+   * 与 register.sessions（本进程认领的全部终端）配套：server 把"被认领但不在运行集合内"的
+   * 残留 busy 收尾，修复断线期间 cmdDone 丢失导致的僵尸 busy（server 内存 done=false 永不收尾）。
+   * 无法确定即返回 undefined（不臆测）：某认领终端取不到句柄、或枚举抛异常时整体降级；
+   * server 收到非数组会只记一行"未能对账"并保持现状（宁可保留，也不误判在线命令已完成）。
+   * @returns 运行中终端列表；无法确定时 undefined
+   */
+  const collectRunning = (): Array<{ sessionID: string; name: string }> | undefined => {
+    try {
+      const out: Array<{ sessionID: string; name: string }> = []
+      for (const { sessionID, name } of listSessions()) {
+        const s = resolveSession(sessionID, name)
+        if (!s) return undefined // 有认领却取不到句柄：该终端状态无法确定
+        if (s.hasRunningStream()) out.push({ sessionID, name })
+      }
+      return out
+    } catch {
+      return undefined
+    }
+  }
+
   const register = (): void => {
-    send({ type: "register", sessions: listSessions() })
+    // 同批上报认领的会话列表 + 其中真正运行命令的子集，供 server 注册时做运行态对账
+    send({ type: "register", sessions: listSessions(), running: collectRunning() })
+    // 注册后调度一次推流：挂接新增/重建会话的监听，并推送初始 raw（代次变化时带 reset）。
+    // 会话增删经 index.refreshAgent→reRegister 到这里，不依赖任何周期轮询。
+    schedulePush()
   }
 
   /** raw 增量游标：按会话实例代次记录已推位置；代次不同即新会话，从 0 重新读 */
   const rawPosMap = new Map<string, { gen: string; pos: number }>()
   /** 已挂接生命周期监听的会话对象（按对象去重：同名会话断开重建是新对象，需重新挂接） */
   const lifeHooked = new WeakSet<object>()
+  /** 已挂接数据到达监听的会话对象（按对象去重，同上：重建后的新对象需重新挂接） */
+  const dataHooked = new WeakSet<object>()
   /** 会话执行队列：命令 busy 时 web 提交的命令排队，当前命令完成后依次执行（key=sessionID:name） */
   const execQueue = new Map<string, string[]>()
   /** 各终端最近一次命令提交时间戳（busy 分流：<阈值视为连续命令排队，≥阈值视为交互输入 send） */
   const lastSubmitTs = new Map<string, number>()
 
-  /** 为某个会话挂接生命周期监听：cmdStart/cmdDone 由 BaseSession 精确发出（web exec 与插件 exec 统一来源） */
-  const hookLifecycle = (key: string, session: AgentSession): void => {
+  /**
+   * 事件驱动的推流调度（节流合并）：由数据到达事件、注册/重连触发，取代原固定 100ms 轮询。
+   * - 空闲（无数据、无注册）时不挂任何定时器 → 零周期回调；
+   * - 到达时：距上次推流已满最小间隔则尽快推（wait=0，前沿），否则挂一个 setTimeout 等到满间隔再推，
+   *   窗口内多次到达只挂一个定时器、合并为一帧（尾沿），避免逐 chunk 打爆 WS；
+   * - 回调始终读取各会话最新游标，窗口内到达的数据必然被这一帧带走，绝不漏推。
+   */
+  const schedulePush = (): void => {
+    if (pushTimer !== null) return
+    const wait = Math.max(0, AGENT_PUSH_MIN_INTERVAL_MS - (Date.now() - lastPushAt))
+    pushTimer = setTimeout(() => {
+      pushTimer = null
+      lastPushAt = Date.now()
+      pushStreams()
+    }, wait)
+  }
+
+  /** 为一个会话挂接监听：数据到达（驱动推流调度）+ 生命周期（cmdStart/cmdDone，BaseSession 精确发出） */
+  const hookSession = (key: string, session: AgentSession): void => {
+    if (!dataHooked.has(session)) {
+      dataHooked.add(session)
+      // 会话每有新输出即调度一次合并推流：ssh2 的 stream.on("data") 与本地 PTY 的 data 回调
+      // 最终都汇入 BaseSession._appendBuffer，在那统一触发本监听
+      session.setDataListener(() => schedulePush())
+    }
     if (lifeHooked.has(session)) return
     lifeHooked.add(session)
     const sep = key.indexOf(":")
@@ -117,9 +171,8 @@ export function startAgent(
       const q = execQueue.get(key)
       const next = q?.shift()
       if (q && q.length === 0) execQueue.delete(key)
-      if (next) { log.info(`agent 队列出队执行 ${sid}/${name}: ${next}`); return execQueued(sid, name, next) }
-      // 队列已空：排队序列结束，放开 busy 保持
-      resolveSession(sid, name)?.setHoldBusy(false)
+      if (next) { log.info(`agent 队列出队执行 ${sid}/${name} cmdLen=${next.length}`); debug(`agent 队列出队命令 ${sid}/${name} cmd=${tailLines(next, 3)}`); return execQueued(sid, name, next) }
+      // 队列已空：序列结束（各命令的 busy 由自身 cmdDone 生命周期收尾，无需额外状态处理）
       return
     }).catch((e) => {
       log.error(`代理执行失败 ${sid}/${name}`, e instanceof Error ? e.message : String(e))
@@ -129,8 +182,7 @@ export function startAgent(
       const q = execQueue.get(key)
       const next = q?.shift()
       if (q && q.length === 0) execQueue.delete(key)
-      if (next) { log.info(`agent 队列异常后出队 ${sid}/${name}: ${next}`); return execQueued(sid, name, next) }
-      resolveSession(sid, name)?.setHoldBusy(false)
+      if (next) { log.info(`agent 队列异常后出队 ${sid}/${name} cmdLen=${next.length}`); debug(`agent 队列异常后出队命令 ${sid}/${name} cmd=${tailLines(next, 3)}`); return execQueued(sid, name, next) }
       return
     })
   }
@@ -140,7 +192,7 @@ export function startAgent(
       const session = resolveSession(sessionID, name)
       const key = `${sessionID}:${name}`
       if (!session) continue
-      hookLifecycle(key, session)
+      hookSession(key, session)
       // 代次变化 = 同名会话已重建（新实例）：丢弃旧游标从 0 重读；即使暂无新数据也要上报（带 reset），
       // 让 server 立即清空该 key 的 rawBuf 并给订阅者下发清屏，不能依赖"新数据恰好非空"
       const prev = rawPosMap.get(key)
@@ -212,7 +264,8 @@ export function startAgent(
       if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
       lastPingAt = Date.now()
       hbTimer = setInterval(checkServerAlive, HEARTBEAT_INTERVAL_MS)
-      timer = setInterval(pushStreams, 100)
+      // 推流不再挂固定周期定时器：register() 已调度一次（挂接监听 + 推送初始 raw/reset），
+      // 之后完全由数据到达事件驱动（见 schedulePush）。补播 cmdStart 见上，与推流周期无关。
     }
     ws.onmessage = (ev: MessageEvent) => {
       let msg: Record<string, unknown>
@@ -236,11 +289,13 @@ export function startAgent(
         //   间隔 ≥ 阈值仍 busy（用户给运行中的交互程序输入，如 sudo 密码/REPL）→ 原样 send 交程序。
         // 不再用 hasRunningStream() 单点猜测——快速命令窗口内到达的后续命令会被误判为交互输入而裸执行。
         const key = `${sid}:${name}`
+        // 兜底挂接监听：正常由 register()→pushStreams 挂接；此处确保命令真正执行前生命周期/数据监听已生效
+        hookSession(key, session)
         const now = Date.now()
         const last = lastSubmitTs.get(key) ?? 0
         lastSubmitTs.set(key, now)
         // 排队序列执行中（队列非空）：新命令排队，等序列结束再执行；
-        // 不能走 send（那是给交互程序的输入），也不能直接 exec（hold busy 会 quick-fail）
+        // 不能走 send（那是给交互程序的输入），也不能直接 exec（busy 期间 exec 会 quick-fail）
         if ((execQueue.get(key)?.length ?? 0) > 0) {
           execQueue.get(key)!.push(command)
           log.info(`agent run-exec 序列中排队 ${sid}/${name}: ${describeSend(command)} (队列 ${execQueue.get(key)!.length})`)
@@ -282,7 +337,7 @@ export function startAgent(
       }
     }
     ws.onclose = () => {
-      if (timer) { clearInterval(timer); timer = null }
+      if (pushTimer) { clearTimeout(pushTimer); pushTimer = null }
       if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
       if (closed) return
       // 断开时记录受影响的终端列表；重连每 2s 重试一次，用 10s 窗口去重避免刷屏（重复次数附在汇总行）。
@@ -303,7 +358,7 @@ export function startAgent(
   return {
     close: () => {
       closed = true
-      if (timer) { clearInterval(timer); timer = null }
+      if (pushTimer) { clearTimeout(pushTimer); pushTimer = null }
       if (hbTimer) { clearInterval(hbTimer); hbTimer = null }
       try { ws?.close() } catch { /* ignore */ }
     },
