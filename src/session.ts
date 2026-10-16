@@ -1,5 +1,5 @@
 // SshSession：ssh2 长驻连接 + PTY shell 管理，
-// 完成标记法：注入 PROMPT_COMMAND 脚本，命令完成时输出 <SSH_DONE:退出码>
+// 完成标记法：每条命令后追加一条标记命令，完成后输出 <SSH_DONE:nonce:seq:退出码>（不依赖 PROMPT_COMMAND/PS1 钩子）
 
 import { Client, type ConnectConfig } from "ssh2"
 import log, { isDebugEnabled, ssh2Trace } from "./log.js"

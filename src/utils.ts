@@ -156,7 +156,8 @@ export function echoRegexSourceLength(command: string): number {
 
 /**
  * 定位命令回显行在原始流中的结束位置（供流式增量定位使用）：
- * 丢弃窗口开头到"命令回显行结束"之前的一切内容（提示符、PS1 填充、光标定位噪音均在内）。
+ * 丢弃窗口开头到"命令回显行结束"之前的一切内容——**靠命令文本自锚定，不判断提示符形态**；
+ * 提示符 / PS1 填充 / 光标定位噪音都随这段前缀被一并丢弃（无需识别其长什么样）。
  * 命令回显行 = 命令文本首次出现所在行（命令本身可能含 \033 等转义）。
  * 命令文本后允许任意行内字符直到行尾：命令可能被追加完成标记（如 `cmd ;printf '<SSH_DONE…>'`），
  * 此时回显是整行拼接，不能要求命令后紧跟换行。
@@ -200,9 +201,9 @@ export function extractOutputStart(raw: string, command: string, endBound = raw.
 }
 
 /**
- * 剥离"提示符 + 命令回显"，只保留程序纯输出：
- * shell 提示符（含背景填充、zle 重绘序列）依赖其自身终端屏幕状态，字节流脱离该状态无法忠实还原，
- * 故丢弃窗口开头到"命令回显行结束"之前的一切内容（提示符、PS1 填充、光标定位噪音均在内）。
+ * 剥离"命令回显前缀"（含提示符 / PS1 填充 / 光标噪音），只保留程序纯输出：
+ * **靠命令文本自锚定，不判断提示符形态**（提示符依赖终端自身屏幕状态、且形态可变，不可识别），
+ * 故丢弃窗口开头到"命令回显行结束"之前的一切内容——前缀里的提示符/填充/噪音随之一并丢弃。
  * 命令回显行 = 命令文本首次出现所在行（命令本身可能含 \033 等转义）。
  * 命中后切到"命令文本结束处"：zsh 下程序输出可能直接粘连在回显尾（无换行），不能按换行截断。
  * @param raw 原始终端流（含 ANSI）
@@ -215,44 +216,12 @@ export function extractOutput(raw: string, command: string): string {
   return raw.slice(end).replace(/^[\r\n]+/, "")
 }
 
-/** 行归一化：剥 ANSI、去行尾 \r 与尾空白，用于提示符行比较（提示符常带尾空格与颜色序列） */
+/**
+ * 行归一化：剥 ANSI、去行尾 \r 与尾空白。
+ * 只服务"探针回显前缀是否还有可见字符"的**存在性**判断（与 `""` 比较），
+ * 不再作提示符相等基准——提示符形态随 cwd/profile/主题变化，不可判断。
+ */
 const normLine = (s: string): string => stripAnsi(s).replace(/\r$/, "").trimEnd()
-
-/**
- * 取文本首个非空行（剥 ANSI 后判定），无则返回空串
- * @param s 文本
- * @returns 首个非空行原文（未剥 ANSI）；不存在返回 ""
- */
-function firstNonEmptyLine(s: string): string {
-  for (const line of s.split("\n")) {
-    if (normLine(line) !== "") return line
-  }
-  return ""
-}
-
-/**
- * 剥离输出尾部 shell 重印的提示符行（语法错误收尾专用）：
- * 命令因语法错误作废后 shell 会重新打印提示符，该行与命令发起前的旧提示符行同形，属终端画面噪音、
- * 非命令输出，保留会让模型多看到一行提示符。候选基准两处：
- * - 捕获窗口首个非空行（窗口含旧提示符行的场景，如不等待结果的 submit 提交 startPos=0）；
- * - 命令发起前缓冲末行（exec 窗口自命令回显起，旧提示符在窗口之外，由调用方单独传入）。
- * @param out 纯输出流（命令回显结束 → 窗口末尾，可能以重印的提示符行结尾）
- * @param window 捕获窗口原始流（用于取窗口开头那行作候选）
- * @param promptRef 命令发起前缓冲末行（旧提示符行，另一候选；空串表示不可用）
- * @returns 末行与任一候选相同（剥 ANSI/尾空白后比较）时剥掉末行；否则原样返回
- */
-export function stripTrailingPromptLine(out: string, window: string, promptRef: string): string {
-  const nl = out.lastIndexOf("\n")
-  if (nl < 0) return out
-  const last = normLine(out.slice(nl + 1))
-  if (last === "") return out
-  for (const cand of [firstNonEmptyLine(window), promptRef]) {
-    const ref = normLine(cand)
-    // 连行尾 \r 一并去掉：剥掉提示符行后仅剩的 \r 会成为输出末尾的孤立回车
-    if (ref !== "" && ref === last) return out.slice(0, nl).replace(/\r$/, "")
-  }
-  return out
-}
 
 /**
  * 探针回显"单个匹配区间的跨度上限"（字符，含字符间插入的 ANSI 与空白）。
@@ -279,15 +248,15 @@ export function findAnsiTolerantFirstRange(text: string, needle: string): { star
 }
 
 /**
- * 判定一行是否"仅剩提示符"（D1 判据）：剥净 ANSI、去行尾 \r 与尾空白后，与提示符基准逐字相等。
- * 只认"整行恰为提示符"，不放宽；基准为空串时恒 false（宁可留脏，不可误删）。
- * @param line 待判定行（原始，可含 ANSI）
- * @param promptRef 提示符基准（命令发起前缓冲末行，与 stripTrailingPromptLine 同源判据）
- * @returns true 表示该行可见内容恰为提示符
+ * 判定探针回显前缀是否已无任何可见字符（D1 判据）：该行删掉探针回显后若只剩空白/ANSI 前缀，
+ * 说明**探针回显是本行首个可见 token** → 整行丢弃。
+ * 只做存在性判断，不与任何提示符基准比较（提示符形态随 cwd/profile/主题变化，不可判断）；
+ * 前缀含可见字符则保留（行中打断场景下前缀可能是真输出，宁可留脏，不可误删）。
+ * @param head 探针回显起点之前的行前缀（已回退掉紧邻 ANSI）
+ * @returns true 表示前缀无任何可见字符
  */
-export function isPromptOnlyLine(line: string, promptRef: string): boolean {
-  const ref = normLine(promptRef)
-  return ref !== "" && normLine(line) === ref
+function hasNoVisiblePrefix(head: string): boolean {
+  return normLine(head) === ""
 }
 
 /**
@@ -317,15 +286,14 @@ function backOverAnsi(line: string, pos: number): number {
  * 剔除探针命令回显行（含 shell 语法高亮插入的 ANSI 与提示符前缀）：
  * 逐行处理，对每行 ANSI 容忍地定位任一 needle 的首次出现；命中且跨度不超 PROBE_ECHO_MAX_SPAN 时，
  * 删除「探针回显起点（含其前紧邻 ANSI 色码）→ 该行行尾」——**只向后删、绝不向前越过可见字符**：
- * 保留行中探针之前的真输出（行中打断场景），提示符前缀留在行首，
- * 再由 D1 判据（该行可见内容 == 提示符）决定是否整行删除。
+ * 保留行中探针之前的真输出（行中打断场景）；若探针回显即本行首个可见 token（前缀无可见字符）则整行丢弃，
+ * 否则保留其前缀（可能是真输出，也可能是提示符，不再与提示符基准比较）。
  * 无命中行逐字节不变；Raw 视图不经此函数，保留原始字节。
  * @param text 可见输出文本
  * @param needles 探针命令文本（各 seq；含会话 nonce，故不会命中别的会话/nonce 的探针）
- * @param promptRef 提示符基准（D1 用）
  * @returns 剔除后文本
  */
-export function removeProbeEchoLines(text: string, needles: string[], promptRef: string): string {
+export function removeProbeEchoLines(text: string, needles: string[]): string {
   if (needles.length === 0 || text === "") return text
   const kept: string[] = []
   for (const line of text.split("\n")) {
@@ -342,7 +310,7 @@ export function removeProbeEchoLines(text: string, needles: string[], promptRef:
       continue
     }
     const head = line.slice(0, backOverAnsi(line, cut)) // 护栏③：只删探针起点→行尾，保留该行前半真输出
-    if (isPromptOnlyLine(head, promptRef)) continue // D1：删后仅剩提示符 → 整行丢弃
+    if (hasNoVisiblePrefix(head)) continue // D1：探针回显即本行首个可见 token → 整行丢弃
     kept.push(head)
   }
   return kept.join("\n")
@@ -405,15 +373,6 @@ function writeHeadless(term: HeadlessTerminal, data: string): Promise<void> {
       done()
     })
   })
-}
-
-/**
- * 末尾空白清理（原为提示符剥离，现仅做清理，不依赖正则匹配具体提示符形状）
- * @param s 文本
- * @returns 清理后文本
- */
-export function stripPrompt(s: string): string {
-  return s.trimEnd()
 }
 
 /**

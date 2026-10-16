@@ -393,7 +393,17 @@ class PwshAdapter implements ShellAdapter {
   markerCmd(nonce: string, seq: number): string {
     // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
     // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
-    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$LASTEXITCODE>"`
+    // 退出码必须恒为数字：$LASTEXITCODE 只由**原生命令**（git/npm/cmd 等）设置，命令全是 cmdlet
+    // （如 `echo x; Write-Output y`）时它是 $null，直接插值得到空串 → marker 成 `<...:>`，而检测
+    // 正则要求至少一位数字 → 永不匹配 → busy 永不清除、中断周期反复补探针直至无限刷屏。
+    // 取 `[int]` 转换（实测 PS 5.1：$null→0，非空原样透出，负码/0/255 均不变），理由：
+    // ①不用 `$?`——if/比较表达式本身会覆盖 `$?`，不可靠；
+    // ②不用 `$(if ($null -eq $LASTEXITCODE) {0} else {$LASTEXITCODE})`——语义虽同但可见长度
+    //   从 ~50 涨到 ~97，挤占回显剔除的跨度上限（utils.PROBE_ECHO_MAX_SPAN），且原生命令退出码
+    //   本就是 Int32，[int] 对非空值是恒等转换，不会改写正常码。
+    // 已知取舍（有意为之）：cmdlet 失败不进 $LASTEXITCODE，回落值只能报 0——退出码对纯 cmdlet 命令
+    // 本就不具判别力，宁可"失败也报 0"，也不能让 busy 卡死。
+    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$([int]$LASTEXITCODE)>"`
   }
   groupWrap(body: string): string | null {
     // 点源 `. { }` 在当前作用域执行（保留变量/状态）；不可用 `& { }`（子作用域会丢变量/状态）。
