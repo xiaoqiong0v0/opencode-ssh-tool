@@ -393,17 +393,29 @@ class PwshAdapter implements ShellAdapter {
   markerCmd(nonce: string, seq: number): string {
     // 用 Write-Output（success 管线）而非 Write-Host：Write-Host 直写 host 流会抢在
     // cmdlet 输出（经格式化器批量渲染）之前，导致 marker 落在命令输出之前、提取时把输出裁掉
-    // 退出码必须恒为数字：$LASTEXITCODE 只由**原生命令**（git/npm/cmd 等）设置，命令全是 cmdlet
-    // （如 `echo x; Write-Output y`）时它是 $null，直接插值得到空串 → marker 成 `<...:>`，而检测
-    // 正则要求至少一位数字 → 永不匹配 → busy 永不清除、中断周期反复补探针直至无限刷屏。
-    // 取 `[int]` 转换（实测 PS 5.1：$null→0，非空原样透出，负码/0/255 均不变），理由：
-    // ①不用 `$?`——if/比较表达式本身会覆盖 `$?`，不可靠；
-    // ②不用 `$(if ($null -eq $LASTEXITCODE) {0} else {$LASTEXITCODE})`——语义虽同但可见长度
-    //   从 ~50 涨到 ~97，挤占回显剔除的跨度上限（utils.PROBE_ECHO_MAX_SPAN），且原生命令退出码
-    //   本就是 Int32，[int] 对非空值是恒等转换，不会改写正常码。
-    // 已知取舍（有意为之）：cmdlet 失败不进 $LASTEXITCODE，回落值只能报 0——退出码对纯 cmdlet 命令
-    // 本就不具判别力，宁可"失败也报 0"，也不能让 busy 卡死。
-    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$([int]$LASTEXITCODE)>"`
+    // 退出码必须恒为数字（三个分支 0 / 1 / $LASTEXITCODE 求值结果均是数字）：检测正则要求
+    // 至少一位数字，空码 → 永不匹配 → busy 永不清除、中断周期反复补探针直至无限刷屏。
+    //
+    // 取值次序 `$?` 优先、`$LASTEXITCODE` 次之（真实 5.1 与 7 实测，见 .tmp/scratch/marker-out.txt）：
+    // ① $LASTEXITCODE 只由**原生命令**设置且**永不清除**——实测 `cmd /c exit 3 ; echo hi` 之后它
+    //    仍是 3（cmdlet 成功不改写它）。所以旧写法 `$([int]$LASTEXITCODE)` 会给**成功**的纯 cmdlet
+    //    命令报出上一条原生命令的残留码（第二个失真），而单用"$LASTEXITCODE 非空就用它"（候选 A）
+    //    同样中招（实测 T5b：报 3，期望 0）。
+    // ② $? 反映**最近一条语句**成败（原生非 0 退出也算 False），且追加语句里"求值先于覆盖"：
+    //    实测失败 cmdlet 后 `$ok = $?` 得 False、成功得 True；字符串插值 `$(if($?)…)` 的条件求值
+    //    同样先读到用户命令的 $?（实测 `Get-Item /nope` → 标记 1、`cmd /c exit 3` → 标记 3），
+    //    推翻了旧注释"if 表达式会覆盖 $? 所以不可用"的顾虑——被覆盖发生在语句完成后，读在其前。
+    // ③ 于是三分支语义：$? True → 0（无论有无残留码，成功命令就该报 0）；$? False → 有残留/本轮
+    //    原生非 0 码就原样透出（exit 3 → 3），否则（纯 cmdlet 失败）报 1（失败必非 0）。
+    //
+    // 已知残留失真（远小于旧写法）：仅"$? False 且失败者是 cmdlet、而残留原生码非 0"时透出的是
+    // 残留数字而非本轮真实码（实测 `cmd /c exit 7 ; Get-Item /nope` → 7），但**永远非 0**，判别方向
+    // 正确。要彻底消除须在用户命令**前**重置 $LASTEXITCODE（候选 B），而 markerCmd 只能追加在命令后、
+    // 前置需改 base-session 的拼接结构（超出本处改动边界），故取当前组合。
+    //
+    // 长度取舍：标记可见长度 58 → 92（候选 C2b 嵌套 94、A 98 均无增益不取），回显剔除跨度上限
+    // utils.PROBE_ECHO_MAX_SPAN=200（跨度≈标记长+高亮 SGR），92+SGR 仍余 ~100 余量，可用。
+    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$(if($?){0}elseif($LASTEXITCODE){$LASTEXITCODE}else{1})>"`
   }
   groupWrap(body: string): string | null {
     // 点源 `. { }` 在当前作用域执行（保留变量/状态）；不可用 `& { }`（子作用域会丢变量/状态）。
