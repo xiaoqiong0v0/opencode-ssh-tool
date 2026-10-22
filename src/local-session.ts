@@ -36,6 +36,9 @@ export class LocalSession extends BaseSession {
 
   protected get _extraResult(): Partial<ExecResult> { return {} }
 
+  /** 本地会话：发送前语法预检可接 */
+  get isLocal(): boolean { return true }
+
   protected _ready(): boolean {
     return this._connected && this._term !== null && this._adapter !== null
   }

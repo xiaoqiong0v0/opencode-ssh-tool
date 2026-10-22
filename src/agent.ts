@@ -3,6 +3,7 @@
 
 import log, { debug, describeSend, infoDedup, infoDedupShared, tailLines } from "./log.js"
 import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS, AGENT_PUSH_MIN_INTERVAL_MS } from "./constants.js"
+import { precheckBeforeExec } from "./precheck.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
 export interface AgentSession {
@@ -20,6 +21,10 @@ export interface AgentSession {
   readRawStream(pos: number): { data: string; pos: number; reset?: boolean }
   /** 会话实例代次：同名重建/进程重启后变化，用于判定新会话并重置 raw 增量游标 */
   readonly generation: string
+  /** 探测到的 shell 适配器名（供发送前语法预检选择校验器） */
+  readonly shellName: string | null
+  /** 是否本地会话（SSH 远程不接预检） */
+  readonly isLocal: boolean
 }
 
 /** 代理状态 */
@@ -149,15 +154,27 @@ export function startAgent(
 
   /** 执行单条命令；完成后从队列取下一条继续（在 promise resolve 后才出队，
    *  保证上一条的 running context 已清理，出队的下一条不会因 busy 误判被跳过） */
-  const execQueued = (sid: string, name: string, command: string): Promise<void> => {
+  const execQueued = async (sid: string, name: string, command: string): Promise<void> => {
     const session = resolveSession(sid, name)
     if (!session) {
       send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now() })
-      return Promise.resolve()
+      return
     }
     const key = `${sid}:${name}`
     /** 队列是否还有后续命令（排队命令）→ 决定 server 是否保持 busy */
     const hasMore = (): boolean => (execQueue.get(key)?.length ?? 0) > 0
+    // web run-exec 与 term_exec 共用发送前语法预检：命中即拦，不写终端、不发 cmdStart
+    const rejection = await precheckBeforeExec(session, command)
+    if (rejection) {
+      log.tool("web_run_precheck_rejected", { sessionID: sid, name, command: tailLines(command, 3), shell: session.shellName })
+      send({ type: "out", sessionID: sid, name, data: rejection, final: true })
+      send({ type: "cmdDone", sessionID: sid, name, exitCode: null, endTs: Date.now(), more: hasMore() })
+      const q = execQueue.get(key)
+      const next = q?.shift()
+      if (q && q.length === 0) execQueue.delete(key)
+      if (next) return execQueued(sid, name, next)
+      return
+    }
     return session.exec(command).then((result) => {
       // exec 同步等待：正常完成/动画等待均会触发生命周期 done（cmdDone）。
       // 仅 quick-fail（busy/未连接，返回 {ok:false}）不会发 done —— 补一条兜底防 server busy 卡死

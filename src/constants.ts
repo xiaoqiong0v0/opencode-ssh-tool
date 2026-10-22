@@ -155,6 +155,13 @@ export const CACHE_DIR = ".opencode/plugins-cache/opencode-ssh-tool"
 /** 完成标记前缀（后续跟退出码 + ">"，如 <SSH_DONE:0>） */
 export const DONE_TAG = "<SSH_DONE:"
 
+/**
+ * 补发探针标记前缀：与完成标记**同构但不同 tag**，用于彻底区分
+ * 「原命令自己的完成标记」与「shell 回到提示符后补发的探针标记」。
+ * 同一会话/同一 seq 两种标记可能先后出现；若不区分，语法误判时会把真实退出码覆盖成 null。
+ */
+export const PROBE_TAG = "<SSH_PROBE:"
+
 /** shell 类型探测前缀：probeCommand 回显 <前缀>$0 */
 export const SHELL_ID_PREFIX = "__SHELL_ID__"
 

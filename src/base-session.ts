@@ -9,6 +9,7 @@ import {
   MAX_OUTPUT_LEN,
   RAW_LOG_MAX,
   DONE_TAG,
+  PROBE_TAG,
   SYNTAX_QUIET_MS,
   SYNTAX_MAX_WAIT_MS,
   FALLBACK_WATCH_INTERVAL_MS,
@@ -18,7 +19,7 @@ import log, { debug, describeSend, infoDedup, isDebugEnabled, tailLines, tailSum
 import { decodeTerminalEscapes } from "./escapes.js"
 import { SessionHistory } from "./history.js"
 import { toModelText, extractOutputStart, removeProbeEchoLines, ECHO_REGEX_MAX_CMD_CHARS, echoRegexSourceLength } from "./utils.js"
-import { detectLastDoneMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
+import { detectLastDoneMarker, detectLastProbeMarker, stripMarkers, detectInterrupt, detectSyntaxError, adapters, type ShellAdapter } from "./shell-adapter.js"
 import { tr, type Lang } from "./i18n.js"
 
 /** 命令执行结果 */
@@ -55,36 +56,56 @@ const MAX_BUFFER_LEN = 2 * 1024 * 1024
 /** Shell 探测等待超时 */
 const PROBE_TIMEOUT_MS = 5_000
 
+/** 探针回显 seq 保留上限：只保留最近 N 条，防长会话 Set 无界增长与剔除成本 O(N×行) */
+const PROBE_SEQ_KEEP = 8
+
 /**
- * 剥离命令尾部注释：仅当 `#` 在行首或前有空白、且不在单双引号内（支持反斜杠转义）时视为注释，
- * 避免 `echo "a#b"` / `echo 'a#b'` 引号内的 # 被误剥，也避免 marker 被真注释吞掉。
- * @param s 命令文本
+ * 剥离命令尾部注释：只在**最后一行**、`#` 位于引号外且处于词首时视为注释。
+ * 扫描整条命令以维护跨行引号状态（bash/pwsh 字符串都可跨行），避免 `"line2 # x"` 被误截断。
+ * - pwsh：反引号是转义符；单引号内 `''` 表示字面单引号。
+ * - bash/zsh：反斜杠转义；反引号是命令替换，内部 `#` 不剥（保守处理）。
+ * - cmd：不支持 `#` 注释，跳过。
+ * @param s 完整命令文本
+ * @param shell 适配器名（bash/zsh/pwsh/cmd；空串按 POSIX 处理）
  * @returns 剥离尾注释（若有）后的文本
  */
-function stripTrailingComment(s: string): string {
+function stripTrailingComment(s: string, shell: string): string {
+  if (shell === "cmd") return s.trimEnd()
+  const pwsh = shell === "pwsh" || shell === "powershell"
+  const lastLineStart = s.lastIndexOf("\n") + 1
   let inSingle = false
   let inDouble = false
-  let escaped = false
+  let inBacktick = false
   for (let i = 0; i < s.length; i++) {
     const c = s[i]
-    if (escaped) {
-      escaped = false
+    if (c === "\n") continue
+    if (inSingle) {
+      if (pwsh && c === "'" && s[i + 1] === "'") { i++; continue }
+      if (c === "'") inSingle = false
       continue
     }
-    if (c === "\\") {
-      escaped = true
+    if (inDouble) {
+      if (pwsh && c === "`") { i++; continue }
+      if (!pwsh && c === "\\") { i++; continue }
+      if (c === '"') inDouble = false
       continue
     }
-    if (c === "'" && !inDouble) {
-      inSingle = !inSingle
+    if (inBacktick) {
+      if (c === "`") inBacktick = false
       continue
     }
-    if (c === '"' && !inSingle) {
-      inDouble = !inDouble
-      continue
-    }
-    if (c === "#" && !inSingle && !inDouble && (i === 0 || /\s/.test(s[i - 1]))) {
-      return s.slice(0, i).trimEnd()
+    if (pwsh && c === "`") { i++; continue }
+    if (!pwsh && c === "\\") { i++; continue }
+    if (c === "'") { inSingle = true; continue }
+    if (c === '"') { inDouble = true; continue }
+    if (!pwsh && c === "`") { inBacktick = true; continue }
+    // 注释起始：行首/空白/语句分隔符/括号之后（`;#`、`&#`、`)#` 都能正确识别）
+    if (c === "#" && (i === 0 || /[\s;&|(){}]/.test(s[i - 1]))) {
+      if (i >= lastLineStart) return s.slice(0, i).trimEnd()
+      // 前面的行上的注释：跳过本行剩余内容，继续扫描后续行
+      const nl = s.indexOf("\n", i)
+      if (nl < 0) break
+      i = nl
     }
   }
   return s.trimEnd()
@@ -95,16 +116,17 @@ function stripTrailingComment(s: string): string {
  * - 尾注释 `# xxx` 把 marker 整行吞掉 → 检测不到完成
  * - 尾运算符 `&`、`;`、`&&`、`||` 与拼接的 `;` 形成 `&;`/`;;` 等语法错误
  * @param command 原始命令
+ * @param shell 适配器名（用于正确的引号/转义语义；空串按 POSIX 处理）
  * @returns 可安全拼装 marker 的命令体
  */
-function stripCommandTail(command: string): string {
-  // 仅处理最后一行：多行命令（如 heredoc 正文）中间的 `#` 是内容，若在此截断会把命令切断
-  const nl = command.lastIndexOf("\n")
-  const head = nl >= 0 ? command.slice(0, nl + 1) : ""
-  const last = nl >= 0 ? command.slice(nl + 1) : command
-  let s = stripTrailingComment(last)
-  s = s.replace(/(?:&&|\|\||[;&|])[\s]*$/, "")
-  return (head + s).trimEnd()
+export function stripCommandTail(command: string, shell = ""): string {
+  const withoutComment = stripTrailingComment(command, shell)
+  // 仅处理最后一行：多行命令（如 heredoc 正文）中间的 `#`/运算符是内容，不能在这里截断
+  const nl = withoutComment.lastIndexOf("\n")
+  const head = nl >= 0 ? withoutComment.slice(0, nl + 1) : ""
+  const last = nl >= 0 ? withoutComment.slice(nl + 1) : withoutComment
+  const cleaned = last.replace(/(?:&&|\|\||[;&|])[\s]*$/, "")
+  return (head + cleaned).trimEnd()
 }
 
 /**
@@ -184,12 +206,6 @@ export abstract class BaseSession {
   private _syntaxQuietAt = 0
   /** 语法错误识别后观测到的输出长度（判断输出是否仍在变化） */
   private _syntaxLen = 0
-  /**
-   * 语法错误路径是否已补发探针（每条命令复位）。
-   * 输出安静且无完成标记时补发一条本 seq 标记命令：shell 若已回到提示符会打印它，
-   * 据此把该 marker 起点当作输出窗口右界（替代"与旧提示符行相等比较"的脆弱判据）。
-   */
-  private _syntaxProbed = false
   /** exec 同步等待完成的一次性 animation 定时器（到点未完成 → 兑现 "running" 转后台） */
   private _animationTimer: ReturnType<typeof setTimeout> | null = null
   /** exec 同步等待完成的 resolver（数据到达/语法静默命中时由 _settleCompletion 兑现） */
@@ -405,6 +421,16 @@ export abstract class BaseSession {
    */
   get nonce(): string { return this._nonce }
 
+  /**
+   * 当前 shell 适配器名（"zsh" / "bash" / "pwsh" / "cmd"）：供发送前语法预检选校验器。
+   * 只读暴露探测结果，不触发探测（未连接时为 null，调用方按"不校验"处理）。
+   * @returns 适配器名；未连接/未探测到适配器时为 null
+   */
+  get shellName(): string | null { return this._adapter?.name ?? null }
+
+  /** 是否本地会话：发送前语法预检只接本地（SSH 远程需会话内往返，另开一轮） */
+  get isLocal(): boolean { return false }
+
   getRunningOutput(): string {
     if (this._runningStartPos === null || !this._connected || !this._runningCommand) return ""
     return this._buffer.slice(this._runningStartPos)
@@ -519,7 +545,10 @@ export abstract class BaseSession {
     if (this._closed) return
     this._closed = true
     if (this._watchTimer) clearInterval(this._watchTimer)
-    this._stopInterruptCycle("会话关闭")
+    this._watchTimer = null
+    // 先清运行上下文（含语法/中断定时器），再释放 history：
+    // 否则 close 后定时器仍可能触发写已关闭终端，并在 history 已 dispose 时 append 抛未捕获 ENOENT
+    this._clearRunningContext()
     this._closeTransport()
     this._connected = false
     this._setBusy(false, "会话关闭")
@@ -543,6 +572,19 @@ export abstract class BaseSession {
    */
   private _markerCmd(seq: number): string {
     return this._adapter ? this._adapter.markerCmd(this._nonce, seq) : `printf '\\n${DONE_TAG}${this._nonce}:${seq}:%s>' $?`
+  }
+
+  /**
+   * 补发探针命令：与完成标记命令**同构**，仅把 tag 换成 PROBE_TAG。
+   * 复用各 adapter 的 markerCmd，避免四套 shell 各维护一份退出码表达式；
+   * 独立 tag 让「探针标记」与「原命令真实完成标记」在字节流里可严格区分。
+   * @param seq 命令序号
+   * @returns 探针标记命令文本
+   */
+  private _probeCmd(seq: number): string {
+    const marker = this._markerCmd(seq)
+    // cmd 的 marker 用 ^< 转义，DONE_TAG 不再是连续子串；此时只替换 tag 主体
+    return marker.includes(DONE_TAG) ? marker.replace(DONE_TAG, PROBE_TAG) : marker.replace("SSH_DONE:", "SSH_PROBE:")
   }
 
   /**
@@ -583,25 +625,36 @@ export abstract class BaseSession {
    * @returns 写入 PTY 的探针文本
    */
   private _composeProbe(seq: number): string {
-    return this._markerCmd(seq) + "\r"
+    return this._probeCmd(seq) + this._ptyLineSep()
+  }
+
+  /** 记录探针 seq，只保留最近 PROBE_SEQ_KEEP 条（迟到回显跨命令有限，避免 Set 无界增长） */
+  private _rememberProbeSeq(seq: number): void {
+    this._probeSeqs.add(seq)
+    while (this._probeSeqs.size > PROBE_SEQ_KEEP) {
+      const first = this._probeSeqs.values().next().value
+      if (first === undefined) break
+      this._probeSeqs.delete(first)
+    }
   }
 
   /**
-   * 补发一次当前命令的探针标记（中断收尾与语法错误右界共用）：
+   * 补发一次当前命令的探针标记（仅中断收尾使用）：
    * 写入一条独立的本 seq 标记命令，并记录 seq，使其回显迟到落入后续窗口时仍能被剔除。
    * - 中断场景：用户显式 Ctrl+C 后前台命令可能已死、原命令的完成标记永不执行 → busy 卡死；
    *   补写探针后 shell 若已回到提示符会读它并打印当前 seq 标记使命令收尾；若前台程序未死，
    *   字节留在 tty 输入缓冲待 shell 拿回控制权再读（两种情况均符合预期，绝不误判完成）。
    *   由中断周期调用：写完 \x03 时立即补发一次，之后定时器每间隔补发一次（见 _startInterruptCycle）。
-   * - 语法错误场景：整行命令作废、标记未执行 → 输出安静后补发一次，以其 marker 起点作为输出窗口右界。
    * 幂等：同一条命令多次补发时，先到的当前 seq 标记胜出。仅在确实追踪着命令时补发（空闲补发只污染缓冲）。
-   * @param reason 补发原因（仅用于日志：中断探针 / 语法错误探针）
+   * 注意：语法错误路径**不再补发探针**（会写进仍在运行程序的 stdin），改为安静窗口到点直接收尾。
+   * @param reason 补发原因（仅用于日志：中断探针）
    * @returns 无
    */
   private _sendProbe(reason: string): void {
+    if (!this._connected) return
     if (this._runningStartPos === null || this._runningCommand === "") return
     const seq = this._runningSeq
-    this._probeSeqs.add(seq)
+    this._rememberProbeSeq(seq)
     const probe = this._composeProbe(seq)
     debug(`${reason} ${this._logTag} seq=${seq} ${JSON.stringify(probe)} (busy=${this._remoteBusy})`)
     this._write(probe)
@@ -655,21 +708,24 @@ export abstract class BaseSession {
   }
 
   /**
-   * 从可见输出中剔除中断探针留下的痕迹（探针命令的回显）。
-   * 探针在用户中断时补发，其回显可能迟到落到后续命令的输出窗口里；这里对每个已记录探针 seq
-   * （以及当前命令自身的标记命令回显）做 **ANSI 容忍定位**：即便 pwsh 语法高亮在 token 间插入
+   * 从可见输出中剔除探针留下的痕迹（探针命令的回显）。
+   * 探针命令已改为独立 PROBE tag，但其回显仍是"一条标记命令"；同时保留对当前命令 DONE 标记回显的剔除。
+   * 对每个已记录探针 seq（以及当前命令自身）做 **ANSI 容忍定位**：即便 pwsh 语法高亮在 token 间插入
    * SGR、行首带提示符与 `\x1b[?25l`，也能命中并整段剔除（见 removeProbeEchoLines）。
-   * 三处调用点（本函数、_extractOutput 的 out.replace、getRunningStream 的 data.replace）
-   * 统一收敛至此，消除口径漂移。Raw 视图不经此函数，保留原始字节。
+   * 三处调用点（本函数、getRunningStream、readBuffer）统一收敛至此；Raw 视图保留原始字节。
    * @param text 可见输出文本
    * @returns 剔除探针回显后的文本
    */
   private _stripProbeEchoes(text: string): string {
-    const needles: string[] = []
-    for (const seq of this._probeSeqs) needles.push(this._markerCmd(seq))
-    // 当前命令的标记命令回显：原 out.replace(_markerCmd(_runningSeq)) / data.replace(...) 两种口径并入此处
-    needles.push(this._markerCmd(this._runningSeq))
-    return removeProbeEchoLines(text, needles)
+    const needles = new Set<string>()
+    for (const seq of this._probeSeqs) {
+      needles.add(this._markerCmd(seq))
+      needles.add(this._probeCmd(seq))
+    }
+    // 当前命令的标记命令回显：与上面可能重复，Set 去重避免同一 needle 反复扫描
+    needles.add(this._markerCmd(this._runningSeq))
+    needles.add(this._probeCmd(this._runningSeq))
+    return removeProbeEchoLines(text, [...needles])
   }
 
   /**
@@ -691,8 +747,10 @@ export abstract class BaseSession {
    */
   private _composeEchoText(command: string): string {
     const marker = this._markerCmd(this._runningSeq)
-    const body = stripCommandTail(command)
+    const body = stripCommandTail(command, this._adapter?.name ?? "")
     const sep = this._adapter?.stmtSep ?? ";"
+    // cmd：marker 必须独占下一行——%errorlevel% 是整行解析期展开，同行拼接会取到旧值
+    if (this._adapter?.name === "cmd") return `${body}\n${marker}`
     // 多行命令：尝试包组（cmd 返回 null → 回退原样拼接），使整段作为一条命令执行
     if (body.includes("\n")) {
       const grouped = this._adapter?.groupWrap(body)
@@ -710,7 +768,7 @@ export abstract class BaseSession {
    * 语法错误路径（syntaxMode）另作两处特殊处理：
    * - 回显定位取**首次**匹配：pwsh 错误块的 `   1 |  <命令>` 行会重印含标记的整行命令，
    *   末次匹配会落到该拷贝上，导致 `ParserError:`/`Line |` 等错误块前半被裁掉；
-   * - 输出窗口右界取**补发探针的 marker 起点**（见 _armSyntaxQuiet），不再与提示符行做相等比较。
+   * - 输出窗口右界取缓冲区末尾（不再补发语法探针），尾部最多多 1 行提示符噪音。
    * @param raw 本次执行窗口原始字节流
    * @param command 原始命令（历史用）
    * @param syntaxMode true 表示语法/解析错误收尾（无完成标记，整行命令作废）
@@ -719,6 +777,10 @@ export abstract class BaseSession {
   private _extractOutput(raw: string, command: string, syntaxMode = false): string {
     // 完成标记先定位：marker 自带唯一 seq，从窗口起点搜索即可（echoEnd 可能被连续输入的后序回显带偏）
     const marker = detectLastDoneMarker(raw, 0, this._nonce, this._runningSeq)
+    // 中断探针路径没有真实完成标记，右界取 PROBE 标记结束位置，避免把探针之后的提示符污染带进输出；
+    // 语法错误路径不补发探针，boundary 退到 raw.length（尾部最多多 1 行提示符噪音）
+    const probe = marker.done ? null : detectLastProbeMarker(raw, 0, this._nonce, this._runningSeq)
+    const boundary = marker.done ? marker.pos : (probe?.done ? probe.pos : raw.length)
     const echoText = this._composeEchoText(command)
     const echoLen = echoText.trim().length
     // 超长回显：extractOutputStart 会降级为"首/尾锚点"匹配（否则模式源约 265×长度，JSC 下会抛 too large）
@@ -727,9 +789,7 @@ export abstract class BaseSession {
     }
     let end: number
     try {
-      end = marker.done
-        ? extractOutputStart(raw, echoText, marker.pos, syntaxMode)
-        : extractOutputStart(raw, echoText, raw.length, syntaxMode)
+      end = extractOutputStart(raw, echoText, boundary, syntaxMode)
     } catch (e) {
       // 回显定位异常绝不上抛（否则会中断完成收尾）：记一行后退回整窗输出
       log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 回显定位失败, 退回整窗: echoLen=${echoLen} err=${e instanceof Error ? e.message : String(e)}`)
@@ -737,7 +797,7 @@ export abstract class BaseSession {
     }
     // 诊断：输出窗口坐标 + 是否退回整窗（startPos=回显结束偏移，endPos=窗口末尾；窗口长=endPos-startPos）
     const winStart = end <= 0 ? 0 : end
-    const winEnd = marker.done ? marker.pos : raw.length
+    const winEnd = boundary
     debug(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口: startPos=${winStart} endPos=${winEnd} 窗口长=${winEnd - winStart} markerSeq=${this._runningSeq} 是否退回整窗=${end <= 0 ? `是(定位失败, syntaxMode=${syntaxMode})` : "否"}`)
     // 诊断：窗口前 120 字符（仅 SSH_TOOL_DEBUG=1 时落盘）
     debug(`[extract] ${this._logTag} seq=${this._runningSeq} 窗口前120: ${escapeCtl(raw.slice(0, 120))}`)
@@ -746,14 +806,14 @@ export abstract class BaseSession {
       // **不得退回整窗**——整窗会把重放的别会话命令行/标记当输出落盘（旧 bug：outLen=14019 全是杂物）。
       // 改为按窗口内已有标记边界裁剪：取"本命令自己的标记之前、所有非本 seq 标记之后"的边界，
       // 先把重放段整段切掉，再剥行首残余控制码噪音；定位仍失败也只剩边界之后的少量内容。
-      const ownEnd = marker.done ? marker.pos : raw.length
-      const boundary = this._fallbackBoundary(raw, ownEnd)
-      let fallback = boundary > 0 ? raw.slice(boundary) : raw
+      const ownEnd = boundary
+      const fbBoundary = this._fallbackBoundary(raw, ownEnd)
+      let fallback = fbBoundary > 0 ? raw.slice(fbBoundary) : raw
       // 边界裁剪后"再试一次定位"：此时窗口已剔除重放段，回显残片可能恢复成可匹配的连续文本
       const retry = extractOutputStart(fallback, echoText, fallback.length, false)
       if (retry > 0) fallback = fallback.slice(retry)
       else fallback = this._stripLeadingControlNoise(fallback)
-      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 定位失败改用标记边界: boundary=${boundary} retry=${retry} 裁剪后长=${fallback.length} 原窗长=${raw.length}`)
+      log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 定位失败改用标记边界: boundary=${fbBoundary} retry=${retry} 裁剪后长=${fallback.length} 原窗长=${raw.length}`)
       // 中断命令再截到首个 ^C 回显，避免输出残留 ^C 与探针后 shell 重印的提示符（与旧版中断收尾语义一致）
       if (this._interruptSent) {
         const intr = detectInterrupt(fallback, 0)
@@ -763,14 +823,13 @@ export abstract class BaseSession {
     }
     let out: string
     if (syntaxMode) {
-      // 语法错误：命令整行作废、本条标记未执行 → 输出 = 回显结束 → 补发探针的 marker 起点
-      //（右界由 marker 给出，不再与提示符行比较；探针未到时退到窗口末尾，仅多留 1 行提示符噪音）
-      const endPos = marker.done ? marker.pos : raw.length
-      out = raw.slice(end, endPos)
-    } else if (marker.done) {
-      // 中断命令：完成标记由探针补发，输出窗口会多出 ^C 回显、重印提示符与探针回显；
+      // 语法错误：命令整行作废、本条标记未执行 → 输出 = 回显结束 → 缓冲区末尾（含整段错误块）
+      //（不补发探针；尾部最多多 1 行提示符噪音，按设计接受）
+      out = raw.slice(end, boundary)
+    } else if (marker.done || probe?.done) {
+      // 中断命令：完成由补发探针标记（SSH_PROBE）触发，输出窗口会多出 ^C 回显、重印提示符与探针回显；
       // 输出在首个 ^C 回显处截断，保留中断前程序输出（探针回显另由 _stripProbeEchoes 剔除）
-      let endPos = marker.pos
+      let endPos = boundary
       if (this._interruptSent) {
         const intr = detectInterrupt(raw, end)
         if (intr.interrupted) endPos = Math.min(endPos, intr.pos)
@@ -982,16 +1041,18 @@ export abstract class BaseSession {
       return
     }
     try {
-      // 完成判定（权威且唯一）：命令后追加的 printf 输出 <SSH_DONE:seq:code>；marker 自带唯一 seq，从命令起点搜索
+      // 真实完成（权威且唯一）：只认本会话 nonce + 本 seq 的 SSH_DONE 标记。
+      // 探针已改用独立 SSH_PROBE tag，二者不再混淆——语法误判时真实退出码不会被覆盖。
       const marker = detectLastDoneMarker(this._buffer, this._runningStartPos, this._nonce, this._runningSeq)
       if (marker.done) {
-        // 语法错误路径的 marker 来自补发探针（原命令整行作废、其标记未执行）：完成语义仍是语法错误
-        //（首匹配提取错误块），右界取该探针 marker 起点，退出码无可信来源记 null
-        if (this._syntaxProbed) {
-          this._settleCompletion({ kind: "done", markerPos: marker.pos, exitCode: null, syntaxError: true })
-          return
-        }
         this._settleCompletion({ kind: "done", markerPos: marker.pos, exitCode: marker.exitCode })
+        return
+      }
+      // 中断探针（SSH_PROBE）：Ctrl+C 后 shell 回到提示符执行补发的标记命令。
+      // 语法错误路径不再补发探针（见 _armSyntaxQuiet）：避免把命令写进仍在运行的程序 stdin。
+      const probe = detectLastProbeMarker(this._buffer, this._runningStartPos, this._nonce, this._runningSeq)
+      if (probe.done) {
+        this._settleCompletion({ kind: "done", markerPos: probe.pos, exitCode: probe.exitCode })
         return
       }
       // 语法/解析错误：整行命令作废（含同行拼装的完成标记也不会执行）→ 输出安静后补发探针按完成收尾
@@ -1037,9 +1098,9 @@ export abstract class BaseSession {
 
   /**
    * 推进语法错误安静窗口（一次性定时器，非轮询）：
-   * - 首轮：识别到语法错误后等输出停止增长 SYNTAX_QUIET_MS，确保 pwsh 异步/批量渲染的多行错误块完整收进输出窗口；
-   *   到点后**补发一次探针**（此刻 shell 应已回到提示符），改由 marker 分支收尾——右界取探针 marker 起点。
-   * - 探针已发：等待其 marker；仅挂上限兜底定时器，到点仍未等到则按语法错误收尾（右界退到窗口末尾）。
+   * 识别到语法错误后等输出停止增长 SYNTAX_QUIET_MS，确保 pwsh 异步/批量渲染的多行错误块完整收进输出窗口；
+   * 到点**直接按语法错误收尾，不再补发探针**——探针会被写进仍在运行的程序 stdin（如 `cat >file` / REPL），
+   * 且语法误判时会提前收尾、丢弃迟到的真实完成标记；尾部最多多 1 行提示符噪音，按设计接受。
    * 自首次识别起硬上限 SYNTAX_MAX_WAIT_MS；数据到达（输出变化）时重置安静窗口；兜底 tick 不重置（见 _checkCompletion）。
    * @returns 无
    */
@@ -1056,48 +1117,25 @@ export abstract class BaseSession {
     }
     if (now - this._syntaxSeenAt >= SYNTAX_MAX_WAIT_MS) {
       this._clearSyntaxTimer()
-      this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
+      this._settleSyntaxError()
       return
     }
-    // 探针已补发：等待其 marker 收尾（_checkCompletion 的 marker 分支），仅挂上限兜底定时器
-    if (this._syntaxProbed) {
-      this._armSyntaxFallbackSettle(SYNTAX_MAX_WAIT_MS - (now - this._syntaxSeenAt))
-      return
-    }
-    // 首轮：安静窗口到点后补发探针（此刻 shell 应已回到提示符）
     const remain = Math.max(0, SYNTAX_QUIET_MS - (now - this._syntaxQuietAt))
     this._clearSyntaxTimer()
     this._syntaxTimer = setTimeout(() => {
       this._syntaxTimer = null
       if (this._runningStartPos === null) return
-      this._syntaxProbed = true
-      try {
-        this._sendProbe("语法错误探针")
-        this._armSyntaxQuiet()
-      } catch (e) {
-        // 探针写入异常：退回按语法错误收尾（右界为窗口末尾），保证 busy/history 一定落地
-        log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 语法错误探针补发异常, 直接收尾: err=${e instanceof Error ? e.message : String(e)}`)
-        this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
-      }
+      this._settleSyntaxError()
     }, remain)
   }
 
-  /**
-   * 挂一个一次性兜底定时器：到点仍未收尾则按语法错误收尾（探针 marker 未及时到达时的下限保护）。
-   * @param ms 延迟毫秒（<0 视作 0）
-   * @returns 无
-   */
-  private _armSyntaxFallbackSettle(ms: number): void {
-    this._clearSyntaxTimer()
-    this._syntaxTimer = setTimeout(() => {
-      this._syntaxTimer = null
-      if (this._runningStartPos === null) return
-      try {
-        this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
-      } catch (e) {
-        log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 语法错误兜底收尾异常: err=${e instanceof Error ? e.message : String(e)}`)
-      }
-    }, Math.max(0, ms))
+  /** 按语法错误收尾（含异常兜底：收尾本身再抛也不能变成未捕获异常） */
+  private _settleSyntaxError(): void {
+    try {
+      this._settleCompletion({ kind: "done", exitCode: null, syntaxError: true })
+    } catch (e) {
+      log.info(`[watch] ${this._logTag} seq=${this._runningSeq} 语法错误收尾异常: err=${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
   /**
@@ -1132,7 +1170,6 @@ export abstract class BaseSession {
     this._syntaxSeenAt = 0
     this._syntaxQuietAt = 0
     this._syntaxLen = 0
-    this._syntaxProbed = false
     this._clearSyntaxTimer()
   }
 
@@ -1199,7 +1236,12 @@ export abstract class BaseSession {
       log.info(`[extract] ${this._logTag} seq=${this._runningSeq} 输出提取异常, 使用整窗输出: cmdLen=${command.length} err=${e instanceof Error ? e.message : String(e)}`)
       output = raw
     }
-    this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
+    try {
+      this._history.append(command, output, this._runningStartTs, undefined, exitCode ?? undefined)
+    } catch (e) {
+      // history 落盘失败（目录被删/权限/磁盘）不得阻断 done/busy 收尾，否则会话永久 busy
+      log.info(`[history] ${this._logTag} seq=${this._runningSeq} 追加失败: err=${e instanceof Error ? e.message : String(e)}`)
+    }
     this._emitDone(exitCode, Date.now(), output)
     this._cursor = Math.max(startPos, endPos)
     this._setBusy(false, "cmdDone", true) // 命令完成即清 busy（"保持 busy 到排队序列结束"的机制已移除）；释放行紧随 [run] 结束，降 debug 免重复

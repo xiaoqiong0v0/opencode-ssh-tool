@@ -19,6 +19,9 @@ import { type SessionEntry } from "./server.js"
 import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
+import { precheckBeforeExec } from "./precheck.js"
+
+export { precheckBeforeExec }
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -238,6 +241,8 @@ function cleanupAllSessions(sessionID: string): void {
   refreshAgent()
 }
 
+// 发送前语法预检已抽到 ./precheck.ts，供 term_exec 与 web run-exec 共用。
+
 export const OpenCodeSshTool: Plugin = async () => {
   // 父子会话关系（sessionID → parentID；根的 parentID 为 undefined）
   // 通过 session.created/updated 事件构建，用于根系查找（主子会话共享终端）
@@ -402,6 +407,13 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!command) return `${tr("cli_need_command", toolLang)}\n${tr("cli_exec_usage", toolLang)}\n\n${HELP_TEXT}`
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
+    // 发送前语法预检：本地会话命中语法错误即拦下并返回结构化错误（不写终端、不进权限询问）；
+    // SSH 会话 / cmd 等不支持的 shell / 校验模块故障 → 内部一律放行，维持现有行为
+    const rejection = await precheckBeforeExec(session, command, undefined, toolLang)
+    if (rejection) {
+      log.tool("term_exec_precheck_rejected", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, command, shell: session.shellName })
+      return rejection
+    }
     const decision = decide(command)
     if (decision === "deny") {
       log.tool("term_exec_denied", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, command })

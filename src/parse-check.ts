@@ -51,7 +51,7 @@ const PS_CANDIDATES: readonly string[] =
 /**
  * PowerShell 常驻侧车脚本（**必须 ASCII-only**，见文件头约束 3）。
  * 协议：父写一行 base64(UTF-8 命令文本) → 子回一行 `ERRCOUNT=<n>[|ErrorId:line:col:b64(text)]...`；
- * 首行 `READY` 表示就绪；收 `QUIT` 或 stdin EOF 即干净退出。
+ * 首行 `READY` 表示就绪；收 `!QUIT` 或 stdin EOF 即干净退出（`!` 不是 base64 字符，避免 payload 碰撞）。
  * 输出行整体为 ASCII（ErrorId 为 ASCII、片段走 base64），故不受控制台代码页影响。
  */
 const PS_SIDECAR_SCRIPT = [
@@ -63,7 +63,7 @@ const PS_SIDECAR_SCRIPT = [
   "while ($true) {",
   "  $line = [Console]::In.ReadLine()",
   "  if ($null -eq $line) { break }",
-  "  if ($line -eq 'QUIT') { break }",
+  "  if ($line -eq '!QUIT') { break }",
   "  try {",
   "    $bytes = [Convert]::FromBase64String($line)",
   "    $text = [System.Text.Encoding]::UTF8.GetString($bytes)",
@@ -102,7 +102,7 @@ const PS_SIDECAR_ARGS: readonly string[] = [
  */
 const POSIX_RUNNERS: Record<"bash" | "zsh", readonly (readonly string[])[]> = {
   bash: [["bash", "-n"], ["wsl", "bash", "-n"]],
-  zsh: [["zsh", "-n"]],
+  zsh: [["zsh", "-f", "-n"]],
 }
 
 /**
@@ -153,9 +153,9 @@ async function checkPosix(kind: "bash" | "zsh", text: string): Promise<ParseIssu
     const outcome = await runPosixCheck(argv, text)
     if (outcome === null) continue // 二进制不存在/超时：试下一个候选
     if (outcome.code === 0) return null
-    // 只有确属语法错误才拦：exit=2（bash 语法错误码）或 stderr 命中语法错误特征；
+    // 只有 stderr 确实像语法错误才拦：不能单凭 exit=2（包装脚本/WSL 异常也可能返回 2）；
     // 其余非 0（如 127 command not found、WSL 无发行版）视为"不可用"→ 放行，绝不误拦
-    if (outcome.code !== 2 && !POSIX_SYNTAX_RE.test(outcome.stderr)) return null
+    if (!POSIX_SYNTAX_RE.test(outcome.stderr)) return null
     const stderr = outcome.stderr.trim()
     return { errorId: BASH_ERR_ID, line: parseBashLine(outcome.stderr), col: 0, text: stderr }
   }
@@ -176,9 +176,13 @@ function runPosixCheck(
   return new Promise((resolve) => {
     let proc: ChildProcess
     try {
+      // 清掉 BASH_ENV/ENV：否则用户启动文件里的语法错误会让 `bash -n` 把**所有**合法命令判错
+      const env = { ...process.env, LC_ALL: "C", LANG: "C" } as NodeJS.ProcessEnv
+      delete env.BASH_ENV
+      delete env.ENV
       proc = spawn(argv[0], argv.slice(1), {
         stdio: ["pipe", "ignore", "pipe"],
-        env: { ...process.env, LC_ALL: "C", LANG: "C" },
+        env,
         windowsHide: true,
       })
     } catch {
@@ -198,6 +202,11 @@ function runPosixCheck(
     proc.stderr?.on("data", (chunk: string) => {
       stderr += chunk
     })
+    // 子进程在写入前/写入中退出时，流层会发 EPIPE；无监听会变成未捕获异常。
+    // 这里一律视为该候选不可用（结束本次校验，由调用方降级放行）。
+    proc.stdin?.on("error", () => done(null))
+    proc.stdout?.on("error", () => done(null))
+    proc.stderr?.on("error", () => done(null))
     proc.once("error", () => done(null)) // ENOENT 等：该候选不可用
     proc.once("close", (code) => done({ code: code ?? 1, stderr }))
     timer = setTimeout(() => {
@@ -285,6 +294,8 @@ class PwshSidecar {
   private _ready = false
   private _disabled = false
   private _crashes = 0
+  /** 挂接代次：新进程挂接后递增，旧进程迟到的 data/exit 一律忽略，防串扰新进程队列 */
+  private _attachEpoch = 0
   private _starting: Promise<boolean> | null = null
   private _queue: Pending[] = []
   private _buf = ""
@@ -320,13 +331,21 @@ class PwshSidecar {
     return ok ? this._proc : null
   }
 
-  /** 按候选顺序尝试启动；全部失败则永久降级。成功后重置崩溃计数并置空闲不阻塞退出 */
+  /** 按候选顺序尝试启动；全部失败则永久降级。成功后置空闲不阻塞退出（崩溃计数在成功响应后重置） */
   private async _start(): Promise<boolean> {
     for (const bin of PS_CANDIDATES) {
       const proc = await this._spawnCandidate(bin)
       if (proc === null) continue
+      // READY 之后、赋值前已退出：不要装入死进程（否则 _ensure 会一直返回它并等超时）
+      if (!this._ready) {
+        try {
+          proc.kill()
+        } catch {
+          /* ignore */
+        }
+        continue
+      }
       this._proc = proc
-      this._crashes = 0
       this._unref(proc)
       return true
     }
@@ -379,8 +398,18 @@ class PwshSidecar {
 
   /** 挂接侧车输出：按行解析（首行 READY 触发就绪回调，其后逐行兑现队首请求），并注册退出清理 */
   private _attach(proc: ChildProcess, onReady: () => void): void {
+    const epoch = ++this._attachEpoch
+    this._buf = ""
+    this._ready = false
+    const current = (): boolean => epoch === this._attachEpoch
+    // 侧车提前退出/管道断开时的流级异常：走统一退出清理（拒绝待决请求，下次调用重新拉起）；
+    // 不监听会变成未捕获 EPIPE。旧进程的异常/退出由 epoch 过滤，不污染新进程。
+    proc.stdin?.on("error", () => { if (current()) this._onExit(proc) })
+    proc.stdout?.on("error", () => { if (current()) this._onExit(proc) })
+    proc.stderr?.on("error", () => { if (current()) this._onExit(proc) })
     proc.stdout?.setEncoding("utf8")
     proc.stdout?.on("data", (chunk: string) => {
+      if (!current()) return
       this._buf += chunk
       let idx: number
       while ((idx = this._buf.indexOf("\n")) >= 0) {
@@ -396,16 +425,20 @@ class PwshSidecar {
         const pending = this._queue.shift()
         if (pending) {
           clearTimeout(pending.timer)
+          // 成功响应才重置连续崩溃计数：避免 _start 每次都清零导致重启上限失效
+          this._crashes = 0
           pending.resolve(line)
         }
         if (this._queue.length === 0) this._unref(proc)
       }
     })
-    proc.once("exit", () => this._onExit(proc))
+    proc.once("exit", () => { if (current()) this._onExit(proc) })
   }
 
   /** 侧车退出：运行中崩溃计入重启次数（超限永久降级），并拒绝所有待决请求 */
   private _onExit(proc: ChildProcess): void {
+    // 旧进程迟到退出：新进程已接管，忽略，避免清掉新进程的 _ready/队列
+    if (this._proc !== null && this._proc !== proc) return
     if (this._proc === proc) {
       if (this._ready) {
         this._crashes += 1

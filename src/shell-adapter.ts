@@ -5,7 +5,7 @@
 // 改为在每条命令后追加独立一行的标记输出命令，免疫任何提示符框架。
 
 import { stripAnsi } from "./ansi.js"
-import { DONE_TAG, SHELL_ID_PREFIX } from "./constants.js"
+import { DONE_TAG, PROBE_TAG, SHELL_ID_PREFIX } from "./constants.js"
 import { findLastMatch } from "./last-match.js"
 
 /** Shell 适配器接口 */
@@ -65,10 +65,19 @@ export interface ShellAdapter {
 /** 匹配任意求值后的完成标记（含 nonce 式 / 序号式 / 无序号，退出码在末尾）；前缀取自 DONE_TAG，< 与 : 在正则中均为字面量 */
 const DONE_RE = new RegExp(DONE_TAG + "(?:[0-9A-Za-z]+:)?(?:\\d+:)?(-?\\d+)>", "g")
 
+/** 匹配任意求值后的探针标记（与完成标记同构，前缀为 PROBE_TAG） */
+const PROBE_RE = new RegExp(PROBE_TAG + "(?:[0-9A-Za-z]+:)?(?:\\d+:)?(-?\\d+)>", "g")
+
 /** 检测指定会话、指定序号命令的完成标记（nonce 精确匹配，别会话重放的标记不会被误认） */
 function doneSeqRe(nonce: string, seq: number): RegExp {
   const esc = nonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   return new RegExp(`${DONE_TAG}${esc}:${seq}:(-?\\d+)>`, "g")
+}
+
+/** 检测指定会话、指定序号命令的探针标记（与 doneSeqRe 同构，仅 tag 不同） */
+function probeSeqRe(nonce: string, seq: number): RegExp {
+  const esc = nonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(`${PROBE_TAG}${esc}:${seq}:(-?\\d+)>`, "g")
 }
 
 /** 终端中断回显：Ctrl-C 由 TTY 层回显为 ^C（ECHOCTL 开启），与 shell 框架无关 */
@@ -89,8 +98,23 @@ export function detectLastDoneMarker(buffer: string, fromPos: number, nonce: str
   return { done: true, exitCode: parseInt(m[1], 10) || 0, pos: m.index + m[0].length }
 }
 
+/**
+ * 检测本会话/本 seq 的**探针**标记（`<SSH_PROBE:nonce:seq:code>`）。
+ * 与完成标记严格区分：正常完成只认 SSH_DONE，探针只认 SSH_PROBE——
+ * 语法误判时真实完成标记的退出码不会再被覆盖。
+ * @param buffer 原始字节流
+ * @param fromPos 搜索起点
+ * @param nonce 本会话随机串
+ * @param seq 命令序号
+ */
+export function detectLastProbeMarker(buffer: string, fromPos: number, nonce: string, seq: number): { done: boolean; exitCode: number; pos: number } {
+  const m = findLastMatch(probeSeqRe(nonce, seq), buffer, fromPos)
+  if (!m) return { done: false, exitCode: 0, pos: 0 }
+  return { done: true, exitCode: parseInt(m[1], 10) || 0, pos: m.index + m[0].length }
+}
+
 export function stripMarkers(raw: string): string {
-  return raw.replace(DONE_RE, "")
+  return raw.replace(DONE_RE, "").replace(PROBE_RE, "")
 }
 
 /** 检测从指定位置起是否出现中断回显 ^C（命令被 Ctrl-C 中断） */
@@ -323,17 +347,20 @@ function cmdOpenContinuation(s: string): boolean {
  * POSIX 系（bash/zsh/sh/dash）语法/解析错误模式，命中形式：
  * `bash: syntax error near unexpected token ...`、`zsh: parse error near ...`、
  * `/bin/sh: 1: Syntax error: ...`（dash 首字母大写，故大小写不敏感）。
- * 行首锚定：容忍可选的「路径 + shell 名 + 位置链」前缀；
- * 因此仅在行首（或行首 shell 前缀之后）出现该词时命中，命令行中途的普通文本不会误判。
+ * 行首锚定并要求 **shell 名前缀**：程序输出里的裸 `syntax error` 不命中，降低误判面
+ *（误判会让插件提前收尾，甚至把探针写进仍在运行的程序）。
  */
 const POSIX_SYNTAX_ERROR_RE =
-  /(?:^|[\r\n])(?:(?:[^\s:]*\/)?-?(?:bash|zsh|sh|dash|ksh|ash):(?:\s*[^\s:]+(?:\s+\d+)?:)*\s*)?(?:syntax|parse)\s+error/i
+  /(?:^|[\r\n])(?:(?:[^\s:]*\/)?-?(?:bash|zsh|sh|dash|ksh|ash):)(?:\s*[^\s:]+(?:\s+\d+)?:)*\s*(?:syntax|parse)\s+error/i
 
 /**
- * PowerShell 语法/解析错误模式：pwsh 报错首行为 `ParserError:`。
- * 行首锚定：命令输出里行中出现 `ParserError` 不命中。
+ * PowerShell 语法/解析错误模式：
+ * - pwsh 7：`ParserError:` 后紧跟 `Line |` / `所在位置` 错误块；
+ * - Windows PowerShell 5.1：`At line:1 char:14` / `所在位置 行:1 字符:14` 后紧跟 `+` 指示行。
+ * 行首锚定且要求错误块结构：仅输出一行 `ParserError: xxx` 或 `At line:` 的程序日志不命中。
  */
-const PWSH_SYNTAX_ERROR_RE = /(?:^|[\r\n])ParserError:/
+const PWSH_SYNTAX_ERROR_RE =
+  /(?:^|[\r\n])(?:ParserError:[\s\S]{0,300}?(?:\r?\n\s*Line \||\r?\n\s*所在位置)|(?:At line:\d+\s+char:\d+|所在位置\s*行:\d+\s*字符:\d+)[\s\S]{0,200}?\r?\n\s*\+)/i
 
 class ZshAdapter implements ShellAdapter {
   readonly name = "zsh"
@@ -413,9 +440,9 @@ class PwshAdapter implements ShellAdapter {
     // 正确。要彻底消除须在用户命令**前**重置 $LASTEXITCODE（候选 B），而 markerCmd 只能追加在命令后、
     // 前置需改 base-session 的拼接结构（超出本处改动边界），故取当前组合。
     //
-    // 长度取舍：标记可见长度 58 → 92（候选 C2b 嵌套 94、A 98 均无增益不取），回显剔除跨度上限
-    // utils.PROBE_ECHO_MAX_SPAN=200（跨度≈标记长+高亮 SGR），92+SGR 仍余 ~100 余量，可用。
-    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$(if($?){0}elseif($LASTEXITCODE){$LASTEXITCODE}else{1})>"`
+    // 长度取舍：标记可见长度 92 → 约 110（`-as [int]` 兜底用户把 LASTEXITCODE 改成非数字），
+    // 回显剔除跨度上限 utils.PROBE_ECHO_MAX_SPAN=200 仍有余量；语法错误路径已不再补发探针。
+    return `Write-Output "${DONE_TAG}${nonce}:${seq}:$(if($?){0}elseif($LASTEXITCODE -as [int]){$LASTEXITCODE -as [int]}else{1})>"`
   }
   groupWrap(body: string): string | null {
     // 点源 `. { }` 在当前作用域执行（保留变量/状态）；不可用 `& { }`（子作用域会丢变量/状态）。
@@ -442,7 +469,9 @@ class CmdAdapter implements ShellAdapter {
   // 完成标记照常输出，标记法已完成判定，无需该信号
   readonly syntaxErrorRe = null
   markerCmd(nonce: string, seq: number): string {
-    return `echo ${DONE_TAG}${nonce}:${seq}:%errorlevel%>`
+    // `<`/`>` 会被 cmd 当重定向，必须用 ^ 转义；marker 由 base 放到**独立下一行**，
+    // 使 %errorlevel% 在上一行执行完之后才展开（同一行拼接会取到解析期旧值）。
+    return `echo ^<${DONE_TAG.slice(1)}${nonce}:${seq}:%errorlevel%^>`
   }
   groupWrap(_body: string): string | null {
     // cmd 不包组：组内 `%errorlevel%` 是解析期展开，退出码会失真；保持原样逐行执行

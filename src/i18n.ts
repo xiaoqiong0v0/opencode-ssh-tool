@@ -315,6 +315,18 @@ web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入�
     en: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted",
     zh: "命令会导致 shell 进入续行等待（引号/反引号/转义未闭合），已中止",
   },
+  precheck_failed: {
+    en: "Pre-exec syntax check failed",
+    zh: "发送前语法校验失败",
+  },
+  precheck_entry: {
+    en: "ErrorId={errorId} at line {line} col {col} fragment={fragment}",
+    zh: "ErrorId={errorId} 位置=行{line}列{col} 片段={fragment}",
+  },
+  precheck_more: {
+    en: "… ({n} total)",
+    zh: "…（共 {n} 处）",
+  },
   shell_probe_timeout: {
     en: "Shell probe timed out (shell not ready within 30s); connection aborted",
     zh: "Shell 探测超时（30s 内 shell 未就绪），连接终止",
