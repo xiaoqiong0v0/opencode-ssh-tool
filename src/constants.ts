@@ -174,4 +174,4 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  * v18：register 增加 running 运行集合（注册时对账僵尸 busy）；状态推送改事件驱动+兜底；空闲关闭改事件驱动。
  */
-export const SERVER_PROTO_VERSION = 18
+export const SERVER_PROTO_VERSION = 19

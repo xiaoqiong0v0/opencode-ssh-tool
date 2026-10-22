@@ -3,7 +3,7 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import stringArgv from "string-argv"
 import { parseArgs } from "node:util"
-import log, { describeSend, infoDedupShared } from "./log.js"
+import log, { describeSend, infoDedupShared, sweepDedupDir } from "./log.js"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -18,10 +18,8 @@ import { LocalSession } from "./local-session.js"
 import { type SessionEntry } from "./server.js"
 import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
-import { writeSessionState, removeSessionState, removeAllSessionStates } from "./session-store.js"
+import { writeSessionState, removeSessionState, removeAllSessionStates, writeSessionMeta } from "./session-store.js"
 import { precheckBeforeExec } from "./precheck.js"
-
-export { precheckBeforeExec }
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -54,6 +52,21 @@ const localSessions = new Map<string, Map<string, LocalSession>>()
 
 /** 会话元信息（标题/目录，供 HTTP 页面显示），key = sessionID */
 const sessionMeta = new Map<string, { title: string; directory: string }>()
+
+/**
+ * 记录会话标题/目录并持久化到 meta.json（仅内容变化时写盘，避免 session.updated 每次刷盘）。
+ * @param root 根会话 ID
+ * @param title 标题
+ * @param directory 工作目录
+ * @returns 无
+ */
+function rememberSessionMeta(root: string, title: string, directory: string): void {
+  const prev = sessionMeta.get(root)
+  sessionMeta.set(root, { title, directory })
+  if (!prev || prev.title !== title || prev.directory !== directory) {
+    writeSessionMeta(cacheRoot(), root, { title, directory })
+  }
+}
 
 /** HTTP 服务已知地址（独立进程托管，本进程仅记录用于展示） */
 let httpUrl = ""
@@ -265,6 +278,7 @@ export const OpenCodeSshTool: Plugin = async () => {
   }
   // 插件实例批量加载（评测一次起多个 opencode run）时，"loaded" 每实例刷一条无信息量，
   // 用跨进程短窗去重合并（同一时间窗内多次加载只记一条，下次窗口外补"重复 N 次"）
+  sweepDedupDir() // 顺手清理 7 天前的跨进程去重标记（只存 {ts,count}，删除安全）
   infoDedupShared("plugin-loaded", "loaded", 10000)
 
   // 加载配置并"发起"HTTP 终端记录服务启动（默认开启；端口 0=自动分配）。
@@ -583,10 +597,10 @@ export const OpenCodeSshTool: Plugin = async () => {
           // 标题仅来自根会话自身；子会话不覆盖根标题
           const root = findRoot(info.id)
           if (info.id === root) {
-            sessionMeta.set(root, { title: info.title ?? "", directory: info.directory ?? "" })
+            rememberSessionMeta(root, info.title ?? "", info.directory ?? "")
             rootTitleOwned.add(root)
           } else if (!rootTitleOwned.has(root) && !sessionMeta.has(root)) {
-            sessionMeta.set(root, { title: info.title ?? "", directory: info.directory ?? "" })
+            rememberSessionMeta(root, info.title ?? "", info.directory ?? "")
           }
           // 有活动终端时同步状态文件
           const map = getSessionMap(root)

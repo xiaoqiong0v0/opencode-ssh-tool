@@ -8,7 +8,7 @@ import { join, dirname, extname, normalize } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { AddressInfo } from "node:net"
 import { WebSocketServer, WebSocket } from "ws"
-import { listAllSessions, removeSessionState, sweepStaleOrphanStateFiles, type SessionState } from "./session-store.js"
+import { listAllSessions, removeSessionState, removeSessionMeta, readSessionMeta, sweepStaleOrphanStateFiles, type SessionState } from "./session-store.js"
 import { tr, type FlatKey, type Lang } from "./i18n.js"
 import {
   PTY_COLS,
@@ -312,6 +312,12 @@ export function startServer(
 
   const buildSessions = (): Record<string, unknown> => {
     const states = listAllSessions(dir)
+    // 会话级 meta.json（标题/目录）：state 文件被清理后仍保留，供 history-only 条目恢复标题
+    const metaCache = new Map<string, ReturnType<typeof readSessionMeta>>()
+    const metaOf = (sid: string): ReturnType<typeof readSessionMeta> => {
+      if (!metaCache.has(sid)) metaCache.set(sid, readSessionMeta(dir, sid))
+      return metaCache.get(sid) ?? null
+    }
     // 补：state 文件可能被清理（重启/断线），但 history 目录仍在——扫描发现离线历史终端
     const histTerms: { sessionID: string; name: string; kind: string }[] = []
     for (const sidDir of readdirSync(dir)) {
@@ -376,7 +382,10 @@ export function startServer(
     }
     const bySession = new Map<string, { title?: string; directory?: string; terminals: { name: string; kind?: string; host?: string; user?: string; port?: number; program?: string; connected: boolean; busy: boolean; pending: number; canDelete: boolean; deleteReason?: string }[] }>()
     for (const s of states) {
-      if (!bySession.has(s.sessionID)) bySession.set(s.sessionID, { title: s.title, directory: s.directory, terminals: [] })
+      if (!bySession.has(s.sessionID)) {
+        const m = metaOf(s.sessionID)
+        bySession.set(s.sessionID, { title: s.title ?? m?.title, directory: s.directory ?? m?.directory, terminals: [] })
+      }
       const elig = deleteEligibility(s.sessionID, s.name, s)
       bySession.get(s.sessionID)!.terminals.push({ name: s.name, kind: s.kind, host: s.host, user: s.user, port: s.port, program: s.program, connected: s.connected, busy: s.busy, pending: s.pending, canDelete: elig.canDelete, deleteReason: elig.reasonKey ? tr(elig.reasonKey, lang) : undefined })
     }
@@ -385,7 +394,13 @@ export function startServer(
       const k = sessionKey(h.sessionID, h.name)
       if (seen.has(k)) continue
       seen.add(k)
-      if (!bySession.has(h.sessionID)) bySession.set(h.sessionID, { terminals: [] })
+      const m = metaOf(h.sessionID)
+      if (!bySession.has(h.sessionID)) bySession.set(h.sessionID, { title: m?.title, directory: m?.directory, terminals: [] })
+      else {
+        const g = bySession.get(h.sessionID)!
+        if (!g.title) g.title = m?.title
+        if (!g.directory) g.directory = m?.directory
+      }
       const elig = deleteEligibility(h.sessionID, h.name)
       bySession.get(h.sessionID)!.terminals.push({ name: h.name, kind: h.kind, connected: false, busy: false, pending: 0, canDelete: elig.canDelete, deleteReason: elig.reasonKey ? tr(elig.reasonKey, lang) : undefined })
     }
@@ -446,7 +461,10 @@ export function startServer(
     const offline = !agentBySession.has(k)
     const unclaimed = !claimedByAnyAgent().has(k)
     if (!offline || !unclaimed) return { canDelete: false, reasonKey: "web_delete_refused_active" }
-    const lastActive = Math.max(state?.updatedAt ?? 0, historyDirMtimeMs(sid, name))
+    // 无 state 文件 = 只剩 history（opencode 会话已退出，终端无法复用）→ 允许立即删除；
+    // 仍受上方 agent 认领检查保护，不会误删其他实例正在使用的活终端。
+    if (!state) return { canDelete: true }
+    const lastActive = Math.max(state.updatedAt ?? 0, historyDirMtimeMs(sid, name))
     if (Date.now() - lastActive <= STALE_ORPHAN_MS) return { canDelete: false, reasonKey: "web_delete_refused_recent" }
     return { canDelete: true }
   }
@@ -874,6 +892,14 @@ export function startServer(
         try {
           const histName = resolveHistName(sid, name)
           rmSync(join(dir, sid, histName), { recursive: true, force: true })
+        } catch { /* 目录不存在忽略 */ }
+        // 该会话已无任何终端目录：一并清掉 meta.json（避免残留标题让空会话继续出现在列表里）
+        try {
+          const sidPath = join(dir, sid)
+          const remaining = readdirSync(sidPath).filter((x) => {
+            try { return statSync(join(sidPath, x)).isDirectory() } catch { return false }
+          })
+          if (remaining.length === 0) removeSessionMeta(dir, sid)
         } catch { /* 目录不存在忽略 */ }
         streamBuf.delete(k)
         rawBuf.delete(k)

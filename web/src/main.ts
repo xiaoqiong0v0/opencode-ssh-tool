@@ -926,6 +926,9 @@ function sessionLabel(s: SessionStatus): string {
   if (s.title && s.title.trim()) return s.title
   const t = s.terminals && s.terminals[0]
   if (t && t.host) return (t.user ? t.user + "@" : "") + t.host
+  // 历史-only 条目没有 title/host：优先用终端名，避免显示成 sessionID
+  if (t && t.name && t.name !== "default") return t.name
+  if (t && t.program) return t.program
   return s.sessionID.slice(0, 8) + "…"
 }
 

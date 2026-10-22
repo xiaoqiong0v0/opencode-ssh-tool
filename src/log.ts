@@ -13,7 +13,7 @@
 //   把受影响的 `<主会话ID>/<终端名>` 列表打进同一行。独立服务是另一进程，只能看到 key=`sid:name`，
 //   拿不到 opencode 会话之外的上下文（其日志可按 sid 过滤，但无法按插件进程过滤）。
 import createLogger from "@xiaoqiong0v0/opencode-plugin-logger"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { stripAnsi } from "./ansi.js"
@@ -209,6 +209,32 @@ function dedupSafeName(key: string): string {
 
 /** 已排定"窗口结束回补汇总"定时器的跨进程 key（避免同进程重复排定） */
 const sharedTimerKeys = new Set<string>()
+
+/** 去重标记文件最长保留时间（7 天）：只影响跨进程去重状态，删除安全 */
+const DEDUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * 清理过期的跨进程去重标记文件（默认 7 天）。
+ * `.log-dedup` 的 key 可能含动态 ws 端口/连接序号，长期运行会累积；文件只存 `{ts,count}`，
+ * 过期删除不影响功能（下次命中窗口会重新创建）。读/删失败静默忽略，绝不阻断日志或插件。
+ * @param maxAgeMs 最大保留时长（毫秒）
+ * @returns 无
+ */
+export function sweepDedupDir(maxAgeMs = DEDUP_MAX_AGE_MS): void {
+  try {
+    for (const name of readdirSync(SHARED_DEDUP_DIR)) {
+      const file = join(SHARED_DEDUP_DIR, name)
+      try {
+        const st = statSync(file)
+        if (st.isFile() && Date.now() - st.mtimeMs > maxAgeMs) rmSync(file, { force: true })
+      } catch {
+        /* 单个文件被占用/已删除：跳过 */
+      }
+    }
+  } catch {
+    /* 目录不存在：忽略 */
+  }
+}
 
 /**
  * 跨进程短窗去重：多个 opencode 插件实例（各自独立进程）写同一日志文件时，

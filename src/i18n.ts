@@ -55,6 +55,14 @@ export const T = {
     en: "Local terminal start failed",
     zh: "本地终端启动失败",
   },
+  local_start_epipe: {
+    en: "Shell exited immediately after start (EPIPE). On Windows, avoid the bare Microsoft Store alias: use \"pwsh.exe -NoLogo\" or \"powershell\".",
+    zh: "shell 启动后立即退出（EPIPE）。Windows 上请避免裸 Store 别名：改用 \"pwsh.exe -NoLogo\" 或 \"powershell\"。",
+  },
+  local_start_not_found: {
+    en: "Executable not found in the service PATH: {cmd}. Use a path without spaces, or \"powershell\".",
+    zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
+  },
   term_cli: {
     en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read; use -w only for commands expected to finish quickly.",
     zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read；-w 只用于预期很快结束的命令。",

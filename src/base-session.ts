@@ -231,6 +231,12 @@ export abstract class BaseSession {
   protected _adapter: ShellAdapter | null = null
   /** 多行命令写入 PTY 的行分隔符：Unix PTY 用 \n；Windows ConPTY（本地会话）用 \r（裸 \n 不提交行） */
   protected _lineSep = "\n"
+  /**
+   * 当前会话终端是否为 Windows ConPTY：决定提交分隔符。
+   * 本地会话按宿主平台设置；SSH 会话在 shell 探测后按 pwsh 的 `$PSHOME` 路径判断
+   *（Windows `C:\...` → true，Unix `/...` → false），不能只看 adapter 类型。
+   */
+  protected _windowsPTY = process.platform === "win32"
   protected _closed = false
   /** 当前运行命令的输入时刻（history 记录展示命令发起时间用） */
   private _runningStartTs = 0
@@ -589,27 +595,26 @@ export abstract class BaseSession {
 
   /**
    * 组合实际写入 PTY 的命令：在规范形式（`_composeEchoText`）基础上把换行改写为行分隔符并补尾部回车。
-   * 行分隔符按**探测到的 shell 类型/平台**决定，而非按传输类型（本地/SSH）：
-   * - Windows shell（pwsh/cmd，控制台为 ConPTY）→ `\r`；本地 ConPTY 会话（无 adapter 时由 `_lineSep` 覆盖为 `\r`）→ `\r`；
-   * - SSH + POSIX（zsh/bash，走 Unix PTY）→ `\n`（`_lineSep` 默认值）。
+   * 行分隔符按**探测到的终端平台**决定，而非按传输类型（本地/SSH）：
+   * - Windows ConPTY（本机 Windows，或 SSH 到 Windows pwsh/cmd）→ `\r`；
+   * - Unix PTY（bash/zsh，含 Linux/macOS 上的 pwsh）→ `_lineSep`（通常 `\n`）。
+   * SSH 的 pwsh 平台由探测输出里的 `$PSHOME` 路径区分（`C:\...` vs `/...`）。
    * 原因：ConPTY 下裸 `\n` 只下移不复位、不提交行 → 多行命令逆序执行并卡在 `>>` 续行，须用 `\r`；
-   * 实测 SSH 连到 Windows 的 pwsh：用 `\n` 分隔时命令逆序卡死，改用 `\r` 后行序正确、组内作用域保留、输出正常。
-   * Unix PTY 下 `\n` 可正常提交行，保持不变。
+   * Unix PTY 下 `\n` 可正常提交行。
    * @param command 原始命令（history 存干净版本）
-   * @returns 实际写入 PTY 的文本（尾部带 \r，行分隔已按 shell 类型/平台规范化）
+   * @returns 实际写入 PTY 的文本（尾部带提交分隔符，行分隔已按平台规范化）
    */
   private _composeCommand(command: string): string {
-    // 行分隔符按 shell 类型/平台判定（见 _ptyLineSep）
-    return this._composeEchoText(command).replace(/\n/g, this._ptyLineSep()) + "\r"
+    // 行分隔符按终端平台判定（见 _ptyLineSep）
+    return this._composeEchoText(command).replace(/\n/g, this._ptyLineSep()) + this._ptyLineSep()
   }
 
   /**
-   * 当前 shell 的 PTY **提交分隔符**（让 shell 执行该行）：Windows shell（pwsh/cmd，ConPTY）→ `\r`
-   * （裸 \n 不提交行）；其余沿用会话 `_lineSep`（Unix PTY 为 \n，本地会话为 \r）。
+   * 当前终端的 PTY **提交分隔符**：Windows ConPTY → `\r`；Unix PTY → `_lineSep`（通常 `\n`）。
    * @returns 提交分隔符字符串
    */
   private _ptyLineSep(): string {
-    return this._adapter?.windowsShell ? "\r" : this._lineSep
+    return this._windowsPTY ? "\r" : this._lineSep
   }
 
   /**
@@ -957,7 +962,7 @@ export abstract class BaseSession {
    * @returns 无
    */
   protected _sendBaselineMarker(): void {
-    const baseline = this._markerCmd(0) + "\r"
+    const baseline = this._markerCmd(0) + this._ptyLineSep()
     debug(`[baseline] ${this._logTag} 初始化完成，发送基线标记 nonce=${this._nonce} seq=0`)
     this._write(baseline)
   }
@@ -970,7 +975,16 @@ export abstract class BaseSession {
         this._write(candidate.probeCommand + "\r")
         const output = await this._waitProbeOutput(Math.min(PROBE_TIMEOUT_MS, deadline - Date.now()))
         this._buffer = ""
-        if (output !== null && candidate.parseProbe(output)) return candidate
+        if (output !== null && candidate.parseProbe(output)) {
+          // 终端平台按真实 shell 判断：cmd 必为 Windows；pwsh 看 $PSHOME 是 Windows 路径还是 Unix 路径；
+          // bash/zsh 走 Unix PTY。这样 SSH 到 Linux 上的 pwsh 也会用 \n（不依赖 ICRNL）。
+          this._windowsPTY = candidate.name === "cmd"
+            ? true
+            : candidate.name === "pwsh"
+              ? /__SHELL_ID__pwsh_[A-Za-z]:[\\/]/.test(output)
+              : false
+          return candidate
+        }
       }
     }
     return null

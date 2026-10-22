@@ -6,6 +6,8 @@ import { tr } from "./i18n.js"
 import type { ExecResult } from "./base-session.js"
 import { BaseSession } from "./base-session.js"
 import log from "./log.js"
+import { delimiter, join } from "node:path"
+import { statSync } from "node:fs"
 
 export interface LocalStatus {
   connected: boolean
@@ -26,13 +28,74 @@ function splitCommand(cmd: string): string[] {
   return args
 }
 
+/**
+ * 在 PATH 中查找指定可执行文件，跳过 WindowsApps 下的 Store 执行别名
+ *（Bun.spawn 在 service/ConPTY 上下文拉不起该重解析点）。
+ * @param names 候选文件名（按优先级）
+ * @returns 第一个真实可执行文件路径；找不到返回 null
+ */
+function findRealOnPath(names: string[]): string | null {
+  // Windows 环境变量实际键名通常是 `Path`；Bun 的 process.env 可能不像 Node 那样大小写不敏感
+  const pathEnv = process.env.PATH || process.env.Path || process.env.path || ""
+  const dirs = pathEnv.split(delimiter)
+  for (const dir of dirs) {
+    for (const name of names) {
+      const p = join(dir, name)
+      try {
+        if (!statSync(p).isFile()) continue
+        if (/[\\/]WindowsApps[\\/]/i.test(p)) continue // Store 别名：跳过
+        return p
+      } catch {
+        /* 不存在/不可访问 */
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Windows 下规范化 PowerShell 启动命令：
+ * - 优先找**真实** `pwsh.exe`（跳过 WindowsApps 别名），使用其全路径；
+ * - 找不到则回退 `powershell.exe`（5.1），并记一行日志；
+ * - 两者都没有时退回 `pwsh.exe`，让上层给出可行动错误。
+ * 已有 -NoLogo 不重复添加；非 win32 或非 pwsh 首参原样返回。
+ * @param argv 拆分后的命令参数
+ * @returns 规范化后的参数
+ */
+function normalizeLocalArgv(argv: string[]): string[] {
+  if (process.platform !== "win32" || argv.length === 0) return argv
+  const exe = argv[0].toLowerCase()
+  if (exe !== "pwsh" && exe !== "pwsh.exe") return argv
+  const rest = argv.slice(1)
+  const addNoLogo = rest.some((a) => a.toLowerCase() === "-nologo") ? [] : ["-NoLogo"]
+  const pwsh = findRealOnPath(["pwsh.exe"])
+  if (pwsh) return [pwsh, ...addNoLogo, ...rest]
+  const psOnPath = findRealOnPath(["powershell.exe"])
+  // PATH 取不到时的绝对兜底（%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe）
+  const sysRoot = process.env.SystemRoot || process.env.windir
+  let ps = psOnPath
+  if (!ps && sysRoot) {
+    const psDefault = join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    try {
+      if (statSync(psDefault).isFile()) ps = psDefault
+    } catch {
+      /* 没有 5.1 */
+    }
+  }
+  if (ps) {
+    log.info("未找到可用的 PowerShell 7（pwsh 仅 Store 别名），回退到 powershell 5.1")
+    return [ps, ...addNoLogo, ...rest]
+  }
+  return ["pwsh.exe", ...addNoLogo, ...rest]
+}
+
 export class LocalSession extends BaseSession {
   private _term: Bun.Terminal | null = null
   private _proc: Bun.Subprocess | null = null
   private _program = ""
 
-  /** Windows ConPTY（本地/容器会话）裸 \n 不提交行，多行命令须用 \r 分隔 */
-  protected override _lineSep = "\r"
+  /** 本地 PTY 提交分隔符：Windows ConPTY 用 \r；Unix PTY 用 \n（不依赖 ICRNL 转换） */
+  protected override _lineSep = process.platform === "win32" ? "\r" : "\n"
 
   protected get _extraResult(): Partial<ExecResult> { return {} }
 
@@ -63,7 +126,7 @@ export class LocalSession extends BaseSession {
       // 内联 terminal 选项：让 Bun 走 terminal_info 路径、向子进程传 pty_slave_fd，
       // 子进程才能 setsid+TIOCSCTTY 取得自己的控制终端。若改为传入已 new 出的 Terminal 对象，
       // Bun 不传该 fd，子进程会沿用 opencode TUI 的 pts，导致 sudo 等读 /dev/tty 的程序抢占 TUI 屏幕/键盘。
-      const proc = Bun.spawn(splitCommand(opts.command), {
+      const proc = Bun.spawn(normalizeLocalArgv(splitCommand(opts.command)), {
         cwd: opts.cwd,
         terminal: {
           cols: PTY_COLS,
@@ -116,7 +179,13 @@ export class LocalSession extends BaseSession {
       const msg = e instanceof Error ? e.message : String(e)
       log.error(`本地终端启动失败 ${opts.command} (session ${this.sessionID}, term ${this.name})`, msg)
       this.close()
-      return { ok: false, error: msg }
+      // 把底层 EPIPE/ENOENT 转成可行动提示（原始错误附后，便于排障）
+      let friendly = msg
+      if (/EPIPE|broken pipe/i.test(msg)) friendly = `${tr("local_start_epipe", this._lang)}: ${msg}`
+      else if (/ENOENT|Executable not found|not found in \$PATH/i.test(msg)) {
+        friendly = `${tr("local_start_not_found", this._lang).replace("{cmd}", opts.command)}: ${msg}`
+      }
+      return { ok: false, error: friendly }
     }
   }
 

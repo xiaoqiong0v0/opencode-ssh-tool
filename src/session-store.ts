@@ -28,6 +28,71 @@ export interface SessionState {
 /** sessions 状态文件目录名 */
 const SESSIONS_DIR = "sessions"
 
+/** 会话级持久元信息文件名（标题/目录；state 文件清理后仍保留，供重启后的 history-only 展示） */
+const SESSION_META_FILE = "meta.json"
+
+/** 会话级持久元信息 */
+export interface SessionMeta {
+  /** opencode 会话标题（重启后用于 web 列表） */
+  title?: string
+  /** opencode 会话工作目录 */
+  directory?: string
+  /** 最后更新时间（毫秒） */
+  updatedAt: number
+}
+
+/**
+ * 写入会话级持久元信息（标题/目录）：state 文件会随进程退出被清理，但 meta.json 保留在
+ * `cacheRoot/<sessionID>/meta.json`，供 server 在只有 history 目录时恢复标题。
+ * 写入失败不抛异常（展示降级为 sessionID，不影响主流程）。
+ * @param cacheRoot 缓存根目录
+ * @param sessionID 主会话 ID
+ * @param meta 标题/目录
+ * @returns 无
+ */
+export function writeSessionMeta(cacheRoot: string, sessionID: string, meta: Omit<SessionMeta, "updatedAt">): void {
+  try {
+    mkdirSync(join(cacheRoot, sessionID), { recursive: true })
+  } catch {
+    return
+  }
+  atomicWriteJson(join(cacheRoot, sessionID, SESSION_META_FILE), { ...meta, updatedAt: Date.now() })
+}
+
+/**
+ * 读取会话级持久元信息
+ * @param cacheRoot 缓存根目录
+ * @param sessionID 主会话 ID
+ * @returns 元信息；缺失/损坏时返回 null
+ */
+export function readSessionMeta(cacheRoot: string, sessionID: string): SessionMeta | null {
+  try {
+    const raw = readFileSync(join(cacheRoot, sessionID, SESSION_META_FILE), "utf8")
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object") return null
+    const o = parsed as Record<string, unknown>
+    return {
+      title: typeof o.title === "string" ? o.title : undefined,
+      directory: typeof o.directory === "string" ? o.directory : undefined,
+      updatedAt: typeof o.updatedAt === "number" ? o.updatedAt : 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 删除会话级持久元信息（删除会话最后一个终端时清理）
+ * @param cacheRoot 缓存根目录
+ * @param sessionID 主会话 ID
+ * @returns 无
+ */
+export function removeSessionMeta(cacheRoot: string, sessionID: string): void {
+  try {
+    rmSync(join(cacheRoot, sessionID, SESSION_META_FILE), { force: true })
+  } catch { /* ignore */ }
+}
+
 /** 状态文件名：<sessionID>-<name>.json（name 已 sanitize，安全） */
 function stateFile(sessionsDir: string, sessionID: string, name: string): string {
   return join(sessionsDir, `${sessionID}-${name}.json`)
