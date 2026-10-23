@@ -85,7 +85,7 @@ Subcommands:
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
   exec "<command>" [-n name] [-w]
       run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; for long-running / stdin-reading / interactive commands use the default and poll with status/read, because -w keeps waiting as long as the command runs)
-  read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
+  read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
@@ -120,7 +120,7 @@ Examples:
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
   exec "<command>" [-n name] [-w]
       在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；长时间运行 / 需要 stdin / 交互的命令请用默认模式，再用 status/read 轮询，因为只要命令没结束 -w 就会一直等）
-  read [-n name] [-s buffer|history] [-l limit] [--head] [--include-command]
+  read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）

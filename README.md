@@ -7,7 +7,8 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **长驻会话**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
-- **命令完成判定**：完成标记法（`<SSH_DONE:seq:退出码>`）+ 静默窗口 + 动画检测（进度条等长输出自动识别）三重判定；**断连兜底，不设超时强杀**（长命令由 Ctrl-C 干预）；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截
+- **命令完成判定**：真实完成只认 `<SSH_DONE:<nonce>:<seq>:<退出码>>`；Ctrl-C 用独立 `<SSH_PROBE:...>` 探针标记收尾（写完 `\x03` 立即补发首条，之后按 `interruptProbeInterval` 周期补发）。**不设超时强杀**，也不把「静默窗口 / 动画」当完成判据——动画窗口只把长命令转后台继续监听；语法错误安静收尾、不再补发探针；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截；**断连兜底**
+- **发送前语法预检**：本机（本地/容器）命令发送前做语法预检，命中错误直接拦下、不写入终端；SSH 远程不预检、直接放行
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **直接输入（焦点驱动）**：浏览器内直接向交互式程序输入。默认「命令框优先」——按键留在浏览器，回车走 `exec` 提交命令；点终端区域（transcript `#term` / raw `#xt`）或入口按钮 `#cmdKey` 切换为直接输入，按键按**真实控制字节**经 `send` keystroke 通道发往终端（**不产生 `exec`、不写命令记录**）；焦点回到命令框等可编辑控件即自动关闭；状态**不持久化**，每次打开都从命令框优先开始；离线/断线时入口不可点击、按键一律不发送
 - **SSH 保活 + WS 心跳**：SSH 层按 `ServerAliveInterval` 语义定期发 `keepalive@openssh.com`（连接层**带外**消息，不写 channel/PTY），连续 3 次无响应判连接死亡并断连；WS 层 server 每 25s 下发 `ping`、10s 无 `pong` 判半开并断开，客户端静默超 2×间隔即主动断开重连——**保活与心跳都不写入 PTY，不污染终端输出与完成标记**
@@ -20,7 +21,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ```jsonc
 // opencode.json
 {
-  "plugin": ["opencode-ssh-tool"]
+  "plugin": ["@xiaoqiong0v0/opencode-ssh-tool"]
 }
 ```
 
@@ -36,7 +37,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
 term_cli exec "<command>" [-n name] [-w]                          # 执行命令（默认提交后立即返回；-w 等到命令真正结束，仅用于预期很快结束的命令）
-term_cli read [-n name] [-s buffer|history] [-l limit] [--head]   # 读输出
+term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出
 term_cli send "<text>" [-n name]                                  # 发送按键（sudo 密码等）
 term_cli status [-n name]                                         # 状态
 term_cli disconnect [-n name]                                     # 断开
@@ -54,7 +55,7 @@ term_cli help                                                     # 完整用法
   // HTTP 终端记录服务开关（默认 true）
   "server": {
     "enabled": true,
-    // 端口：不设默认值。0 = 自动分配随机端口（推荐，避免冲突）；可显式指定，如 8137
+    // 端口：默认 0（随机端口，推荐，避免冲突）；可显式指定，如 8137
     "port": 0
   },
   // 会话记录（命令+输出 消息对）管理：全部存文件（~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/），随会话清理
@@ -135,7 +136,7 @@ term_cli exec(command)
 opencode（插件进程）
   ├─ agent：每会话多个命名终端，PTY 固定 120×40
   │    ├─ SSH（ssh2 PTY shell）/ 本地·容器（Bun.Terminal）
-  │    └─ 完成标记法执行命令（`command ;markerCmd` → `<SSH_DONE:seq:退出码>`）
+  │    └─ 完成标记法执行命令（`command ;markerCmd` → `<SSH_DONE:<nonce>:<seq>:<退出码>>`）
   ├─ server：独立 HTTP 子进程（WS 统一事件流，proto 版本校验）
   └─ web：transcript（消息对）/ raw（xterm.js）双视图，浏览器实时查看
 ```
@@ -144,7 +145,7 @@ opencode（插件进程）
 
 ```bash
 npm install      # 安装依赖（dependencies + devDependencies）
-npm run build    # tsc：src → dist
+npm run build    # tsc（src → dist）+ node web/build.mjs（打包 Web 资源）
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`
@@ -156,14 +157,14 @@ npm run build    # tsc：src → dist
 
 ```bash
 npm run build
-npm publish      # 只发布 dist/
+npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 ```
 
 本项目提交 GitHub 发布 npm；使用方 `opencode.json` 的 `plugin` 数组引用。
 
 ## 测试清单
 
-需真实 SSH 主机（可用 Docker 测试环境，见 `.tmp/ssh-test-docker.ps1`）：
+需真实 SSH 主机，测试环境需自备 Docker/SSH（测试脚本不随仓库发布）：
 
 - [ ] `term_cli connect` → 登录成功，cwd 为登录目录
 - [ ] `term_cli exec("ls")` 连续多次，确认永不重连（同一会话）
@@ -172,7 +173,7 @@ npm publish      # 只发布 dist/
 - [ ] 白名单命令不弹审批直接执行；`rm -rf` 被拒绝
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
 - [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
-- [ ] `term_cli read` 取前/后 N 条历史输出（含 `includeCommand`、`source=buffer`）
+- [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）
 - [ ] `term_cli status` / HTTP 页面浏览器可访问
 - [ ] `term_cli disconnect` 后连接释放
 
@@ -181,7 +182,11 @@ npm publish      # 只发布 dist/
 - `docs/requirements/需求说明.md` — 原始需求
 - `docs/design/方案分析.md` — 技术分析、决策、风险
 - `docs/design/结构设计.md` — 编码依据
-- `docs/design/消息协议重构设计.md` — WS 统一事件流协议
+- `docs/design/消息协议重构设计.md` — WS 统一事件流协议（历史设计，当前以结构设计/代码为准）
 - `docs/design/终端渲染与尺寸固定说明.md` — 终端尺寸固定、续行检测、渲染修复
+- `docs/design/多语言配置说明.md` — toolLang / webLang 分离与边界
+- `docs/design/多行命令包组与raw渲染修复说明.md` — 多行包组、raw 渲染、headless 屏幕、语法错误收尾
+- `docs/design/中断探针修复说明.md` — Ctrl-C 中断探针（历史记录，当前行为以 README / 结构设计为准）
+- `docs/design/直接输入与保活心跳说明.md` — 直接输入（焦点驱动）与 SSH/WS 保活心跳
 
 

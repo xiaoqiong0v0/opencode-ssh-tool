@@ -92,7 +92,7 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 
 ### 协议版本
 
-`SERVER_PROTO_VERSION` **12 → 13**。server 代码变更须提升协议版本，`ensureServer` 才会替换旧 server 进程，否则改动不生效。
+`SERVER_PROTO_VERSION` **12 → 13**（当时值；当前 19）。server 代码变更须提升协议版本，`ensureServer` 才会替换旧 server 进程，否则改动不生效。
 
 ## 4. 多行命令行分隔符：按探测到的 shell 类型/平台（Windows ConPTY）
 
@@ -117,11 +117,14 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 | 成员 | 位置 | 职责 |
 |---|---|---|
 | `_composeEchoText(command)` | `src/base-session.ts` | **规范形式（恒 `\n` 分行、无尾部回车）**：包组 + 标记同行拼接；供 `extractOutputStart` 按 `\n` 切行、段间宽松匹配跳过 `>>` / `>` 续行提示。**不随 shell 类型改变**（匹配用） |
-| `_composeCommand(command)` | `src/base-session.ts` | **写入 PTY 形式**：`const sep = this._adapter?.windowsShell ? "\r" : this._lineSep`，再 `_composeEchoText(...).replace(/\n/g, sep) + "\r"` |
-| `ShellAdapter.windowsShell` | `src/shell-adapter.ts` | 该 shell 是否运行在 Windows 控制台（ConPTY）：pwsh / cmd → `true`（写入须 `\r`）；zsh / bash → `false`（`\n` 可正常提交） |
-| `_lineSep` | `BaseSession` 默认 `"\n"` | **回退值**（无 `windowsShell` 判定时用）：SSH + POSIX 走 Unix PTY → `\n`；`src/local-session.ts` 覆盖为 `"\r"`（本地 ConPTY，adapter 尚未探测/为 null 时兜底） |
+| `_composeCommand(command)` | `src/base-session.ts` | **写入 PTY 形式**：`_composeEchoText(...).replace(/\n/g, this._ptyLineSep()) + this._ptyLineSep()` |
+| `_windowsPTY` | `src/base-session.ts:239` | 当前终端是否为 Windows ConPTY：本地会话按宿主平台初始化为 `process.platform === "win32"`；SSH 会话在 shell 探测后按 pwsh `$PSHOME` 路径判断（`C:\...` → `true`，`/...` → `false`） |
+| `_ptyLineSep()` | `src/base-session.ts` | 唯一写入判据：`_windowsPTY ? "\r" : _lineSep` |
+| `_lineSep` | `BaseSession` 默认 `"\n"` | Unix PTY 回退值；`src/local-session.ts:98` 按平台覆盖（win32 → `"\r"`，否则 `"\n"`） |
 
-**行分隔符判定规则（最终）**：Windows shell（pwsh/cmd，ConPTY）→ `\r`；本地会话（ConPTY）→ `\r`；SSH + POSIX（Unix PTY）→ `\n`。
+**行分隔符判定规则（当前）**：`_windowsPTY === true`（Windows ConPTY：本机 Windows，或 SSH 到 Windows pwsh/cmd）→ `\r`；否则（Unix PTY，含 Linux/macOS 上的 pwsh）→ `_lineSep`（通常 `\n`）。
+
+> **历史沿革**：2026-09-29 当时实现用 `ShellAdapter.windowsShell` + `_composeCommand = windowsShell ? "\r" : _lineSep`；2026-10-22 起改为 `_windowsPTY` + `_ptyLineSep()`，不再把 `ShellAdapter.windowsShell` 当运行时判据（SSH pwsh 必须看 `$PSHOME` 才知是 Windows 还是 Unix PTY）。
 
 **为何必须解耦（实测）**：初版实现是在 `_composeEchoText` 返回前把 `\n` 替换为行分隔符——
 `\r` 场景下组合文本不含任何 `\n`，`extractOutputStart` 按 `\n` 切行时整段成为一行，
@@ -129,7 +132,7 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 解耦后实测：本地 pwsh 多行命令返回纯 `x=7 loc=D:\tmp`，history 记一条。
 
 实测：本地 pwsh 用 `\r` 后行序正确、组内作用域保留、marker 正常。
-实测（SSH→Windows pwsh）：用 `\n` 分隔时命令逆序卡死；改按 `windowsShell` 选 `\r` 后行序正确、组内作用域保留、输出正常。
+实测（SSH→Windows pwsh，当时实现）：用 `\n` 分隔时命令逆序卡死；改按 `windowsShell` 选 `\r` 后行序正确、组内作用域保留、输出正常。当前由 `_windowsPTY`（SSH pwsh 按 `$PSHOME` 判定）+ `_ptyLineSep()` 覆盖同一场景。
 脚本 `.tmp/check-winshell.mjs` 断言 15 项全 PASS（adapter 取值 + `_composeCommand` 分隔符）。
 
 ## 5. 续行/完整性检测修正
@@ -197,9 +200,9 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| `SERVER_PROTO_VERSION` | `12` → `13` | server 代码变更（§3），须提升版本以触发旧 server 进程替换 |
-| `ShellAdapter.windowsShell` | `true`（pwsh/cmd）/ `false`（zsh/bash） | 该 shell 是否运行在 Windows 控制台（ConPTY）；`_composeCommand` 据此决定写入行分隔符 |
-| `_lineSep`（`BaseSession`） | 默认 `"\n"`（SSH+POSIX）/ `"\r"`（`LocalSession` 覆盖） | 行分隔符**回退值**：仅当 `windowsShell` 不为 `true` 时由 `_composeCommand` 采用；`_composeEchoText` 恒为规范 `\n`（§4） |
+| `SERVER_PROTO_VERSION` | `12` → `13` | 当时值；当前为 `19`。server 代码变更（§3），须提升版本以触发旧 server 进程替换 |
+| `ShellAdapter.windowsShell` | ~~`true`（pwsh/cmd）/ `false`（zsh/bash）~~ | **当时实现（2026-09-29）用于判断 ConPTY；2026-10-22 起运行时判据改为 `_windowsPTY` + `_ptyLineSep()`** |
+| `_lineSep`（`BaseSession`） | 默认 `"\n"`，`LocalSession` 按平台覆盖 | Unix PTY 回退值；当前写入分隔符统一由 `_ptyLineSep()` 给出（`_windowsPTY ? "\r" : _lineSep`），`_composeEchoText` 恒为规范 `\n`（§4） |
 | `LOCK_OWNER` | `owner.json` | 锁属主文件名（`pid` + `ts`） |
 | `LOCK_NOINFO_STALE_MS` | `5_000` | 无属主信息的锁视为陈旧的空闲时长 |
 | `LOCK_ABS_STALE_MS` | `60_000` | 有属主信息的锁的绝对上限 |
@@ -210,13 +213,13 @@ out / run / sep 分支**不动**——输出是原始字节流，保持保真（
 
 | 文件 | 改动 |
 |---|---|
-| `src/base-session.ts` | 新增 `_composeEchoText`（多行包组 + 标记同行拼接，恒返回规范 `\n` 匹配形式）；新增 `_composeCommand`（写入形式：行分隔符 `= windowsShell ? "\r" : _lineSep`，`\n` → 该分隔符 + 尾 `\r`）；新增 `protected _lineSep`；删除 `splitCommand` |
-| `src/shell-adapter.ts` | 接口新增 `stmtSep` / `windowsShell` / `groupWrap`，4 个适配器实现（`windowsShell`：pwsh/cmd → `true`，zsh/bash → `false`）；删除 `splitCommand`、`splitByContinuation`、`hasHeredoc`；重写 3 个 `*OpenContinuation` 检测（注释 / heredoc 闭合 / 括号深度 / here-string，见 §5），`heredocDelim` 改逐字符引号感知，新增 `isPosixCommentStart`、`pwshHereStringStart` |
+| `src/base-session.ts` | 新增 `_composeEchoText`（多行包组 + 标记同行拼接，恒返回规范 `\n` 匹配形式）；新增 `_composeCommand`（写入形式：`_composeEchoText(...).replace(/\n/g, _ptyLineSep()) + _ptyLineSep()`）；新增 `_windowsPTY` / `_ptyLineSep()`；删除 `splitCommand` |
+| `src/shell-adapter.ts` | 接口新增 `stmtSep` / `windowsShell` / `groupWrap`，4 个适配器实现（`windowsShell` 自 2026-10-22 起**不再是运行时判据**）；删除 `splitCommand`、`splitByContinuation`、`hasHeredoc`；重写 3 个 `*OpenContinuation` 检测（注释 / heredoc 闭合 / 括号深度 / here-string，见 §5），`heredocDelim` 改逐字符引号感知，新增 `isPosixCommentStart`、`pwshHereStringStart` |
 | `src/agent.ts` | 删除 `AgentSession.splitCommand` 声明与 `run-exec` 多行拆分分支 |
-| `src/local-session.ts` | 覆盖 `_lineSep = "\r"` |
+| `src/local-session.ts` | 按平台覆盖 `_lineSep`（win32 → `"\r"`，否则 `"\n"`）；PTY 用 `Bun.spawn` 内联 `terminal:{...}` |
 | `src/server.ts` | `buildRawFromHistory` cmd 分支行尾规范化（`\r?\n` → `\r\n`） |
 | `src/server-manager.ts` | `owner.json` 留痕、`clearStaleLock()`、`acquireLock()`、等待循环每轮重试 |
-| `src/constants.ts` | `SERVER_PROTO_VERSION` 13 |
+| `src/constants.ts` | `SERVER_PROTO_VERSION` 13（当时值；当前 19） |
 
 > 本表覆盖 §2–§6；追加批次涉及的文件见 §11「修复」表与 §12「修复」表（含新增文件 `src/ansi.ts`、`package.json` 依赖变更）。
 
@@ -306,8 +309,8 @@ pwsh 的**解析错误（`ParserError`）使整行命令作废**：完成标记�
 | 模式 | `src/shell-adapter.ts` | `ShellAdapter` 新增 `readonly syntaxErrorRe: RegExp \| null`：pwsh → 行首 `ParserError:`（**大小写敏感**）；zsh / bash → `POSIX_SYNTAX_ERROR_RE`（行首可选「路径 + shell 名 + 位置链」前缀 + `syntax error` / `parse error`，大小写不敏感以兼容 dash 的 `Syntax error`）；cmd → `null` |
 | 检测 | `src/shell-adapter.ts` | 新增 `detectSyntaxError(adapter, buffer, fromPos)`：**先 `stripAnsi` 剥净窗口内全部转义序列，再按行首判定**；模式不带 `g`，`test` 无状态 |
 | ANSI 单一来源 | `src/ansi.ts`（新增文件） | `ANSI_SEQ_PATTERN`（CSI 含 `?` / `;` 参数，覆盖 `\x1b[?25l`、`\x1b[39;1H`；OSC；双字节 ESC）+ `stripAnsi()`；`src/utils.ts` 的 `ECHO_WIDE` / `TAIL_ANSI` 与提示符比较用的 `normLine` 改为复用该来源（不再各自定义） |
-| 前台等待 | `BaseSession._waitCompletion` | 每轮**最先**跑语法检测（优先于交互提示与「判为 running」）；命中后不立即收尾，先等输出安静：停止增长达 `SYNTAX_QUIET_MS = 300`，或自首次识别达 `SYNTAX_MAX_WAIT_MS = 1_000` 上限。返回 `{ kind: "done", exitCode: null, syntaxError: true }`，`markerPos` 缺省 → 输出窗口取到缓冲区末尾 |
-| 后台 watch | `BaseSession._startBackgroundWatch` | 同一安静窗口规则；命中后走**与正常完成一致的收尾路径**：`_extractOutput(..., syntaxMode = true)` → `_history.append` → `done` 事件 → `_clearRunningContext` → busy 按 `_holdBusy` 翻转 |
+| 前台等待 | `BaseSession._awaitCompletion`（当时名 `_waitCompletion`） | 数据到达事件驱动；判定顺序：先认完成标记 DONE、再认中断探针 PROBE，最后才在数据到达时判语法错误；命中后不立即收尾，先等输出安静：停止增长达 `SYNTAX_QUIET_MS = 300`，或自首次识别达 `SYNTAX_MAX_WAIT_MS = 1_000` 上限。返回 `{ kind: "done", exitCode: null, syntaxError: true }`，`markerPos` 缺省 → 输出窗口取到缓冲区末尾 |
+| 后台 watch | `BaseSession._startFallbackWatch`（当时名 `_startBackgroundWatch`） | 稀疏兜底（断连 + 极端漏判，tick 调 `_checkCompletion(false)`）；同一安静窗口规则；命中后走**与正常完成一致的收尾路径**：`_extractOutput(..., syntaxMode = true)` → `_history.append` → `done` 事件 → `_clearRunningContext` → busy 按 `_holdBusy` 翻转 |
 | 输出提取 | `BaseSession._extractOutput` / `extractOutputStart` | 语法路径下回显定位改用 `first = true` **首次匹配**：pwsh 错误块的 `   1 \|  <命令>` 行会重印含标记的整行命令，末次匹配会落到该拷贝上，把 `ParserError:` / `Line \|` 等错误块**前半裁掉** |
 
 **为何必须先剥 ANSI（首版失效的根因）**：初版只容忍 SGR（`\x1b[...m`），而真实 ConPTY 的错误块前带
@@ -317,7 +320,7 @@ pwsh 的**解析错误（`ParserError`）使整行命令作废**：完成标记�
 ### 明确不做
 
 不加「无标记即超时完成」式兜底：静默长命令（`sleep 60`、无输出的构建）会被误判为已完成。
-语法错误以外的「标记迟迟不出现」仍由用户 Ctrl-C 干预（TTY 回显 `^C` → `exitCode 130`）。
+语法错误以外的「标记迟迟不出现」仍由用户 Ctrl-C 干预：写完 `\x03` 立即补发中断探针，收到当前 seq 的 `<SSH_PROBE:...>` 标记才收尾（`^C` 回显不作为完成依据；见 §12 末与 `中断探针修复说明.md`）。
 
 ### 探针标记独立化与语法错误收尾（2026-10-22）
 
