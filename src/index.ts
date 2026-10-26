@@ -2,10 +2,11 @@
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
 import { parseArgs } from "node:util"
+import { randomUUID } from "node:crypto"
 import log, { describeSend, infoDedupShared, sweepDedupDir } from "./log.js"
 import { parseCliArgs } from "./cli-args.js"
 import { PayloadError, normalizeExecText, resolvePayload, type ResolvedPayload } from "./payload.js"
-import { CACHE_DIR } from "./constants.js"
+import { CACHE_DIR, MAX_TRANSFER_BYTES, TRANSFER_PROGRESS_THROTTLE_MS, TRANSFER_TIMEOUT_MS } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { rmSync } from "node:fs"
@@ -14,8 +15,10 @@ import { SessionHistory } from "./history.js"
 import { T, getToolLang, getWebLang, tr, type FlatKey } from "./i18n.js"
 import { toModelText } from "./utils.js"
 import { createDecider } from "./permission.js"
-import { SshSession } from "./session.js"
+import { runSshTransfer, SshSession } from "./session.js"
 import { LocalSession } from "./local-session.js"
+import { TransferError, parseTransferPositionals, type TransferErrorCode } from "./transfer.js"
+import type { TransferTask } from "./transfer-events.js"
 import { type SessionEntry } from "./server.js"
 import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
@@ -33,6 +36,26 @@ type CliCtx = {
 
 /** 终端名合法字符（字母/数字/下划线/中划线/点），防止路径穿越 */
 const NAME_RE = /^[A-Za-z0-9_.-]+$/
+
+/** 传输错误码 → i18n 文案键（展示文案不在 transfer.ts 中硬编码） */
+const TRANSFER_ERROR_KEYS: Record<TransferErrorCode, FlatKey> = {
+  exists: "transfer_err_exists",
+  local_missing: "transfer_err_local_missing",
+  local_is_dir: "transfer_err_local_is_dir",
+  remote_missing: "transfer_err_remote_missing",
+  remote_is_dir: "transfer_err_remote_is_dir",
+  symlink: "transfer_err_symlink",
+  parent_missing: "transfer_err_parent_missing",
+  too_large: "transfer_err_too_large",
+  sftp_unavailable: "transfer_err_sftp_unavailable",
+  timeout: "transfer_err_timeout",
+  io: "transfer_err_io",
+  unsupported: "transfer_err_unsupported",
+  ssh_only: "transfer_err_ssh_only",
+  denied: "transfer_denied",
+  tilde_user: "transfer_err_tilde_user",
+  remote_path_backslash: "transfer_err_remote_path_backslash",
+}
 
 /**
  * 校验并规整终端名（防路径穿越：拒绝 ../、绝对路径、路径分隔符）
@@ -366,11 +389,17 @@ export const OpenCodeSshTool: Plugin = async () => {
     } catch {
       return tr("rejected_connect", toolLang)
     }
-    const map = getSessionMap(ctx.sessionID)
-    const old = map?.get(name)
+    // 先占住会话表再 await 连接：两个不同名终端并行 connect 时，
+    // 不能各自在 await 后 new Map() 覆盖对方（会丢终端并触发状态文件孤儿清理）。
+    let map = getSessionMap(ctx.sessionID)
+    if (!map) {
+      map = new Map()
+      sshSessions.set(ctx.sessionID, map)
+    }
+    const old = map.get(name)
     if (old) {
       old.close()
-      map!.delete(name)
+      map.delete(name)
     }
     const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ host, user, port, password: values.password })
@@ -379,8 +408,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       session.close()
       return `${tr("connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
     }
-    if (!map) sshSessions.set(ctx.sessionID, new Map())
-    sshSessions.get(ctx.sessionID)!.set(name, session)
+    map.set(name, session)
     hookBusyState(session, ctx.sessionID, name)
     syncSessionState(ctx.sessionID, name, "connect")
     refreshAgent()
@@ -394,11 +422,16 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!command) return `${tr("cli_need_command", toolLang)}\n${tr("cli_local_usage", toolLang)}\n\n${HELP_TEXT}`
     const name = values.name ?? DEFAULT_NAME
     if (sanitizeName(name) === null) return tr("invalid_name", toolLang)
-    const map = getLocalSessionMap(ctx.sessionID)
-    const old = map?.get(name)
+    // 同样先占住会话表，避免并行 local 连接互相覆盖。
+    let map = getLocalSessionMap(ctx.sessionID)
+    if (!map) {
+      map = new Map()
+      localSessions.set(ctx.sessionID, map)
+    }
+    const old = map.get(name)
     if (old) {
       old.close()
-      map!.delete(name)
+      map.delete(name)
     }
     const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ command, cwd: values.cwd })
@@ -407,8 +440,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       session.close()
       return `${tr("local_connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
     }
-    if (!map) localSessions.set(ctx.sessionID, new Map())
-    localSessions.get(ctx.sessionID)!.set(name, session)
+    map.set(name, session)
     hookBusyState(session, ctx.sessionID, name)
     syncSessionState(ctx.sessionID, name, "local")
     refreshAgent()
@@ -544,6 +576,199 @@ export const OpenCodeSshTool: Plugin = async () => {
     return tr("send_ok_source", toolLang).replace("{source}", payload.source).replace("{length}", String(text.length))
   }
 
+  /**
+   * 传输错误 → 本地化可操作文案（路径/上限/超时秒数由常量填充，不硬编码）
+   * @param err 传输错误
+   * @returns 本地化文案
+   */
+  function transferErrorText(err: TransferError): string {
+    const template = tr(TRANSFER_ERROR_KEYS[err.code], toolLang)
+    const limitMiB = Math.round(MAX_TRANSFER_BYTES / (1024 * 1024))
+    return template
+      .replace("{path}", err.path ?? "-")
+      .replace("{reason}", err.detail ?? "")
+      .replace("{limit}", `${limitMiB} MiB`)
+      .replace("{seconds}", String(Math.round(TRANSFER_TIMEOUT_MS / 1000)))
+  }
+
+  /**
+   * upload / download 共用实现：解析参数 → 仅 SSH 会话 → 权限审批 → SFTP 传输 → 回执
+   * 传输内容不进入工具输出/日志；日志只记方向、路径、字节、耗时、ok、错误码。
+   * @param direction 传输方向
+   * @param args 子命令参数
+   * @param ctx 执行上下文
+   * @returns 回执或错误文案
+   */
+  async function doTransfer(direction: "upload" | "download", args: string[], ctx: CliCtx): Promise<string> {
+    const usage = tr(direction === "upload" ? "cli_upload_usage" : "cli_download_usage", toolLang)
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, overwrite: { type: "boolean" }, mkdir: { type: "boolean" } }, allowPositionals: true })
+    const pair = parseTransferPositionals(positionals)
+    if (!pair) return `${tr("cli_need_transfer_paths", toolLang)}\n${usage}\n\n${HELP_TEXT}`
+    const { first, second } = pair
+    const name = values.name ?? DEFAULT_NAME
+    if (sanitizeName(name) === null) return tr("invalid_name", toolLang)
+    const session = resolveSession(ctx.sessionID, name)
+    if (!session) return tr("not_connected", toolLang)
+
+    const permission = direction === "upload" ? "file_upload" : "file_download"
+    const overwrite = values.overwrite === true
+    const mkdir = values.mkdir === true
+    const logKey = direction === "upload" ? "file_upload" : "file_download"
+    /** 当前传输任务（审批通过、run 开始时创建；拒绝/非 SSH 不创建，因此不会被伪造上报） */
+    let transferTask: TransferTask | null = null
+    /** 最近一次进度回调值（字节/总数），完成或失败时用于补齐最终值 */
+    let lastBytes = 0
+    let lastTotal = 0
+    /** 进度节流的尾沿定时器（窗口内多次回调合并为最新一帧） */
+    let progressTimer: ReturnType<typeof setTimeout> | null = null
+    /** 上次实际发出进度事件的时刻（毫秒） */
+    let lastEmitAt = 0
+
+    /** 发送传输任务元数据（无 agent/未连接时静默丢弃；只发元数据，不含内容） */
+    const emitTransfer = (task: TransferTask): void => { agent?.transfer(task) }
+
+    /** 清除待发的进度尾沿定时器 */
+    const clearProgressTimer = (): void => {
+      if (progressTimer) { clearTimeout(progressTimer); progressTimer = null }
+    }
+
+    /** 立即发送当前进度（以最新回调值为准） */
+    const flushProgress = (): void => {
+      progressTimer = null
+      if (!transferTask || transferTask.state !== "running") return
+      lastEmitAt = Date.now()
+      emitTransfer({ ...transferTask, bytes: lastBytes, total: lastTotal })
+    }
+
+    /**
+     * 进度回调（由 transfer.ts 在每块数据后调用）：按 TRANSFER_PROGRESS_THROTTLE_MS 节流；
+     * 首次超过窗口立即发，否则挂一个尾沿定时器，保证窗口内最新值最终被发出。
+     * @param bytes 已传字节数
+     * @param total 总字节数
+     */
+    const onProgress = (bytes: number, total: number): void => {
+      lastBytes = bytes
+      lastTotal = total
+      if (!transferTask || transferTask.state !== "running") return
+      const elapsed = Date.now() - lastEmitAt
+      if (elapsed >= TRANSFER_PROGRESS_THROTTLE_MS) { flushProgress(); return }
+      if (progressTimer === null) {
+        progressTimer = setTimeout(flushProgress, TRANSFER_PROGRESS_THROTTLE_MS - elapsed)
+        if (typeof progressTimer.unref === "function") progressTimer.unref()
+      }
+    }
+
+    /** 取当前未结束的任务（跨异步回调读取，避免 TS 把闭包内赋值的变量误窄化为 null） */
+    const runningTask = (): TransferTask | null =>
+      transferTask && transferTask.state === "running" ? transferTask : null
+
+    try {
+      // runSshTransfer 固定顺序：instanceof SshSession → ctx.ask → 实际传输
+      const result = await runSshTransfer({
+        session,
+        ask: () => ctx.ask({
+          permission,
+          patterns: [first, second],
+          // overwrite/mkdir 参与 always 键：避免"总是允许"普通上传后，同路径 --overwrite 不再询问
+          always: [`${permission}:${first}:${second}:ow=${overwrite ? 1 : 0}:mkdir=${mkdir ? 1 : 0}`],
+          metadata: { title: `${first} -> ${second}`, overwrite, mkdir },
+        }),
+        run: async (ssh) => {
+          // 审批通过、真正开始传输时才建任务并上报 running（拒绝/非 SSH 不会走到这里）
+          const startedAt = Date.now()
+          transferTask = {
+            id: randomUUID(),
+            sessionID: ctx.sessionID,
+            name,
+            direction,
+            localPath: direction === "upload" ? first : second,
+            remotePath: direction === "upload" ? second : first,
+            state: "running",
+            bytes: 0,
+            total: 0,
+            startedAt,
+          }
+          lastBytes = 0
+          lastTotal = 0
+          lastEmitAt = startedAt
+          emitTransfer({ ...transferTask })
+          return direction === "upload"
+            ? ssh.uploadFile({ localPath: first, remotePath: second, overwrite, mkdir, onProgress })
+            : ssh.downloadFile({ remotePath: first, localPath: second, overwrite, mkdir, onProgress })
+        },
+      })
+      const activeTask = runningTask()
+      if (activeTask) {
+        clearProgressTimer()
+        // 完成补最终值：路径/字节取实际结果；total 优先用进度回调拿到的 stat 大小
+        const finished: TransferTask = {
+          ...activeTask,
+          localPath: result.localPath,
+          remotePath: result.remotePath,
+          state: "done",
+          bytes: result.bytes,
+          total: lastTotal || result.bytes,
+          endedAt: Date.now(),
+        }
+        transferTask = finished
+        emitTransfer(finished)
+      }
+      log.tool(logKey, {
+        sessionID: ctx.sessionID,
+        name,
+        local: result.localPath,
+        remote: result.remotePath,
+        bytes: result.bytes,
+        duration: result.duration,
+        ok: true,
+      })
+      return tr(direction === "upload" ? "upload_ok" : "download_ok", toolLang)
+        .replace("{local}", result.localPath)
+        .replace("{remote}", result.remotePath)
+        .replace("{bytes}", String(result.bytes))
+        .replace("{ms}", String(result.duration))
+    } catch (e) {
+      const err = e instanceof TransferError ? e : new TransferError("io", undefined, e instanceof Error ? e.message : String(e))
+      const activeTask = runningTask()
+      if (activeTask) {
+        clearProgressTimer()
+        const failed: TransferTask = {
+          ...activeTask,
+          state: "failed",
+          bytes: lastBytes,
+          total: lastTotal,
+          endedAt: Date.now(),
+          errorCode: err.code,
+        }
+        transferTask = failed
+        emitTransfer(failed)
+      } else {
+        clearProgressTimer()
+      }
+      // 失败详情（含回滚失败时的 .bak 路径）同时进日志，便于事后定位
+      log.tool(logKey, {
+        sessionID: ctx.sessionID,
+        name,
+        local: first,
+        remote: second,
+        ok: false,
+        code: err.code,
+        ...(err.detail ? { reason: err.detail } : {}),
+      })
+      return transferErrorText(err)
+    }
+  }
+
+  /** upload：本机文件 → SSH 远端（SFTP） */
+  function doUpload(args: string[], ctx: CliCtx): Promise<string> {
+    return doTransfer("upload", args, ctx)
+  }
+
+  /** download：SSH 远端 → 本机（SFTP） */
+  function doDownload(args: string[], ctx: CliCtx): Promise<string> {
+    return doTransfer("download", args, ctx)
+  }
+
   /** status：终端状态 */
   async function doStatus(args: string[], ctx: CliCtx): Promise<string> {
     const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" } }, allowPositionals: true })
@@ -631,6 +856,8 @@ export const OpenCodeSshTool: Plugin = async () => {
       case "exec": return doExec(rest, rootCtx)
       case "read": return doRead(rest, rootCtx)
       case "send": return doSend(rest, rootCtx)
+      case "upload": return doUpload(rest, rootCtx)
+      case "download": return doDownload(rest, rootCtx)
       case "status": return doStatus(rest, rootCtx)
       case "disconnect": return doDisconnect(rest, rootCtx)
       default: return `${tr("cli_unknown", toolLang).replace("{cmd}", cmd)}\n\n${HELP_TEXT}`

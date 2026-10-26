@@ -21,7 +21,11 @@ import {
   ORPHAN_STATE_GRACE_MS,
   ORPHAN_STATE_MIN_AGE_MS,
   STALE_ORPHAN_MS,
+  TRANSFER_TASK_TTL_MS,
+  TRANSFER_TASK_STALE_MS,
+  TRANSFER_TASK_SWEEP_MS,
 } from "./constants.js"
+import { parseTransferTask, type TransferTask } from "./transfer-events.js"
 import log, { infoDedup } from "./log.js"
 
 export interface LiveSession {
@@ -91,11 +95,21 @@ const PAGE_KEYS: FlatKey[] = [
   "web_time",
   "web_new_messages",
   "web_terminals",
+  "web_transfers",
+  "web_transfer_upload",
+  "web_transfer_download",
+  "web_transfer_running",
+  "web_transfer_done",
+  "web_transfer_failed",
   "web_local",
   "web_delete_terminal",
   "web_cmd_placeholder",
   "web_raw",
+  "web_close",
 ]
+
+/** agent 断线时，服务端把该 agent 认领终端上仍为 running 的任务标记为该错误码 */
+const TRANSFER_ERROR_AGENT_DISCONNECTED = "agent_disconnected"
 
 const JS_I18N_KEYS: Record<string, FlatKey> = {
   commands: "web_commands",
@@ -103,6 +117,13 @@ const JS_I18N_KEYS: Record<string, FlatKey> = {
   noSession: "web_no_session",
   local: "web_local",
   terminals: "web_terminals",
+  transfers: "web_transfers",
+  transfersEmpty: "web_transfers_empty",
+  transferUpload: "web_transfer_upload",
+  transferDownload: "web_transfer_download",
+  transferRunning: "web_transfer_running",
+  transferDone: "web_transfer_done",
+  transferFailed: "web_transfer_failed",
   cmdPlaceholder: "web_cmd_placeholder",
   directInput: "web_direct_input",
   inputOn: "web_input_on",
@@ -166,6 +187,11 @@ export function startServer(
   const cmdCount = new Map<string, number>()
   /** 排队序列保持 busy 的 key（agent 报 more=true 加入，最后一条 done 移除） */
   const seqHold = new Set<string>()
+
+  /** 传输任务（只存元数据，不含文件内容）：id → task；Web 可拉快照/收广播 */
+  const transferTasks = new Map<string, TransferTask>()
+  /** 传输任务最近更新时间（毫秒）：running 任务按此做 stale 清理；不含在对外协议里 */
+  const transferSeenAt = new Map<string, number>()
 
   /** server 侧各终端最近一次的对外 busy 状态（仅用于日志：翻转时记一行） */
   const busyState = new Map<string, boolean>()
@@ -571,6 +597,71 @@ export function startServer(
     }, STATUS_PUSH_DEBOUNCE_MS)
   }
 
+  /**
+   * 取传输任务快照（按 sessionID/name 过滤；两者都不传 = 全部任务）。
+   * 返回浅拷贝数组，避免调用方修改服务端 Map 内容。
+   * @param sid 主会话 ID（可空）
+   * @param name 终端名（可空）
+   * @returns 任务数组
+   */
+  const transferSnapshot = (sid?: string, name?: string): TransferTask[] => {
+    const out: TransferTask[] = []
+    for (const task of transferTasks.values()) {
+      // 两个过滤条件各自独立：只传 sid = 该会话全部终端；sid+name = 该会话该终端；只传 name = 全部会话该终端
+      if (sid !== undefined && task.sessionID !== sid) continue
+      if (name !== undefined && task.name !== name) continue
+      out.push(task)
+    }
+    return out
+  }
+
+  /**
+   * 广播一条传输任务给所有 Web 客户端（agent 连接不回发：任务只从 agent 流向 Web）。
+   * @param task 已校验的任务
+   */
+  const broadcastTransfer = (task: TransferTask): void => {
+    for (const client of wss.clients as Set<WsClient>) {
+      if (client.readyState !== WebSocket.OPEN) continue
+      if (agents.has(client)) continue
+      send(client, { type: "transfer", task })
+    }
+  }
+
+  /**
+   * 广播任务删除（过期清理等）：Web 按 id 删除本地行；agent 连接不回发。
+   * @param id 被删除的任务 id
+   */
+  const broadcastTransferRemove = (id: string): void => {
+    for (const client of wss.clients as Set<WsClient>) {
+      if (client.readyState !== WebSocket.OPEN) continue
+      if (agents.has(client)) continue
+      send(client, { type: "transfer-remove", id })
+    }
+  }
+
+  /**
+   * 清理过期传输任务：
+   * - running：最后更新（最近一次进度/状态）早于 TRANSFER_TASK_STALE_MS → 移除（失联任务）；
+   * - done/failed：结束时间早于 TRANSFER_TASK_TTL_MS → 移除。
+   * 定时器 unref，不阻塞进程退出。
+   */
+  const sweepTransferTasks = (): void => {
+    const now = Date.now()
+    for (const [id, task] of [...transferTasks]) {
+      const updatedAt = transferSeenAt.get(id) ?? task.startedAt
+      const expired = task.state === "running"
+        ? now - updatedAt > TRANSFER_TASK_STALE_MS
+        : now - (task.endedAt ?? updatedAt) > TRANSFER_TASK_TTL_MS
+      if (expired) {
+        transferTasks.delete(id)
+        transferSeenAt.delete(id)
+        broadcastTransferRemove(id)
+      }
+    }
+  }
+  const transferSweepTimer = setInterval(sweepTransferTasks, TRANSFER_TASK_SWEEP_MS)
+  if (typeof transferSweepTimer.unref === "function") transferSweepTimer.unref()
+
   // 兜底：事件驱动已覆盖服务端内存态的全部变化；此低频周期只兜底**带外变化**（其他进程写入状态文件
   // 导致的新终端 / pending / 标题变化等，服务端无对应事件），保证这类变化最长 STATUS_PUSH_FALLBACK_MS 内可达前端。
   // 同时周期重跑孤儿状态文件清理：单轮只清"当下已陈旧"的项，未陈旧者留待下一轮，从而**持续收敛**、
@@ -759,6 +850,19 @@ export function startServer(
         return
       }
 
+      // ===== 传输任务（仅 agent 上报；只接受通过校验的元数据） =====
+
+      if (t === "transfer") {
+        // Web 客户端无权上报任务；只认已注册 agent，避免伪造/回环
+        if (!agents.has(ws)) return
+        const task = parseTransferTask(msg.task)
+        if (!task) return // 非法任务静默忽略：不在服务端落状态、不广播
+        transferTasks.set(task.id, task)
+        transferSeenAt.set(task.id, Date.now())
+        broadcastTransfer(task)
+        return
+      }
+
       // ===== web 请求 =====
 
       if (t === "list") {
@@ -770,6 +874,8 @@ export function startServer(
           ws._lastSessionsJson = json
           send(ws, { type: "sessions", ...payload })
         }
+        // 传输任务快照（无任务也发空数组，前端可据此清空/初始化）；scope=all 表示全量替换
+        send(ws, { type: "transfers", scope: "all", tasks: transferSnapshot() })
         return
       }
 
@@ -778,6 +884,8 @@ export function startServer(
         const name = typeof msg.name === "string" ? msg.name : ""
         if (!sid) return
         ws._sub = { sid, name }
+        // 该终端（sid+name）的历史传输任务快照（面板按终端展示；没有也发空数组）
+        send(ws, { type: "transfers", sessionID: sid, name, tasks: transferSnapshot(sid, name) })
         const sKey = sessionKey(sid, name)
         const snap = buildSnapshot(sid, name)
         if (snap.notFound) {
@@ -920,6 +1028,19 @@ export function startServer(
         for (const k of reg) agentBySession.delete(k)
         agents.delete(ws)
         infoDedup(`agent-disconnect:${keys.slice().sort().join(",")}`, `agent 断开（受影响终端: ${keys.length ? keys.map(keyTag).join(", ") : "无"}）`)
+        // 该 agent 认领终端上仍在 running 的任务不可能再收到终态（cmdDone/transfer 随连接丢失）：
+        // 本地标记 failed（agent_disconnected）并广播，避免 Web 永久停在 running；其他 agent/终端任务不动。
+        const endedAt = Date.now()
+        let failedTransfers = 0
+        for (const [id, task] of [...transferTasks]) {
+          if (task.state !== "running" || !reg.has(sessionKey(task.sessionID, task.name))) continue
+          const failed: TransferTask = { ...task, state: "failed", endedAt, errorCode: TRANSFER_ERROR_AGENT_DISCONNECTED }
+          transferTasks.set(id, failed)
+          transferSeenAt.set(id, endedAt)
+          broadcastTransfer(failed)
+          failedTransfers++
+        }
+        if (failedTransfers) log.info(`[transfer] agent 断开：${failedTransfers} 个 running 任务标记 failed（${TRANSFER_ERROR_AGENT_DISCONNECTED}）`)
         // 连接变化是状态事件：立即推一次（原靠 2s 轮询，最坏 2s 才反映离线；改事件驱动后即时）；
         // 同时通知"agent 存在性"边沿（server-entry 据最后一个 agent 断开启动空闲计时）
         notifyAgentPresence()
@@ -940,6 +1061,7 @@ export function startServer(
         url: `http://127.0.0.1:${actualPort}`,
         close: () => {
           if (statusPushTimer) { clearTimeout(statusPushTimer); statusPushTimer = null }
+          clearInterval(transferSweepTimer)
           clearInterval(statusFallbackTimer)
           clearInterval(heartbeatTimer)
           server.close()

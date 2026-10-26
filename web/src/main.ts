@@ -11,6 +11,17 @@ interface I18n {
   sessionGone: string
   noSession: string
   terminals: string
+  /** 传输任务面板标题/计数单位 */
+  transfers: string
+  /** 当前会话无传输任务时的空态文案 */
+  transfersEmpty: string
+  /** 传输方向 */
+  transferUpload: string
+  transferDownload: string
+  /** 传输状态 */
+  transferRunning: string
+  transferDone: string
+  transferFailed: string
   local: string
   cmdPlaceholder: string
   /** 直接输入入口标签/提示 */
@@ -59,6 +70,25 @@ interface TranscriptPair {
   text: string
 }
 
+/**
+ * 传输任务元数据（只读复制自 src/transfer-events.ts 的 TransferTask）。
+ * 不跨目录运行时 import：Web 产物必须独立打包，旧 server 与新 app.js 混用时也不能因模块缺失崩溃。
+ */
+interface TransferTask {
+  id: string
+  sessionID: string
+  name: string
+  direction: "upload" | "download"
+  localPath: string
+  remotePath: string
+  state: "running" | "done" | "failed"
+  bytes: number
+  total: number
+  startedAt: number
+  endedAt?: number
+  errorCode?: string
+}
+
 /** 从原始终端输出中提取退出码和剥离标记后的文本 */
 function parseOutput(raw: string): { text: string; exitCode?: number } {
   const m = raw.match(DONE_RE)
@@ -81,6 +111,13 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     sessionGone: "Session missing or disconnected",
     noSession: "No terminal. Use term_cli connect (SSH) or term_cli local first.",
     terminals: "terminals",
+    transfers: "Transfers",
+    transfersEmpty: "No transfers in this session.",
+    transferUpload: "Upload",
+    transferDownload: "Download",
+    transferRunning: "running",
+    transferDone: "done",
+    transferFailed: "failed",
     local: "local",
     cmdPlaceholder: "Enter command (Shift+Enter new line)",
     directInput: "Direct input (type here for interactive prompts)",
@@ -96,6 +133,13 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     sessionGone: "会话不存在或已断开",
     noSession: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。",
     terminals: "终端",
+    transfers: "传输任务",
+    transfersEmpty: "当前会话暂无传输任务。",
+    transferUpload: "上传",
+    transferDownload: "下载",
+    transferRunning: "传输中",
+    transferDone: "完成",
+    transferFailed: "失败",
     local: "本地",
     cmdPlaceholder: "输入命令（Shift+Enter 换行）",
     directInput: "直接输入（交互输入请直接在此输入）",
@@ -331,6 +375,8 @@ const DIRECT_INPUT_PREF_KEY = "directInput"
 /** 直接输入开关：由焦点驱动，默认关（命令框优先）；点终端区域/入口按钮开启，焦点回命令框即关闭 */
 let directInputOn = false
 let sessionsData: SessionStatus[] = []
+/** 全部会话的传输任务（面板按当前选中终端过滤展示；server 快照/广播同源） */
+let transferTasks: TransferTask[] = []
 let stickToBottom = true
 let runScreen: HeadlessScreen | null = null
 /** 当前活动输出块（diff 渲染用，固化后保留在 DOM，后续命令不再复用/删除） */
@@ -389,6 +435,9 @@ function connectWs(): void {
       case "diff": handleDiff(msg as unknown as { sessionID: string; name: string; event: string; command?: string; data?: string; exitCode?: number; endTs?: number; ts?: number }); break
       case "raw": handleRaw(msg as unknown as { data: string; reset?: boolean }); break
       case "deleteResult": handleDeleteResult(msg as unknown as { sessionID: string; name: string; ok: boolean; reason?: string }); break
+      case "transfer": upsertTransferTask(msg.task as unknown as TransferTask); break
+      case "transfer-remove": removeTransferTask(msg.id); break
+      case "transfers": applyTransferSnapshot(msg as unknown as { scope?: string; sessionID?: string; name?: string; tasks?: TransferTask[] }); break
     }
   }
   ws.onclose = () => {
@@ -432,6 +481,416 @@ function scheduleReconnect(): void {
   }, RECONNECT_MS)
 }
 
+// ===== 传输任务面板 =====
+/** 状态展示排序权重（固定口径：running 优先；其余同组内按 startedAt 降序） */
+const TRANSFER_STATE_RANK: Record<TransferTask["state"], number> = { running: 0, done: 1, failed: 1 }
+
+/**
+ * 按固定口径排序传输任务：running 优先，其余按开始时间降序。
+ * @param tasks 任务数组（不修改原数组）
+ * @returns 新数组
+ */
+function sortTransferTasks(tasks: TransferTask[]): TransferTask[] {
+  return [...tasks].sort((a, b) => {
+    const rank = TRANSFER_STATE_RANK[a.state] - TRANSFER_STATE_RANK[b.state]
+    return rank !== 0 ? rank : b.startedAt - a.startedAt
+  })
+}
+
+/**
+ * 状态文案（走 i18n；未知状态按 running 兜底，避免显示 undefined）。
+ * @param state 任务状态
+ * @returns 本地化状态文案
+ */
+function transferStateText(state: TransferTask["state"]): string {
+  if (state === "done") return I18N.transferDone
+  if (state === "failed") return I18N.transferFailed
+  return I18N.transferRunning
+}
+
+/**
+ * 字节数转人类可读文本（B/KiB/MiB/GiB，保留 1 位小数）。
+ * @param n 字节数
+ * @returns 展示文本
+ */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0 B"
+  if (n < 1024) return Math.round(n) + " B"
+  const units = ["KiB", "MiB", "GiB", "TiB"]
+  let v = n / 1024
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return v.toFixed(1) + " " + units[i]
+}
+
+/**
+ * 耗时转展示文本（秒级；>=60s 用 m s）。
+ * @param ms 毫秒
+ * @returns 展示文本
+ */
+function formatDuration(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000))
+  if (totalSec < 60) return totalSec + "s"
+  return Math.floor(totalSec / 60) + "m " + (totalSec % 60) + "s"
+}
+
+/** 当前选中会话 ID（无选中返回空串） */
+function currentSessionId(): string {
+  return (document.getElementById("session") as HTMLSelectElement).value
+}
+
+/** 当前选中终端名（无选中返回空串） */
+function currentTerminalName(): string {
+  return (document.getElementById("terminal") as HTMLSelectElement).value
+}
+
+/**
+ * 单行任务 DOM。**所有动态文本一律走 textContent**（路径/终端名/错误码均不可信，禁止拼 innerHTML）。
+ * @param task 传输任务元数据
+ * @returns 行元素
+ */
+function renderTransferRow(task: TransferTask): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "transfer-row state-" + task.state
+
+  const head = document.createElement("div")
+  head.className = "transfer-row-head"
+
+  const dir = document.createElement("span")
+  dir.className = "transfer-dir " + task.direction
+  dir.textContent = (task.direction === "upload" ? "↑ " : "↓ ") +
+    (task.direction === "upload" ? I18N.transferUpload : I18N.transferDownload)
+
+  const name = document.createElement("span")
+  name.className = "transfer-name"
+  name.textContent = task.name
+  name.title = task.name
+
+  const bytes = document.createElement("span")
+  bytes.className = "transfer-bytes"
+  // total 未知（0）时：running 显示 ?；done/failed 用实际 bytes（空文件也是 0 B）
+  const totalText = task.total > 0 ? formatBytes(task.total) : (task.state === "running" ? "?" : formatBytes(task.bytes))
+  bytes.textContent = formatBytes(task.bytes) + " / " + totalText
+
+  // running 用当前时刻估算耗时（进度事件约 250ms 一次会触发重渲染，因此数值持续刷新）
+  const elapsed = Math.max(0, (task.endedAt ?? Date.now()) - task.startedAt)
+  const duration = document.createElement("span")
+  duration.className = "transfer-duration"
+  duration.textContent = formatDuration(elapsed)
+
+  const state = document.createElement("span")
+  state.className = "transfer-state " + task.state
+  state.textContent = transferStateText(task.state)
+
+  head.append(dir, name, bytes, duration, state)
+  row.appendChild(head)
+
+  // 进度条：total=0 的 running 用不确定态；done 用实际 bytes/total（total=0 视为 100%）；failed 保留已传比例
+  const progress = document.createElement("div")
+  progress.className = "transfer-progress"
+  const bar = document.createElement("div")
+  bar.className = "transfer-bar"
+  if (task.state === "running" && task.total <= 0) {
+    progress.classList.add("indeterminate")
+  } else {
+    const pct = task.total > 0 ? (task.bytes / task.total) * 100 : (task.state === "done" ? 100 : 0)
+    bar.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + "%"
+  }
+  progress.appendChild(bar)
+  row.appendChild(progress)
+
+  const paths = document.createElement("div")
+  paths.className = "transfer-paths"
+  const local = document.createElement("span")
+  local.className = "transfer-path transfer-local"
+  local.textContent = task.localPath
+  local.title = task.localPath
+  const arrow = document.createElement("span")
+  arrow.className = "transfer-arrow"
+  arrow.textContent = "↔"
+  const remote = document.createElement("span")
+  remote.className = "transfer-path transfer-remote"
+  remote.textContent = task.remotePath
+  remote.title = task.remotePath
+  paths.append(local, arrow, remote)
+  row.appendChild(paths)
+
+  if (task.state === "failed") {
+    const err = document.createElement("div")
+    err.className = "transfer-error"
+    err.textContent = task.errorCode || I18N.transferFailed
+    row.appendChild(err)
+  }
+  return row
+}
+
+/** 传输浮窗位置持久化键（只存 left/top；恢复与 resize 时按当前视口重新 clamp） */
+const TRANSFER_PANEL_POS_KEY = "transferPanelPos"
+/** 浮窗与视口边缘的最小间距（px），拖动/恢复/resize 共用 */
+const TRANSFER_PANEL_MARGIN = 8
+/** 标题栏拖动提示（纯前端交互提示，不进 server i18n 载荷） */
+const TRANSFER_DRAG_HINT: Record<"en" | "zh", string> = { en: "Drag to move", zh: "拖动移动" }
+
+/** 一次拖动会话的快照：指针起点、浮窗起点与拖动开始时的尺寸（getBoundingClientRect） */
+interface TransferDragState {
+  pointerId: number
+  originX: number
+  originY: number
+  startLeft: number
+  startTop: number
+  width: number
+  height: number
+}
+
+/** 进行中的拖动（null 表示未在拖动） */
+let transferDrag: TransferDragState | null = null
+
+/**
+ * 重渲染传输任务面板：只展示当前选中终端（sessionID + 终端名）的任务；无选中会话/终端固定展示空态
+ * （不跨会话、不跨终端混显）。计数与空态口径一致，只算当前终端。
+ */
+function renderTransferPanel(): void {
+  const list = document.getElementById("transferList")
+  const countEl = document.getElementById("transferCount")
+  if (!list || !countEl) return
+  const sid = currentSessionId()
+  const name = currentTerminalName()
+  const tasks = sid && name ? transferTasks.filter((t) => t.sessionID === sid && t.name === name) : []
+  countEl.textContent = String(tasks.length)
+  list.textContent = ""
+  if (tasks.length === 0) {
+    const empty = document.createElement("div")
+    empty.className = "transfer-empty"
+    empty.textContent = I18N.transfersEmpty
+    list.appendChild(empty)
+    return
+  }
+  for (const task of tasks) list.appendChild(renderTransferRow(task))
+}
+
+/**
+ * 切换传输任务浮窗显示状态（header 按钮与浮窗关闭按钮共用）。
+ * @param open 目标状态；省略时按当前状态取反（true=展开）
+ */
+function toggleTransferPanel(open?: boolean): void {
+  const panel = document.getElementById("transferPanel")
+  const toggle = document.getElementById("transferToggle")
+  if (!panel || !toggle) return
+  const next = open ?? panel.hidden
+  panel.hidden = !next
+  toggle.setAttribute("aria-expanded", next ? "true" : "false")
+  // 重新展开时按当前视口复位记忆位置，避免上次的坐标把浮窗留在屏幕外
+  if (next) clampTransferPanelIntoView()
+}
+
+// ===== 传输浮窗拖动（标题栏为拖动柄；仍为 fixed，不占 layout） =====
+
+/**
+ * 把浮窗坐标限制在可视区域内（四周至少留 TRANSFER_PANEL_MARGIN，不允许拖出屏幕）。
+ * @param left 期望的 left（px）
+ * @param top 期望的 top（px）
+ * @param width 浮窗宽度（px，取 getBoundingClientRect）
+ * @param height 浮窗高度（px，取 getBoundingClientRect）
+ * @returns 已 clamp 的 left/top
+ */
+function clampTransferPanelPos(left: number, top: number, width: number, height: number): { left: number; top: number } {
+  const m = TRANSFER_PANEL_MARGIN
+  const maxLeft = Math.max(m, window.innerWidth - width - m)
+  const maxTop = Math.max(m, window.innerHeight - height - m)
+  return { left: Math.min(Math.max(left, m), maxLeft), top: Math.min(Math.max(top, m), maxTop) }
+}
+
+/**
+ * 以 left/top 定位浮窗（拖动后使用）；同时清空 right/bottom，避免两种定位互相覆盖。
+ * @param panel 浮窗元素
+ * @param left 目标 left（px）
+ * @param top 目标 top（px）
+ */
+function applyTransferPanelPos(panel: HTMLElement, left: number, top: number): void {
+  panel.style.left = Math.round(left) + "px"
+  panel.style.top = Math.round(top) + "px"
+  panel.style.right = "auto"
+  panel.style.bottom = "auto"
+}
+
+/**
+ * 按当前视口重新 clamp 已手动定位的浮窗；仍是默认 right/bottom 定位（未拖动过）时不动。
+ * 用于恢复记忆位置、窗口 resize、浮窗重新展开与内容高度变化。
+ */
+function clampTransferPanelIntoView(): void {
+  const panel = document.getElementById("transferPanel")
+  if (!panel || panel.hidden) return
+  if (!panel.style.left || !panel.style.top) return
+  const rect = panel.getBoundingClientRect()
+  const pos = clampTransferPanelPos(rect.left, rect.top, rect.width, rect.height)
+  applyTransferPanelPos(panel, pos.left, pos.top)
+}
+
+/** 读取持久化的浮窗位置（只存 left/top）；缺失或非法时返回 null */
+function loadTransferPanelPos(): { left: number; top: number } | null {
+  try {
+    const raw = localStorage.getItem(TRANSFER_PANEL_POS_KEY)
+    if (!raw) return null
+    const pos = JSON.parse(raw) as { left?: unknown; top?: unknown }
+    if (typeof pos.left !== "number" || typeof pos.top !== "number") return null
+    if (!Number.isFinite(pos.left) || !Number.isFinite(pos.top)) return null
+    return { left: pos.left, top: pos.top }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 记住浮窗位置（只存 left/top）。
+ * @param left 最终 left（px）
+ * @param top 最终 top（px）
+ */
+function saveTransferPanelPos(left: number, top: number): void {
+  try {
+    localStorage.setItem(TRANSFER_PANEL_POS_KEY, JSON.stringify({ left: Math.round(left), top: Math.round(top) }))
+  } catch {
+    // 存储不可用（隐私模式/超额）时只丢记忆，不影响拖动
+  }
+}
+
+/**
+ * 标题栏按下：记录拖动起点、切换为 left/top 定位并捕获指针。
+ * 关闭按钮上的按下直接放行，保证点击关闭仍生效。
+ * @param ev 标题栏 pointerdown
+ */
+function onTransferHeadPointerDown(ev: PointerEvent): void {
+  const panel = document.getElementById("transferPanel")
+  const head = ev.currentTarget as HTMLElement | null
+  if (!panel || !head) return
+  if (ev.pointerType === "mouse" && ev.button !== 0) return
+  if ((ev.target as Element | null)?.closest(".transfer-close")) return
+  const rect = panel.getBoundingClientRect()
+  transferDrag = {
+    pointerId: ev.pointerId,
+    originX: ev.clientX,
+    originY: ev.clientY,
+    startLeft: rect.left,
+    startTop: rect.top,
+    width: rect.width,
+    height: rect.height,
+  }
+  applyTransferPanelPos(panel, rect.left, rect.top)
+  head.setPointerCapture(ev.pointerId)
+  // 阻止拖动时选中文本/触发后续点击
+  ev.preventDefault()
+}
+
+/**
+ * 拖动中：按指针位移换算新坐标并 clamp 在视口内。
+ * @param ev 标题栏 pointermove
+ */
+function onTransferHeadPointerMove(ev: PointerEvent): void {
+  const drag = transferDrag
+  const panel = document.getElementById("transferPanel")
+  if (!drag || !panel || ev.pointerId !== drag.pointerId) return
+  const pos = clampTransferPanelPos(
+    drag.startLeft + (ev.clientX - drag.originX),
+    drag.startTop + (ev.clientY - drag.originY),
+    drag.width,
+    drag.height,
+  )
+  applyTransferPanelPos(panel, pos.left, pos.top)
+  ev.preventDefault()
+}
+
+/**
+ * 拖动结束（pointerup / pointercancel）：释放指针捕获、clamp 并记住最终位置。
+ * @param ev 标题栏 pointerup / pointercancel
+ */
+function onTransferHeadPointerUp(ev: PointerEvent): void {
+  const drag = transferDrag
+  if (!drag || ev.pointerId !== drag.pointerId) return
+  transferDrag = null
+  const head = ev.currentTarget as HTMLElement | null
+  if (head?.hasPointerCapture(ev.pointerId)) head.releasePointerCapture(ev.pointerId)
+  const panel = document.getElementById("transferPanel")
+  if (!panel || panel.hidden) return
+  const rect = panel.getBoundingClientRect()
+  const pos = clampTransferPanelPos(rect.left, rect.top, rect.width, rect.height)
+  applyTransferPanelPos(panel, pos.left, pos.top)
+  saveTransferPanelPos(pos.left, pos.top)
+}
+
+/**
+ * 初始化浮动窗口拖动：恢复记忆位置、绑定标题栏 pointer 事件、窗口 resize 时重新 clamp。
+ * 面板仍是 fixed 定位（不占 layout），只改变 left/top 与 right/bottom 的取舍。
+ */
+function setupTransferPanelDrag(): void {
+  const panel = document.getElementById("transferPanel")
+  if (!panel) return
+  const head = panel.querySelector(".transfer-panel-head") as HTMLElement | null
+  if (!head) return
+  head.title = TRANSFER_DRAG_HINT[DOC_LANG]
+  head.addEventListener("pointerdown", onTransferHeadPointerDown)
+  head.addEventListener("pointermove", onTransferHeadPointerMove)
+  head.addEventListener("pointerup", onTransferHeadPointerUp)
+  head.addEventListener("pointercancel", onTransferHeadPointerUp)
+  window.addEventListener("resize", clampTransferPanelIntoView)
+  // 内容增减改变高度时也保持浮窗在视口内（ResizeObserver 回调由浏览器合并，避免每次渲染读布局）
+  new ResizeObserver(() => {
+    if (!transferDrag) clampTransferPanelIntoView()
+  }).observe(panel)
+  const saved = loadTransferPanelPos()
+  if (!saved) return
+  const rect = panel.getBoundingClientRect()
+  const pos = clampTransferPanelPos(saved.left, saved.top, rect.width, rect.height)
+  applyTransferPanelPos(panel, pos.left, pos.top)
+}
+
+/**
+ * 广播任务 upsert（同 id 覆盖，保留其它任务）。
+ * @param task 已校验的任务元数据（缺 id 时忽略）
+ */
+function upsertTransferTask(task: TransferTask): void {
+  if (!task || typeof task.id !== "string") return
+  const idx = transferTasks.findIndex((t) => t.id === task.id)
+  if (idx >= 0) transferTasks[idx] = task
+  else transferTasks.push(task)
+  transferTasks = sortTransferTasks(transferTasks)
+  renderTransferPanel()
+}
+
+/**
+ * 服务端任务删除通知（过期清理等）：按 id 移除本地行并重渲染。
+ * @param id 任务 id（非字符串/空值忽略）
+ */
+function removeTransferTask(id: unknown): void {
+  if (typeof id !== "string" || !id) return
+  const next = transferTasks.filter((t) => t.id !== id)
+  if (next.length === transferTasks.length) return
+  transferTasks = next
+  renderTransferPanel()
+}
+
+/**
+ * 应用快照：`scope==="all"` 全量替换；带 `sessionID`+`name` 只替换该会话该终端的任务、保留其他终端与会话。
+ * 缺 name（或只带 sessionID）的快照直接忽略，避免误清空其他终端（避免按会话整体替换）。
+ * @param msg 快照消息
+ */
+function applyTransferSnapshot(msg: { scope?: string; sessionID?: string; name?: string; tasks?: TransferTask[] }): void {
+  const incoming = Array.isArray(msg.tasks) ? msg.tasks : []
+  if (msg.scope === "all") {
+    transferTasks = sortTransferTasks(incoming)
+  } else if (typeof msg.sessionID === "string" && msg.sessionID && typeof msg.name === "string" && msg.name) {
+    const { sessionID, name } = msg
+    transferTasks = sortTransferTasks([
+      ...transferTasks.filter((t) => !(t.sessionID === sessionID && t.name === name)),
+      ...incoming,
+    ])
+  } else {
+    return
+  }
+  renderTransferPanel()
+}
+
 // ===== 会话列表更新 =====
 /** 清除全部会话：清空下拉/内容区/订阅/raw 模式，页面恢复到无终端状态 */
 function clearAllTerminals(): void {
@@ -453,6 +912,7 @@ function clearAllTerminals(): void {
   cb.checked = false
   hideRawUi()
   updateCmdBar()
+  renderTransferPanel()
 }
 
 function updateSessions(msg: { sessions: SessionStatus[] }): void {
@@ -477,6 +937,7 @@ function updateSessions(msg: { sessions: SessionStatus[] }): void {
   if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev
   else sel.selectedIndex = sessionsData.length ? 0 : -1
   updateTerminalSelect(prevTerminal)
+  renderTransferPanel()
 }
 
 /** 根据当前终端连接/忙状态更新输入框与直接输入入口可用性 */
@@ -557,6 +1018,7 @@ function updateTerminalSelect(prevName?: string, forceSub = false): void {
   delBtn.title = showDel && !canDelete ? (cur?.deleteReason || I18N.deleteBlocked) : delTitleDefault
   updateCmdBar()
   updateMetaFromSessions()
+  renderTransferPanel()
   // 重订阅时机：用户主动切换（change 事件）强制重订阅；sessions 状态推送才用值比较去重，
   // 避免 change 时 value 已更新导致 curSel===prevSel 永不触发订阅
   const curSel = tsel.value
@@ -1244,6 +1706,8 @@ document.addEventListener("keydown", onDirectInputKeydown, true)
 // 清理旧的持久化值：状态改由焦点驱动，保证每次打开都是「命令框优先」而非上次的残留
 localStorage.removeItem(DIRECT_INPUT_PREF_KEY)
 updateCmdKey()
+setupTransferPanelDrag()
+renderTransferPanel()
 
 Object.assign(window, {
   onSessionChange,
@@ -1251,6 +1715,7 @@ Object.assign(window, {
   onDebugModeChange,
   deleteTerminal,
   scrollToNewest,
+  toggleTransferPanel,
 })
 
 connectWs()

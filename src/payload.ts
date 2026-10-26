@@ -3,8 +3,8 @@
 // 无法靠 CLI 外层分词安全表达时，用 base64 或本地文件把 payload 原样带进来。
 
 import { readFile } from "node:fs/promises"
-import { homedir } from "node:os"
-import { join } from "node:path"
+
+import { expandLocalHome } from "./path-utils.js"
 
 /** 载荷来源：内联文本 / base64 / 本地文件 */
 export type PayloadSource = "text" | "base64" | "file"
@@ -41,17 +41,6 @@ export class PayloadError extends Error {
 
 /** 严格 base64 字符集：仅标准字母表、末尾最多两个补位符（长度另校验 4 的倍数） */
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/
-
-/**
- * 展开开头的 ~（"~" / "~/" / "~\\"）为当前用户 home 目录；其他路径原样返回。
- * @param path 用户传入的文件路径
- * @returns 展开后的路径
- */
-function expandHome(path: string): string {
-  if (path === "~") return homedir()
-  if (path.startsWith("~/") || path.startsWith("~\\")) return join(homedir(), path.slice(2))
-  return path
-}
 
 /**
  * 严格解码 UTF-8 载荷：拒绝非法字节序列与 NUL，剥掉开头的 UTF-8 BOM。
@@ -123,7 +112,7 @@ export async function resolvePayload(
   }
 
   if (opts.file) {
-    const resolved = expandHome(opts.file)
+    const resolved = expandLocalHome(opts.file)
     let bytes: Buffer
     try {
       bytes = await readFile(resolved)

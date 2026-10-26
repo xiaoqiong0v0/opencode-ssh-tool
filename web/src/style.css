@@ -52,3 +52,49 @@ body:not(.show-time) .row .t { display: none; }
 .tgl.disabled { opacity: 0.35; pointer-events: none; }
 .conn-status { display: none; flex: 0 0 auto; padding: 6px 16px; background: #3d1f1f; color: #ff7b72; border-top: 1px solid #30363d; font-size: 13px; }
 .conn-status.show { display: block; }
+/* ===== 传输任务浮窗（fixed 右下角，不参与 body flex；底部留出命令框空间） ===== */
+.transfer-toggle { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.transfer-toggle:hover { border-color: #58a6ff; color: #e6edf3; }
+.transfer-toggle[aria-expanded="true"] { border-color: #58a6ff; }
+.transfer-toggle:focus-visible, .transfer-close:focus-visible { outline: 2px solid #58a6ff; outline-offset: 1px; }
+.transfer-panel { position: fixed; right: 16px; bottom: 72px; z-index: 20; display: flex; flex-direction: column; width: min(420px, calc(100vw - 32px)); max-height: 50vh; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); overflow: hidden; }
+.transfer-panel[hidden] { display: none; }
+.transfer-panel-head { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #161b22; border-bottom: 1px solid #30363d; cursor: move; user-select: none; touch-action: none; }
+/* 关闭按钮保持可点击，不随标题栏拖动 */
+.transfer-panel-head .transfer-close { cursor: pointer; }
+.transfer-title { font-weight: 600; color: #8b949e; font-size: 12px; }
+.transfer-close { margin-left: auto; display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; background: none; border: 1px solid #30363d; border-radius: 4px; color: #8b949e; font-size: 14px; line-height: 1; cursor: pointer; }
+.transfer-close:hover { color: #f85149; border-color: #f85149; }
+.transfer-count { min-width: 18px; padding: 0 7px; border: 1px solid #30363d; border-radius: 10px; background: #21262d; color: #8b949e; font-size: 11px; text-align: center; }
+.transfer-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 12px 8px; }
+.transfer-empty { padding: 8px 0; color: #8b949e; font-size: 12px; }
+.transfer-row { padding: 6px 0 7px; border-bottom: 1px solid #21262d; }
+.transfer-row:last-child { border-bottom: none; }
+.transfer-row-head { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 12px; }
+.transfer-dir { flex: 0 0 auto; font-size: 11px; font-weight: 600; }
+.transfer-dir.upload { color: #58a6ff; }
+.transfer-dir.download { color: #bc8cff; }
+.transfer-name { flex: 0 1 auto; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e6edf3; }
+.transfer-bytes, .transfer-duration { flex: 0 0 auto; color: #8b949e; font-variant-numeric: tabular-nums; }
+.transfer-state { flex: 0 0 auto; margin-left: auto; padding: 0 7px; border: 1px solid transparent; border-radius: 8px; font-size: 11px; white-space: nowrap; }
+.transfer-state.running { color: #d29922; border-color: #9e6a03; background: #2b2107; }
+.transfer-state.done { color: #3fb950; border-color: #238636; background: #0f2417; }
+.transfer-state.failed { color: #f85149; border-color: #8e2c27; background: #2d1212; }
+.transfer-progress { position: relative; height: 4px; margin: 5px 0; border-radius: 2px; background: #21262d; overflow: hidden; }
+.transfer-bar { width: 0; height: 100%; border-radius: 2px; background: #58a6ff; transition: width 0.2s ease; }
+.transfer-row.state-done .transfer-bar { background: #3fb950; }
+.transfer-row.state-failed .transfer-bar { background: #f85149; }
+.transfer-progress.indeterminate .transfer-bar { width: 35% !important; animation: transfer-slide 1.2s ease-in-out infinite; }
+@keyframes transfer-slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+.transfer-paths { display: flex; align-items: center; gap: 6px; min-width: 0; color: #8b949e; font-size: 11px; }
+.transfer-path { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-arrow { flex: 0 0 auto; color: #484f58; }
+.transfer-error { margin-top: 2px; color: #f85149; font-size: 11px; word-break: break-all; }
+@media (max-width: 600px) {
+  .transfer-row-head { flex-wrap: wrap; gap: 6px; }
+  .transfer-state { margin-left: 0; }
+  .transfer-name { max-width: 100%; }
+  .transfer-paths { flex-direction: column; align-items: flex-start; gap: 0; }
+  .transfer-path { flex: 0 1 auto; max-width: 100%; }
+  .transfer-arrow { display: none; }
+}

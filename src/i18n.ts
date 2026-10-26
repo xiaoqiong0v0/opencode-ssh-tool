@@ -68,12 +68,12 @@ export const T = {
     zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read; use -w only for commands expected to finish quickly.",
-    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read；-w 只用于预期很快结束的命令。",
+    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read; use -w only for commands expected to finish quickly. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected).",
+    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read；-w 只用于预期很快结束的命令。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。",
   },
   term_cli_args: {
-    en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host'; defaults to 'help' when empty.",
-    zh: "完整命令行字符串，如 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host'；空时默认 'help'。",
+    en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
+    zh: "完整命令行字符串，如 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host' / 'upload ./a.txt ~/a.txt'；空时默认 'help'。",
   },
   term_cli_help: {
     en: `term_cli unified CLI tool: manage SSH / local (wsl, pwsh, bash) / container (docker exec) terminal sessions.
@@ -93,6 +93,13 @@ Subcommands:
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [--base64 | --file <path>] [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
+  upload <local> <remote> [-n name] [--overwrite] [--mkdir]
+      upload a regular file from this machine (plugin host) to the SSH session over SFTP
+      local supports ~; remote supports absolute or home-relative paths and ~/ (expanded by SFTP, no shell; ~user unsupported); Windows drive paths must use forward slashes (C:/dir/file)
+      fails if the target exists unless --overwrite; parents are not created unless --mkdir
+      SSH sessions only; directories and symlinks are rejected; max 256 MiB
+  download <remote> <local> [-n name] [--overwrite] [--mkdir]
+      download a regular file over SFTP; same path/overwrite/mkdir/size rules
   status [-n name]
       terminal state (busy/pending/connection); omit name to list all
   disconnect [-n name]
@@ -116,6 +123,8 @@ Examples:
   term_cli exec --base64 "bHMK"
   term_cli send --file ./payload.txt -n db
   term_cli send "mypass\\r" -n default
+  term_cli upload ./dist/app.tgz /opt/app/app.tgz --overwrite
+  term_cli download ~/logs/app.log ./app.log --mkdir
   term_cli read -n db -s buffer
   term_cli status
   term_cli disconnect -n db
@@ -137,6 +146,13 @@ Examples:
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [--base64 | --file <path>] [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
+  upload <local> <remote> [-n name] [--overwrite] [--mkdir]
+      通过 SFTP 把本机（插件进程）普通文件上传到 SSH 会话
+      local 支持 ~；remote 支持绝对路径、相对 home 路径与 ~/（由 SFTP 展开，不经过 shell；不支持 ~user）；Windows 盘符路径必须用正斜杠（C:/dir/file）
+      目标已存在默认失败，需加 --overwrite；默认不建父目录，需加 --mkdir
+      仅支持 SSH 会话；目录与符号链接会被拒绝；单文件上限 256 MiB
+  download <remote> <local> [-n name] [--overwrite] [--mkdir]
+      通过 SFTP 下载普通文件；路径/覆盖/建目录/大小规则相同
   status [-n name]
       终端状态（busy/pending/连接）；省略 name 列出全部
   disconnect [-n name]
@@ -160,6 +176,8 @@ Examples:
   term_cli exec --base64 "bHMK"
   term_cli send --file ./payload.txt -n db
   term_cli send "mypass\\r" -n default
+  term_cli upload ./dist/app.tgz /opt/app/app.tgz --overwrite
+  term_cli download ~/logs/app.log ./app.log --mkdir
   term_cli read -n db -s buffer
   term_cli status
   term_cli disconnect -n db
@@ -216,6 +234,90 @@ Examples:
   payload_file_error: {
     en: "Cannot read file: {path}",
     zh: "无法读取文件：{path}",
+  },
+  cli_need_transfer_paths: {
+    en: "Need a local path and a remote path",
+    zh: "需要本地路径和远端路径",
+  },
+  cli_upload_usage: {
+    en: "Usage: upload <local> <remote> [-n name] [--overwrite] [--mkdir]",
+    zh: "用法: upload <local> <remote> [-n name] [--overwrite] [--mkdir]",
+  },
+  cli_download_usage: {
+    en: "Usage: download <remote> <local> [-n name] [--overwrite] [--mkdir]",
+    zh: "用法: download <remote> <local> [-n name] [--overwrite] [--mkdir]",
+  },
+  upload_ok: {
+    en: "Uploaded {local} -> {remote} ({bytes} bytes, {ms} ms)",
+    zh: "已上传 {local} -> {remote}（{bytes} 字节，{ms} ms）",
+  },
+  download_ok: {
+    en: "Downloaded {remote} -> {local} ({bytes} bytes, {ms} ms)",
+    zh: "已下载 {remote} -> {local}（{bytes} 字节，{ms} ms）",
+  },
+  transfer_denied: {
+    en: "Transfer denied by user.",
+    zh: "用户已拒绝传输。",
+  },
+  transfer_err_exists: {
+    en: "{path} already exists. Add --overwrite to replace it (no auto-rename/backup).",
+    zh: "{path} 已存在。需要覆盖请加 --overwrite（不会自动改名或备份）。",
+  },
+  transfer_err_local_missing: {
+    en: "Local file not found: {path}",
+    zh: "本地文件不存在：{path}",
+  },
+  transfer_err_local_is_dir: {
+    en: "Local path is a directory (only regular files are supported): {path}",
+    zh: "本地路径是目录（只支持普通文件）：{path}",
+  },
+  transfer_err_remote_missing: {
+    en: "Remote file not found: {path}",
+    zh: "远端文件不存在：{path}",
+  },
+  transfer_err_remote_is_dir: {
+    en: "Remote path is a directory (only regular files are supported): {path}",
+    zh: "远端路径是目录（只支持普通文件）：{path}",
+  },
+  transfer_err_symlink: {
+    en: "Symbolic links are not supported: {path}",
+    zh: "不支持符号链接：{path}",
+  },
+  transfer_err_parent_missing: {
+    en: "Parent directory does not exist: {path}. Add --mkdir to create it.",
+    zh: "父目录不存在：{path}。需要创建请加 --mkdir。",
+  },
+  transfer_err_too_large: {
+    en: "File is too large for v1 transfer: {path} (limit {limit}).",
+    zh: "文件超过 v1 传输上限：{path}（上限 {limit}）。",
+  },
+  transfer_err_sftp_unavailable: {
+    en: "SFTP is unavailable on this SSH session. Reconnect with term_cli connect and retry.",
+    zh: "该 SSH 会话的 SFTP 不可用。请用 term_cli connect 重新连接后重试。",
+  },
+  transfer_err_timeout: {
+    en: "Transfer timed out ({seconds}s). The SFTP channel was aborted; no new rename/commit is started, but an already-issued rename may still run. A partially written file may remain at the target path or in a .part/.bak temp file.",
+    zh: "传输超时（{seconds}s）。已中止 SFTP 通道，不再主动发起新的 rename/commit，但已发出的 rename 仍可能被执行；目标路径或 `.part`/`.bak` 临时文件可能残留半截内容。",
+  },
+  transfer_err_io: {
+    en: "Transfer failed: {reason}",
+    zh: "传输失败：{reason}",
+  },
+  transfer_err_unsupported: {
+    en: "Only regular files are supported (not {path}).",
+    zh: "只支持普通文件（{path} 不是普通文件）。",
+  },
+  transfer_err_tilde_user: {
+    en: "~user paths are not supported; use ~/ (current user) or an absolute path: {path}",
+    zh: "不支持 ~user 路径；请用 ~/（当前用户）或绝对路径：{path}",
+  },
+  transfer_err_remote_path_backslash: {
+    en: "Remote Windows paths must use forward slashes (e.g. C:/dir/file); backslash drive paths are rejected: {path}",
+    zh: "远端 Windows 路径必须用正斜杠（如 C:/dir/file）；反斜杠盘符路径已拒绝：{path}",
+  },
+  transfer_err_ssh_only: {
+    en: "File transfer is only supported on SSH sessions (term_cli connect); local/container sessions cannot transfer files.",
+    zh: "文件传输仅支持 SSH 会话（term_cli connect）；本地/容器会话不能传文件。",
   },
   cli_unknown: {
     en: "Unknown command: {cmd}",
@@ -308,10 +410,18 @@ Examples:
     zh: "终端历史（前 {n} 条 / 共 {total} 条）",
   },
   web_title: { en: "Terminal Records", zh: "终端记录" },
+  web_close: { en: "Close", zh: "关闭" },
   web_loading: { en: "Loading...", zh: "加载中..." },
   web_session_gone: { en: "Session not found or disconnected", zh: "会话不存在或已断开" },
   web_time: { en: "Time", zh: "时间" },
   web_terminals: { en: "terminals", zh: "终端" },
+  web_transfers: { en: "Transfers", zh: "传输任务" },
+  web_transfers_empty: { en: "No transfers in this session.", zh: "当前会话暂无传输任务。" },
+  web_transfer_upload: { en: "Upload", zh: "上传" },
+  web_transfer_download: { en: "Download", zh: "下载" },
+  web_transfer_running: { en: "running", zh: "传输中" },
+  web_transfer_done: { en: "done", zh: "完成" },
+  web_transfer_failed: { en: "failed", zh: "失败" },
   web_local: { en: "local", zh: "本地" },
   web_commands: { en: "commands", zh: "条命令" },
   web_no_session: { en: "No terminal. Use term_cli connect (SSH) or term_cli local first.", zh: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。" },

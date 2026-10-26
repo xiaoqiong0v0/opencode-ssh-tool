@@ -4,6 +4,7 @@
 import log, { debug, describeSend, infoDedup, infoDedupShared, tailLines } from "./log.js"
 import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS, AGENT_PUSH_MIN_INTERVAL_MS } from "./constants.js"
 import { precheckBeforeExec } from "./precheck.js"
+import type { TransferTask } from "./transfer-events.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
 export interface AgentSession {
@@ -32,6 +33,12 @@ export interface AgentHandle {
   close(): void
   /** 重新注册当前会话列表（增删会话后调用） */
   reRegister(): void
+  /**
+   * 上报一条传输任务（只发元数据，不含文件内容）。
+   * WS 未连接时静默丢弃：任务可见性依赖连接恢复，不影响传输本身。
+   * @param task 传输任务元数据
+   */
+  transfer(task: TransferTask): void
 }
 
 /**
@@ -380,5 +387,6 @@ export function startAgent(
       try { ws?.close() } catch { /* ignore */ }
     },
     reRegister: register,
+    transfer: (task) => { send({ type: "transfer", task }) },
   }
 }

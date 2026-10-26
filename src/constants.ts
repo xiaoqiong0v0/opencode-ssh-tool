@@ -138,6 +138,58 @@ export const TERM_SCROLLBACK_LINES = 2000
 /** 单次工具返回输出上限（字节） */
 export const MAX_OUTPUT_LEN = 50_000
 
+// ===== SFTP 文件传输（v1） =====
+
+/** 单次传输入口文件大小上限（字节，256 MiB）：超过直接拒绝，避免误传大文件打爆内存/链路 */
+export const MAX_TRANSFER_BYTES = 256 * 1024 * 1024
+
+/**
+ * 单次传输整体超时（毫秒，10 分钟）：SFTP API 本身不接受超时参数，由调用方包装；
+ * 到点后中止 SFTP 通道（destroy）并报 timeout，不再主动发起新的 rename/commit
+ * （已发出的 rename 仍可能被服务端执行）。
+ */
+export const TRANSFER_TIMEOUT_MS = 10 * 60 * 1000
+
+/**
+ * 传输失败后的临时文件清理等待上限（毫秒）：
+ * 通道异常/超时后远端回调可能永不返回，清理必须有时限，不能把错误路径挂死。
+ */
+export const TRANSFER_CLEANUP_TIMEOUT_MS = 3_000
+
+/**
+ * 通道中止后等待传输 job 真正 settle 的兜底上限（毫秒）：
+ * job 自身 deadline + 清理预算应有界；超过该上限仍未结束则强制结算队列，
+ * 避免单次异常永久堵住同一会话的后续传输（此时通道已中止，job 无法再提交）。
+ */
+export const TRANSFER_JOB_SETTLE_TIMEOUT_MS = 4 * TRANSFER_CLEANUP_TIMEOUT_MS
+
+/**
+ * 覆盖提交回退（备份旧目标 → 新文件就位）所需的最小剩余时间（毫秒）：
+ * 剩余不足时不再开始回退，避免"旧目标已移走、新目标未就位"恰好被超时打断。
+ */
+export const TRANSFER_COMMIT_MIN_REMAINING_MS = 2_000
+
+// ===== SFTP 传输任务事件（agent → server → Web）=====
+
+/** 已结束（done/failed）任务在 server 内存中的保留时长（毫秒），过期移除 */
+export const TRANSFER_TASK_TTL_MS = 10 * 60 * 1000
+
+/** 传输进度事件节流窗口（毫秒）：窗口内多次进度只发最新一帧，完成时补最终值 */
+export const TRANSFER_PROGRESS_THROTTLE_MS = 250
+
+/** running 任务的最长静默时长（毫秒）：超过此时长无任何更新即视为失联并移除 */
+export const TRANSFER_TASK_STALE_MS = 10 * 60 * 1000
+
+/** 传输任务过期清理周期（毫秒）：周期扫描 TTL/stale，定时器 unref 不阻塞进程退出 */
+export const TRANSFER_TASK_SWEEP_MS = 60 * 1000
+
+/** 传输任务字段长度上限（防止异常/恶意 agent 用超长值打爆内存与页面） */
+export const TRANSFER_TASK_ID_MAX = 128
+export const TRANSFER_TASK_SESSION_ID_MAX = 256
+export const TRANSFER_TASK_NAME_MAX = 256
+export const TRANSFER_TASK_PATH_MAX = 4096
+export const TRANSFER_TASK_ERROR_CODE_MAX = 128
+
 /** 会话连续原始字节流上限（超过裁剪最旧部分） */
 export const RAW_LOG_MAX = 1_048_576
 
@@ -173,5 +225,8 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * server-entry 启动时写入 server.json（proto 字段），ensureServer 发现既有服务版本不符时
  * 杀掉旧进程重启，防止 detached 持久进程一直跑旧代码导致行为不生效（如 busy 卡死）。
  * v18：register 增加 running 运行集合（注册时对账僵尸 busy）；状态推送改事件驱动+兜底；空闲关闭改事件驱动。
+ * v19：history-only 删除判据、meta.json 标题持久化。
+ * v20：新增传输任务事件（agent→server `transfer`，server→web `transfer`/`transfers` 快照）。
+ * v21：传输面板改右下浮窗；新增 `transfer-remove` 清理广播与 agent 断线任务失败收尾。
  */
-export const SERVER_PROTO_VERSION = 19
+export const SERVER_PROTO_VERSION = 21
