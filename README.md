@@ -36,13 +36,15 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ```text
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
-term_cli exec "<command>" [-n name] [-w]                          # 执行命令（默认提交后立即返回；-w 等到命令真正结束，仅用于预期很快结束的命令）
+term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 等到命令真正结束，仅用于预期很快结束的命令）
 term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出
-term_cli send "<text>" [-n name]                                  # 发送按键（sudo 密码等）
+term_cli send "<text>" [--base64 | --file <path>] [-n name]         # 发送按键（sudo 密码等）
 term_cli status [-n name]                                         # 状态
 term_cli disconnect [-n name]                                     # 断开
 term_cli help                                                     # 完整用法
 ```
+
+> 复杂引号 / 目标 shell 转义 / 以 `-` 开头的载荷：`--base64` 会忽略空白后解码为 UTF-8 文本，`--file <path>` 读取**插件进程本机**的 UTF-8 文件（不是远程文件），二者互斥；两者都严格按 UTF-8 解码（剥掉开头的 BOM，非法 UTF-8 / 含 NUL 的 UTF-16 或二进制文件直接报错，不会静默发送）。**`send` 原样**交给终端（不再解释 `\n` / `\xHH` 等转义）；**`exec` 仍走命令管线**（strip / groupWrap / marker / 换行归一，CRLF 折成 LF，避免多出空行或双提交）。选项终止用 `--`：`term_cli exec -- "-x"`、`term_cli send -- "-n"`。复杂引号场景优先 base64/file，不要在外层引号里猜转义。
 
 > 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
@@ -146,6 +148,7 @@ opencode（插件进程）
 ```bash
 npm install      # 安装依赖（dependencies + devDependencies）
 npm run build    # tsc（src → dist）+ node web/build.mjs（打包 Web 资源）
+npm test         # 构建后跑 node:test 单测（test/cli-args.test.mjs + test/payload.test.mjs）
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`

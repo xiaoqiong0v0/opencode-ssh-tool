@@ -1,9 +1,10 @@
 // 插件入口：导出 5 个 SSH 工具 + 会话生命周期管理 + HTTP 终端记录服务
 
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import stringArgv from "string-argv"
 import { parseArgs } from "node:util"
 import log, { describeSend, infoDedupShared, sweepDedupDir } from "./log.js"
+import { parseCliArgs } from "./cli-args.js"
+import { PayloadError, normalizeExecText, resolvePayload, type ResolvedPayload } from "./payload.js"
 import { CACHE_DIR } from "./constants.js"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -414,10 +415,34 @@ export const OpenCodeSshTool: Plugin = async () => {
     return tr("local_connect_ok", toolLang).replace("{cmd}", command).replace("{name}", name)
   }
 
+  /**
+   * 载荷解析错误 → 本地化文案
+   * @param err 载荷解析错误
+   * @param file 用户传入的 --file 值（文件错误文案里回显原路径）
+   * @returns 本地化错误文案
+   */
+  function payloadErrorText(err: PayloadError, file?: string): string {
+    if (err.code === "conflict") return tr("payload_conflict", toolLang)
+    if (err.code === "base64") return tr("payload_bad_base64", toolLang)
+    if (err.code === "decode") return tr("payload_bad_encoding", toolLang)
+    return tr("payload_file_error", toolLang).replace("{path}", file ?? "")
+  }
+
   /** exec：在指定终端执行命令 */
   async function doExec(args: string[], ctx: CliCtx): Promise<string> {
-    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, waitResult: { type: "boolean", short: "w" } }, allowPositionals: true })
-    const command = positionals.join(" ")
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, waitResult: { type: "boolean", short: "w" }, base64: { type: "boolean" }, file: { type: "string" } }, allowPositionals: true })
+    let payload: ResolvedPayload
+    try {
+      payload = await resolvePayload(positionals.join(" "), { base64: values.base64, file: values.file })
+    } catch (e) {
+      if (e instanceof PayloadError) {
+        log.tool("payload_error", { code: e.code, message: e.message })
+        return payloadErrorText(e, values.file)
+      }
+      throw e
+    }
+    // text 模式维持原样（由 exec 管线自行处理）；base64/file 只归一 CRLF，避免双提交/空行
+    const command = payload.source === "text" ? payload.text : normalizeExecText(payload.text)
     if (!command) return `${tr("cli_need_command", toolLang)}\n${tr("cli_exec_usage", toolLang)}\n\n${HELP_TEXT}`
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
@@ -425,12 +450,21 @@ export const OpenCodeSshTool: Plugin = async () => {
     // SSH 会话 / cmd 等不支持的 shell / 校验模块故障 → 内部一律放行，维持现有行为
     const rejection = await precheckBeforeExec(session, command, undefined, toolLang)
     if (rejection) {
-      log.tool("term_exec_precheck_rejected", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, command, shell: session.shellName })
+      log.tool("term_exec_precheck_rejected", {
+        sessionID: ctx.sessionID,
+        name: values.name ?? DEFAULT_NAME,
+        ...(payload.source === "text" ? { command } : { source: payload.source, length: command.length }),
+        shell: session.shellName,
+      })
       return rejection
     }
     const decision = decide(command)
     if (decision === "deny") {
-      log.tool("term_exec_denied", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, command })
+      log.tool("term_exec_denied", {
+        sessionID: ctx.sessionID,
+        name: values.name ?? DEFAULT_NAME,
+        ...(payload.source === "text" ? { command } : { source: payload.source, length: command.length }),
+      })
       return tr("denied_danger", toolLang)
     }
     if (decision === "ask") {
@@ -444,7 +478,14 @@ export const OpenCodeSshTool: Plugin = async () => {
     syncSessionState(ctx.sessionID, name, "exec前")
     const result = values.waitResult ? await session.exec(command) : await session.submit(command)
     syncSessionState(ctx.sessionID, name, "exec后")
-    log.tool("term_exec", { sessionID: ctx.sessionID, name, command, ok: result.ok, submitted: result.submitted, running: result.running })
+    log.tool("term_exec", {
+      sessionID: ctx.sessionID,
+      name,
+      ...(payload.source === "text" ? { command } : { source: payload.source, length: command.length }),
+      ok: result.ok,
+      submitted: result.submitted,
+      running: result.running,
+    })
     if (result.submitted) return tr("submitted", toolLang)
     return result.ok ? result.output : result.error ?? tr("exec_failed", toolLang)
   }
@@ -476,17 +517,31 @@ export const OpenCodeSshTool: Plugin = async () => {
 
   /** send：发送文本/按键到终端 */
   async function doSend(args: string[], ctx: CliCtx): Promise<string> {
-    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" } }, allowPositionals: true })
-    const text = positionals.join(" ")
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, base64: { type: "boolean" }, file: { type: "string" } }, allowPositionals: true })
+    let payload: ResolvedPayload
+    try {
+      payload = await resolvePayload(positionals.join(" "), { base64: values.base64, file: values.file })
+    } catch (e) {
+      if (e instanceof PayloadError) {
+        log.tool("payload_error", { code: e.code, message: e.message })
+        return payloadErrorText(e, values.file)
+      }
+      throw e
+    }
+    const text = payload.text
     if (!text) return `${tr("cli_need_text", toolLang)}\n${tr("cli_send_usage", toolLang)}\n\n${HELP_TEXT}`
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
-    const r = session.send(text)
+    const r = session.send(text, { raw: payload.raw })
     if (!r.ok) return tr("err_not_connected", toolLang)
     syncSessionState(ctx.sessionID, values.name ?? DEFAULT_NAME, "send")
-    // 只记长度与类型，绝不打印载荷内容（用户会把密码/密钥粘进命令框或按键）
-    log.tool("term_send", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, send: describeSend(text) })
-    return tr("send_ok", toolLang).replace("{text}", text.slice(0, 60))
+    // 只记来源/长度与类型，绝不打印载荷内容（base64/file 尤其可能含密码/密钥）
+    const logFields = payload.source === "text"
+      ? { send: describeSend(text), source: payload.source }
+      : { source: payload.source, length: text.length }
+    log.tool("term_send", { sessionID: ctx.sessionID, name: values.name ?? DEFAULT_NAME, ...logFields })
+    if (payload.source === "text") return tr("send_ok", toolLang).replace("{text}", text.slice(0, 60))
+    return tr("send_ok_source", toolLang).replace("{source}", payload.source).replace("{length}", String(text.length))
   }
 
   /** status：终端状态 */
@@ -563,8 +618,9 @@ export const OpenCodeSshTool: Plugin = async () => {
 
   /** CLI 入口：解析命令行字符串并分发子命令 */
   async function handleCliCommand(raw: string, ctx: CliCtx): Promise<string> {
-    const tokens = stringArgv(raw)
-    const [cmd, ...rest] = tokens
+    const parsed = parseCliArgs(raw)
+    if (parsed.unclosedQuote) return `${tr("cli_unclosed_quote", toolLang)}\n\n${HELP_TEXT}`
+    const [cmd, ...rest] = parsed.tokens
     if (!cmd || cmd === "help") return HELP_TEXT
     // 统一按根会话 ID 路由（主子会话共享终端）
     const rootID = await findRoot(ctx.sessionID)

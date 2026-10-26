@@ -399,12 +399,14 @@ export abstract class BaseSession {
    * 转义写法统一由 decodeTerminalEscapes 解码（见 src/escapes.ts）：
    * \xHH 任意字节、\t TAB、\r/\n 回车、\\ 字面反斜杠；非法/不完整写法原样保留。
    * 前端直接发送的真实控制字节（0x7f/0x09/ESC 序列等）不含反斜杠，逐字节原样通过，同一实现两条路径共用。
+   * `raw: true` 时跳过转义解码、按传入文本逐字节发送（term_cli send --base64/--file 用，避免文本里的 \n 等被二次解释）。
    * @param text 要发送的文本或按键序列（转义文本或真实字节）
+   * @param opts raw=true 表示原样发送，不做 decodeTerminalEscapes；默认 false
    * @returns 是否发送成功
    */
-  send(text: string): { ok: boolean; error?: string } {
+  send(text: string, opts: { raw?: boolean } = {}): { ok: boolean; error?: string } {
     if (!this._connected) return { ok: false, error: tr("err_not_connected", this._lang) }
-    const payload = decodeTerminalEscapes(text)
+    const payload = opts.raw ? text : decodeTerminalEscapes(text)
     // 只记长度与类型，绝不打印载荷内容（用户会把密码/密钥粘进命令框或按键）
     log.info(`send ${this._logTag} -> ${describeSend(payload)} (connected=${this._connected}, busy=${this._remoteBusy})`)
     // 真实中断输入：标记本次命令已发过 Ctrl-C；写完中断键后进入中断周期，

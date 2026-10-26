@@ -47,6 +47,10 @@ export const T = {
     en: "Sent: {text}",
     zh: "已发送：{text}",
   },
+  send_ok_source: {
+    en: "Sent ({source}, {length} chars; content hidden)",
+    zh: "已发送（{source}，{length} 字符，内容不回显）",
+  },
   local_connect_ok: {
     en: "Started: {cmd} (terminal {name})",
     zh: "已启动：{cmd}（终端 {name}）",
@@ -83,11 +87,11 @@ Subcommands:
       -p accepts plain text or file:<path> (read password from file, avoids exposure)
   local "<command>" [-n name] [-c cwd]
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
-  exec "<command>" [-n name] [-w]
+  exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; for long-running / stdin-reading / interactive commands use the default and poll with status/read, because -w keeps waiting as long as the command runs)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
-  send "<text>" [-n name]
+  send "<text>" [--base64 | --file <path>] [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   status [-n name]
       terminal state (busy/pending/connection); omit name to list all
@@ -96,12 +100,21 @@ Subcommands:
   help
       show this help
 
+Payload input (exec / send):
+  --base64           decode base64 (whitespace ignored) to strict UTF-8 text; send sends it raw (no \\n / \\xHH decoding), exec still runs the command pipeline and normalizes CRLF
+  --file <path>      read a LOCAL UTF-8 file on the plugin host (not remote); send sends it raw, exec still runs the command pipeline; strips BOM, rejects NUL; ~ is expanded
+  --                 end option parsing: exec -- "-x" / send -- "-n" (payload starting with "-")
+  For complex quotes or shell-specific escaping, prefer --base64 / --file over guessing outer quotes.
+
 Examples:
   term_cli connect root@192.168.1.10
   term_cli connect user@host -p file:C:\\secrets\\pw.txt
   term_cli local "docker exec -it myctr bash" -n db
   term_cli exec "ls -la" -w
   term_cli exec "cd /var/log && tail -50 syslog"
+  term_cli exec -- "-x"
+  term_cli exec --base64 "bHMK"
+  term_cli send --file ./payload.txt -n db
   term_cli send "mypass\\r" -n default
   term_cli read -n db -s buffer
   term_cli status
@@ -118,11 +131,11 @@ Examples:
       -p 支持明文或 file:<路径>（从文件读密码，避免暴露）
   local "<command>" [-n name] [-c cwd]
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
-  exec "<command>" [-n name] [-w]
+  exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；长时间运行 / 需要 stdin / 交互的命令请用默认模式，再用 status/read 轮询，因为只要命令没结束 -w 就会一直等）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
-  send "<text>" [-n name]
+  send "<text>" [--base64 | --file <path>] [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   status [-n name]
       终端状态（busy/pending/连接）；省略 name 列出全部
@@ -131,12 +144,21 @@ Examples:
   help
       显示本帮助
 
+载荷输入（exec / send）:
+  --base64           解码 base64（忽略空白）为严格 UTF-8 文本；send 原样发送（不再解释 \\n / \\xHH 等转义），exec 仍走命令管线（CRLF 归一）
+  --file <path>      读取插件进程本机的 UTF-8 文件（不是远程文件）；send 原样发送，exec 仍走命令管线；剥 BOM、拒绝 NUL；支持 ~ 展开
+  --                 终止选项解析：exec -- "-x" / send -- "-n"（载荷以 "-" 开头时）
+  复杂引号或目标 shell 专属转义，优先用 --base64 / --file，不要在外层引号里猜转义。
+
 示例:
   term_cli connect root@192.168.1.10
   term_cli connect user@host -p file:C:\\secrets\\pw.txt
   term_cli local "docker exec -it myctr bash" -n db
   term_cli exec "ls -la" -w
   term_cli exec "cd /var/log && tail -50 syslog"
+  term_cli exec -- "-x"
+  term_cli exec --base64 "bHMK"
+  term_cli send --file ./payload.txt -n db
   term_cli send "mypass\\r" -n default
   term_cli read -n db -s buffer
   term_cli status
@@ -164,12 +186,12 @@ Examples:
     zh: "用法: local \"<command>\" [-n name] [-c cwd]",
   },
   cli_exec_usage: {
-    en: "Usage: exec \"<command>\" [-n name] [-w]",
-    zh: "用法: exec \"<command>\" [-n name] [-w]",
+    en: "Usage: exec \"<command>\" [--base64 | --file <path>] [-n name] [-w]",
+    zh: "用法: exec \"<command>\" [--base64 | --file <path>] [-n name] [-w]",
   },
   cli_send_usage: {
-    en: "Usage: send \"<text>\" [-n name]",
-    zh: "用法: send \"<text>\" [-n name]",
+    en: "Usage: send \"<text>\" [--base64 | --file <path>] [-n name]",
+    zh: "用法: send \"<text>\" [--base64 | --file <path>] [-n name]",
   },
   cli_need_command: {
     en: "Need a command",
@@ -179,9 +201,29 @@ Examples:
     en: "Need text to send",
     zh: "需要发送内容",
   },
+  payload_conflict: {
+    en: "Use either --base64 or --file, not both.",
+    zh: "只能二选一：--base64 或 --file。",
+  },
+  payload_bad_base64: {
+    en: "Invalid base64 payload.",
+    zh: "base64 载荷不合法。",
+  },
+  payload_bad_encoding: {
+    en: "Payload is not valid UTF-8 (or contains NUL); save it as UTF-8.",
+    zh: "载荷不是合法 UTF-8（或含 NUL）；请保存为 UTF-8。",
+  },
+  payload_file_error: {
+    en: "Cannot read file: {path}",
+    zh: "无法读取文件：{path}",
+  },
   cli_unknown: {
     en: "Unknown command: {cmd}",
     zh: "未知命令: {cmd}",
+  },
+  cli_unclosed_quote: {
+    en: "Unclosed quote in term_cli args; command not sent.",
+    zh: "term_cli 参数中有未闭合引号，命令未发送。",
   },
   st_name: { en: "name", zh: "名称" },
   st_type: { en: "type", zh: "类型" },
