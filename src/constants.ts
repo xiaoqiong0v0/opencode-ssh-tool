@@ -228,5 +228,6 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * v19：history-only 删除判据、meta.json 标题持久化。
  * v20：新增传输任务事件（agent→server `transfer`，server→web `transfer`/`transfers` 快照）。
  * v21：传输面板改右下浮窗；新增 `transfer-remove` 清理广播与 agent 断线任务失败收尾。
+ * v22：传输浮窗默认关闭/开关持久化与 Web 文案修正；强制重启独立服务刷新 Web 资源。
  */
-export const SERVER_PROTO_VERSION = 21
+export const SERVER_PROTO_VERSION = 22

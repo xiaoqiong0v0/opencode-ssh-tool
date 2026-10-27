@@ -15,13 +15,13 @@
   <label class="tgl"><input type="checkbox" id="showTime" onchange="onShowTimeChange()"> {{web_time}}</label>
   <label class="tgl" id="rawToggle"><input type="checkbox" id="debugMode" onchange="onDebugModeChange()"> {{web_raw}}</label>
   <span id="meta"></span>
-  <button id="transferToggle" class="transfer-toggle" type="button" aria-expanded="true" aria-controls="transferPanel" onclick="toggleTransferPanel()">
+  <button id="transferToggle" class="transfer-toggle" type="button" aria-expanded="false" aria-controls="transferPanel" onclick="toggleTransferPanel()">
     <span>{{web_transfers}}</span>
     <span id="transferCount" class="transfer-count">0</span>
   </button>
   <button id="toBottom" class="to-bottom-btn" onclick="scrollToNewest()">{{web_new_messages}}</button>
 </header>
-<aside id="transferPanel" class="transfer-panel" aria-label="{{web_transfers}}">
+<aside id="transferPanel" class="transfer-panel" aria-label="{{web_transfers}}" hidden>
   <div class="transfer-panel-head">
     <span class="transfer-title">{{web_transfers}}</span>
     <button id="transferClose" class="transfer-close" type="button" aria-label="{{web_close}}" title="{{web_close}}" onclick="toggleTransferPanel()">×</button>

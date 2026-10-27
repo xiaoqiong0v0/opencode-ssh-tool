@@ -37,7 +37,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ```text
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
-term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 等到命令真正结束，仅用于预期很快结束的命令）
+term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 只用于已知很快结束的命令；禁止对 server/watch/tail -f/构建/安装/扫描/交互命令用 -w）
 term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出
 term_cli send "<text>" [--base64 | --file <path>] [-n name]         # 发送按键（sudo 密码等）
 term_cli upload <local> <remote> [-n name] [--overwrite] [--mkdir]  # SFTP 上传（仅 SSH）
@@ -155,7 +155,7 @@ term_cli exec(command)
 
 页面按会话/终端切换，transcript 展示「命令 + 输出」历史对，raw 展示 xterm.js 实时画面。底部命令框提交命令；交互式程序（sudo 密码、REPL 等）需要逐键输入时，点终端区域或入口按钮切到**直接输入**（见「特性」），按键实时发往终端。
 
-**传输任务浮窗**（header 的“传输任务”按钮开关，默认展开；固定右下角、最大高度约 50vh，列表内滚动，不参与终端/命令框布局，底部留出命令框空间）：展示**当前选中终端**（会话 + 终端名）的传输任务，每行含方向（上传/下载）、终端名、本地↔远端路径、状态（running/done/failed）、已传/总字节、耗时（失败时附错误码）。进度条按 `bytes/total` 显示，`total=0` 的 running 为不确定态。浮窗可关闭，关闭后 header 按钮仍保留任务计数，点击可重新打开；切换终端时列表随之切换（只看该终端任务），切换会话按新会话/终端快照刷新，任务更新时照常刷新。面板只读元数据，不显示文件内容；任务由 agent 经同一 WS 通道上报（`transfer` 广播、`transfers` 快照、`transfer-remove` 删除，proto 21），done/failed 保留 10 分钟、running 10 分钟无更新清理。
+**传输任务浮窗**（header 的“传输任务”按钮开关，默认关闭（开关状态本地记忆）；固定右下角、最大高度约 50vh，列表内滚动，不参与终端/命令框布局，底部留出命令框空间）：展示**当前选中终端**（会话 + 终端名）的传输任务，每行含方向（上传/下载）、终端名、本地↔远端路径、状态（running/done/failed）、已传/总字节、耗时（失败时附错误码）。进度条按 `bytes/total` 显示，`total=0` 的 running 为不确定态。浮窗可关闭，关闭后 header 按钮仍保留任务计数，点击可重新打开；切换终端时列表随之切换（只看该终端任务），切换会话按新会话/终端快照刷新，任务更新时照常刷新。面板只读元数据，不显示文件内容；任务由 agent 经同一 WS 通道上报（`transfer` 广播、`transfers` 快照、`transfer-remove` 删除，proto 22），done/failed 保留 10 分钟、running 10 分钟无更新清理。
 
 ## 架构
 

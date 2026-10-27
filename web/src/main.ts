@@ -112,7 +112,7 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     noSession: "No terminal. Use term_cli connect (SSH) or term_cli local first.",
     terminals: "terminals",
     transfers: "Transfers",
-    transfersEmpty: "No transfers in this session.",
+    transfersEmpty: "No transfers for this terminal.",
     transferUpload: "Upload",
     transferDownload: "Download",
     transferRunning: "running",
@@ -134,7 +134,7 @@ const I18N_FALLBACK: Record<"en" | "zh", I18n> = {
     noSession: "无终端会话，请先用 term_cli connect（SSH）或 term_cli local 建立。",
     terminals: "终端",
     transfers: "传输任务",
-    transfersEmpty: "当前会话暂无传输任务。",
+    transfersEmpty: "当前终端暂无传输任务。",
     transferUpload: "上传",
     transferDownload: "下载",
     transferRunning: "传输中",
@@ -629,6 +629,8 @@ function renderTransferRow(task: TransferTask): HTMLElement {
 
 /** 传输浮窗位置持久化键（只存 left/top；恢复与 resize 时按当前视口重新 clamp） */
 const TRANSFER_PANEL_POS_KEY = "transferPanelPos"
+/** 浮窗开关状态持久化键：默认关闭，用户关闭/打开后刷新保持 */
+const TRANSFER_PANEL_OPEN_KEY = "transferPanelOpen"
 /** 浮窗与视口边缘的最小间距（px），拖动/恢复/resize 共用 */
 const TRANSFER_PANEL_MARGIN = 8
 /** 标题栏拖动提示（纯前端交互提示，不进 server i18n 载荷） */
@@ -682,6 +684,7 @@ function toggleTransferPanel(open?: boolean): void {
   const next = open ?? panel.hidden
   panel.hidden = !next
   toggle.setAttribute("aria-expanded", next ? "true" : "false")
+  saveTransferPanelOpen(next)
   // 重新展开时按当前视口复位记忆位置，避免上次的坐标把浮窗留在屏幕外
   if (next) clampTransferPanelIntoView()
 }
@@ -753,6 +756,27 @@ function saveTransferPanelPos(left: number, top: number): void {
     localStorage.setItem(TRANSFER_PANEL_POS_KEY, JSON.stringify({ left: Math.round(left), top: Math.round(top) }))
   } catch {
     // 存储不可用（隐私模式/超额）时只丢记忆，不影响拖动
+  }
+}
+
+/** 读取浮窗开关状态；缺失/非法时默认关闭 */
+function loadTransferPanelOpen(): boolean {
+  try {
+    return localStorage.getItem(TRANSFER_PANEL_OPEN_KEY) === "1"
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 保存浮窗开关状态（刷新后保持上次选择）。
+ * @param open true=展开
+ */
+function saveTransferPanelOpen(open: boolean): void {
+  try {
+    localStorage.setItem(TRANSFER_PANEL_OPEN_KEY, open ? "1" : "0")
+  } catch {
+    // 存储不可用时只丢记忆，不影响当前操作
   }
 }
 
@@ -839,10 +863,17 @@ function setupTransferPanelDrag(): void {
     if (!transferDrag) clampTransferPanelIntoView()
   }).observe(panel)
   const saved = loadTransferPanelPos()
-  if (!saved) return
-  const rect = panel.getBoundingClientRect()
-  const pos = clampTransferPanelPos(saved.left, saved.top, rect.width, rect.height)
-  applyTransferPanelPos(panel, pos.left, pos.top)
+  if (saved) {
+    const rect = panel.getBoundingClientRect()
+    const pos = clampTransferPanelPos(saved.left, saved.top, rect.width, rect.height)
+    applyTransferPanelPos(panel, pos.left, pos.top)
+  }
+  // 默认关闭；恢复上次开关状态（刷新不强制展开）
+  const open = loadTransferPanelOpen()
+  const toggle = document.getElementById("transferToggle")
+  panel.hidden = !open
+  toggle?.setAttribute("aria-expanded", open ? "true" : "false")
+  if (open) clampTransferPanelIntoView()
 }
 
 /**

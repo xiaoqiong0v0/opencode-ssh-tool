@@ -68,12 +68,12 @@ export const T = {
     zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read; use -w only for commands expected to finish quickly. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected).",
-    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read；-w 只用于预期很快结束的命令。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。",
+    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read. NEVER add -w to servers, watchers, tail -f, builds, installs, scans, REPLs or commands waiting for input: -w blocks until completion and can hang. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected).",
+    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read。禁止对 server/watch/tail -f/构建/安装/扫描/REPL/等待输入的命令加 -w：-w 会一直等到结束，可能永久阻塞。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。",
   },
   term_cli_args: {
-    en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
-    zh: "完整命令行字符串，如 'local \"wsl bash\"' / 'exec \"ls -la\" -w' / 'connect user@host' / 'upload ./a.txt ~/a.txt'；空时默认 'help'。",
+    en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\"' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
+    zh: "完整命令行字符串，如 'local \"wsl bash\"' / 'exec \"ls -la\"' / 'connect user@host' / 'upload ./a.txt ~/a.txt'；空时默认 'help'。",
   },
   term_cli_help: {
     en: `term_cli unified CLI tool: manage SSH / local (wsl, pwsh, bash) / container (docker exec) terminal sessions.
@@ -88,7 +88,7 @@ Subcommands:
   local "<command>" [-n name] [-c cwd]
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
-      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; for long-running / stdin-reading / interactive commands use the default and poll with status/read, because -w keeps waiting as long as the command runs)
+      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; NEVER use -w for long-running / stdin-reading / interactive / server / watch / tail -f / build / install / scan / REPL commands, because -w keeps waiting as long as the command runs and can hang indefinitely; use the default and poll with status/read)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
   send "<text>" [--base64 | --file <path>] [-n name]
@@ -117,7 +117,7 @@ Examples:
   term_cli connect root@192.168.1.10
   term_cli connect user@host -p file:C:\\secrets\\pw.txt
   term_cli local "docker exec -it myctr bash" -n db
-  term_cli exec "ls -la" -w
+  term_cli exec "ls -la"
   term_cli exec "cd /var/log && tail -50 syslog"
   term_cli exec -- "-x"
   term_cli exec --base64 "bHMK"
@@ -141,7 +141,7 @@ Examples:
   local "<command>" [-n name] [-c cwd]
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
-      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；长时间运行 / 需要 stdin / 交互的命令请用默认模式，再用 status/read 轮询，因为只要命令没结束 -w 就会一直等）
+      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；**禁止**对长时间运行 / 需要 stdin / 交互 / server / watch / tail -f / 构建 / 安装 / 扫描 / REPL 命令加 -w：只要命令没结束 -w 就会一直等，可能永久阻塞；这些命令请用默认模式，再用 status/read 轮询）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
       读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
   send "<text>" [--base64 | --file <path>] [-n name]
@@ -170,7 +170,7 @@ Examples:
   term_cli connect root@192.168.1.10
   term_cli connect user@host -p file:C:\\secrets\\pw.txt
   term_cli local "docker exec -it myctr bash" -n db
-  term_cli exec "ls -la" -w
+  term_cli exec "ls -la"
   term_cli exec "cd /var/log && tail -50 syslog"
   term_cli exec -- "-x"
   term_cli exec --base64 "bHMK"
@@ -416,7 +416,7 @@ Examples:
   web_time: { en: "Time", zh: "时间" },
   web_terminals: { en: "terminals", zh: "终端" },
   web_transfers: { en: "Transfers", zh: "传输任务" },
-  web_transfers_empty: { en: "No transfers in this session.", zh: "当前会话暂无传输任务。" },
+  web_transfers_empty: { en: "No transfers for this terminal.", zh: "当前终端暂无传输任务。" },
   web_transfer_upload: { en: "Upload", zh: "上传" },
   web_transfer_download: { en: "Download", zh: "下载" },
   web_transfer_running: { en: "running", zh: "传输中" },
