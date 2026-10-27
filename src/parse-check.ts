@@ -31,8 +31,8 @@ const SIDECAR_MAX_RESTARTS = 1
 /** bash/zsh 预检超时（毫秒）：`-n` 纯解析不执行，正常 <50ms；超时按放行处理 */
 const POSIX_CHECK_TIMEOUT_MS = 10_000
 
-/** bash 错误消息中的行号（如 `bash: line 2: syntax error ...`）；解析不到时回退第 1 行 */
-const BASH_LINE_RE = /line (\d+)/
+/** bash/zsh 错误消息中的行号（英文 `line 2` / 中文 `行 2`）；解析不到时回退第 1 行 */
+const POSIX_LINE_RE = /(?:line|行)\s*(\d+)/
 
 /** bash 粗错误的固定 ErrorId（bash 无语言无关 ErrorId，仅作占位标记） */
 const BASH_ERR_ID = "bash-syntax"
@@ -42,7 +42,7 @@ const BASH_ERR_ID = "bash-syntax"
  * 用于把「命令不存在 / WSL 无发行版」等**非语法错误**的失败（如 exit 127）与真语法错误区分开——
  * 前者必须放行，绝不误拦。
  */
-const POSIX_SYNTAX_RE = /(syntax error|unexpected EOF|unexpected end of file|parse error)/i
+const POSIX_SYNTAX_RE = /(syntax error|unexpected EOF|unexpected end of file|parse error|语法错误|未预期的记号|未预期的文件结尾)/i
 
 /** PowerShell 侧车候选解释器（按优先级）：Windows 上优先 pwsh 7，回落 5.1；非 Windows 仅 pwsh */
 const PS_CANDIDATES: readonly string[] =
@@ -86,13 +86,19 @@ const PS_SIDECAR_SCRIPT = [
   "}",
 ].join("\n")
 
+/**
+ * 侧车脚本的 `-EncodedCommand` 参数（UTF-16LE base64，纯 ASCII）。
+ * 远程 pwsh 预检直接复用该参数在远端启动同一份侧车脚本，保证协议完全一致。
+ */
+export const PS_SIDECAR_ENCODED_COMMAND: string = encodeUtf16leBase64(PS_SIDECAR_SCRIPT)
+
 /** 侧车启动参数：-EncodedCommand 传脚本，规避引号与代码页问题（脚本 ASCII-only） */
 const PS_SIDECAR_ARGS: readonly string[] = [
   "-NoProfile",
   "-NonInteractive",
   "-NoLogo",
   "-EncodedCommand",
-  encodeUtf16leBase64(PS_SIDECAR_SCRIPT),
+  PS_SIDECAR_ENCODED_COMMAND,
 ]
 
 /**
@@ -131,6 +137,16 @@ function encodeUtf16leBase64(s: string): string {
   return Buffer.from(s, "utf16le").toString("base64")
 }
 
+/**
+ * 把命令文本编码为侧车协议请求行（base64(UTF-8)，单行不含换行）。
+ * 本地常驻侧车与远程 pwsh 预检共用，保证 payload 格式一致。
+ * @param text 待解析的命令文本
+ * @returns base64(UTF-8) 字符串
+ */
+export function encodePwshSidecarPayload(text: string): string {
+  return Buffer.from(text, "utf8").toString("base64")
+}
+
 /** 把 shell 标识归类：仅识别 PowerShell 与 bash/zsh；其余归为 other（放行） */
 function classifyShell(shell: string): "pwsh" | "bash" | "zsh" | "other" {
   const s = shell.trim().toLowerCase()
@@ -155,9 +171,9 @@ async function checkPosix(kind: "bash" | "zsh", text: string): Promise<ParseIssu
     if (outcome.code === 0) return null
     // 只有 stderr 确实像语法错误才拦：不能单凭 exit=2（包装脚本/WSL 异常也可能返回 2）；
     // 其余非 0（如 127 command not found、WSL 无发行版）视为"不可用"→ 放行，绝不误拦
-    if (!POSIX_SYNTAX_RE.test(outcome.stderr)) return null
+    if (!looksLikePosixSyntaxError(outcome.stderr)) return null
     const stderr = outcome.stderr.trim()
-    return { errorId: BASH_ERR_ID, line: parseBashLine(outcome.stderr), col: 0, text: stderr }
+    return { errorId: BASH_ERR_ID, line: parsePosixSyntaxLine(outcome.stderr), col: 0, text: stderr }
   }
   return null
 }
@@ -225,15 +241,34 @@ function runPosixCheck(
   })
 }
 
-/** 从 bash 错误消息解析行号；解析不到或非正数时回退 1 */
-function parseBashLine(stderr: string): number {
-  const m = BASH_LINE_RE.exec(stderr)
+/**
+ * 判断 stderr 是否"像"POSIX shell 语法错误（供本地 `-n` 与远程独立 exec channel 共用）。
+ * 只做存在性判断：非语法失败（命令不存在/无发行版等）必须放行，绝不误拦。
+ * @param stderr 解析器的标准错误输出
+ * @returns 命中语法错误特征时为 true
+ */
+export function looksLikePosixSyntaxError(stderr: string): boolean {
+  return POSIX_SYNTAX_RE.test(stderr)
+}
+
+/**
+ * 从 bash/zsh 错误消息解析行号；兼容英文 `line N` 与中文 `行 N`。
+ * @param stderr 解析器的标准错误输出
+ * @returns 行号（解析不到或非正数时回退 1）
+ */
+export function parsePosixSyntaxLine(stderr: string): number {
+  const m = POSIX_LINE_RE.exec(stderr)
   const n = m ? Number.parseInt(m[1], 10) : Number.NaN
   return Number.isFinite(n) && n > 0 ? n : 1
 }
 
-/** 解析侧车响应行 `ERRCOUNT=<n>[|ErrorId:line:col:b64]...` */
-function parsePsResponse(line: string): ParseIssue[] | null {
+/**
+ * 解析侧车响应行 `ERRCOUNT=<n>[|ErrorId:line:col:b64]...`。
+ * 本地常驻侧车与远程 pwsh 预检共用；远程拿到的 stdout 可能含 `READY`/CRLF，调用方需先取出响应行。
+ * @param line 协议响应行（以 `ERRCOUNT=` 开头）
+ * @returns 错误列表（空数组=通过）；行格式不合法返回 null
+ */
+export function parsePwshSidecarResponse(line: string): ParseIssue[] | null {
   const prefix = "ERRCOUNT="
   if (!line.startsWith(prefix)) return null
   const head = line.indexOf("|")
@@ -308,14 +343,14 @@ class PwshSidecar {
   async check(text: string): Promise<ParseIssue[] | null> {
     const proc = await this._ensure()
     if (proc === null) return null
-    const payload = Buffer.from(text, "utf8").toString("base64")
+    const payload = encodePwshSidecarPayload(text)
     let response: string
     try {
       response = await this._request(proc, payload)
     } catch {
       return null // 侧车异常/超时 → 降级放行
     }
-    return parsePsResponse(response)
+    return parsePwshSidecarResponse(response)
   }
 
   /**

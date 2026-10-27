@@ -346,12 +346,14 @@ function cmdOpenContinuation(s: string): boolean {
 /**
  * POSIX 系（bash/zsh/sh/dash）语法/解析错误模式，命中形式：
  * `bash: syntax error near unexpected token ...`、`zsh: parse error near ...`、
- * `/bin/sh: 1: Syntax error: ...`（dash 首字母大写，故大小写不敏感）。
+ * `/bin/sh: 1: Syntax error: ...`（dash 首字母大写，故大小写不敏感）；
+ * 以及中文 locale 的 `bash: 未预期的记号 "(" 附近有语法错误` /
+ * `bash: 未预期的文件结尾` / `bash: 语法错误 ...`。
  * 行首锚定并要求 **shell 名前缀**：程序输出里的裸 `syntax error` 不命中，降低误判面
  *（误判会让插件提前收尾，甚至把探针写进仍在运行的程序）。
  */
 const POSIX_SYNTAX_ERROR_RE =
-  /(?:^|[\r\n])(?:(?:[^\s:]*\/)?-?(?:bash|zsh|sh|dash|ksh|ash):)(?:\s*[^\s:]+(?:\s+\d+)?:)*\s*(?:syntax|parse)\s+error/i
+  /(?:^|[\r\n])(?:(?:[^\s:]*\/)?-?(?:bash|zsh|sh|dash|ksh|ash):)(?:\s*[^\s:]+(?:\s+\d+)?:)*\s*(?:(?:syntax|parse)\s+error|未预期的记号|未预期的文件结尾|语法错误|附近有语法错误)/i
 
 /**
  * PowerShell 语法/解析错误模式：

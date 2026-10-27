@@ -1,13 +1,16 @@
 // SshSession：ssh2 长驻连接 + PTY shell 管理，
 // 完成标记法：每条命令后追加一条标记命令，完成后输出 <SSH_DONE:nonce:seq:退出码>（不依赖 PROMPT_COMMAND/PS1 钩子）
 
-import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2"
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2"
 import log, { isDebugEnabled, ssh2Trace } from "./log.js"
 import {
   INJECT_TIMEOUT_MS,
   PTY_COLS,
   PTY_ROWS,
   READY_TIMEOUT_MS,
+  REMOTE_PRECHECK_COMMAND_MAX,
+  REMOTE_PRECHECK_OUTPUT_MAX,
+  REMOTE_PRECHECK_TIMEOUT_MS,
   SSH_KEEPALIVE_COUNT_MAX,
   SSH_KEEPALIVE_INTERVAL_MS,
   TRANSFER_JOB_SETTLE_TIMEOUT_MS,
@@ -18,6 +21,76 @@ import { resolveAuth, resolvePassword, type AuthInfo } from "./ssh-auth.js"
 import { assertTransferCapable, downloadFile, uploadFile, TransferError, type DownloadOptions, type TransferResult, type UploadOptions } from "./transfer.js"
 import type { ExecResult } from "./base-session.js"
 import { BaseSession } from "./base-session.js"
+import {
+  encodePwshSidecarPayload,
+  looksLikePosixSyntaxError,
+  parsePosixSyntaxLine,
+  parsePwshSidecarResponse,
+  PS_SIDECAR_ENCODED_COMMAND,
+  type ParseCheckResult,
+  type ParseIssue,
+} from "./parse-check.js"
+import { pickSyntaxErrorText } from "./precheck.js"
+
+/** 远程预检放行结果（共享单例） */
+const PRECHECK_PASS: ParseCheckResult = { ok: true }
+
+/** 远程 pwsh 侧车候选解释器（按序尝试；任一不可用/超时即 fail-open） */
+const REMOTE_PWSH_CANDIDATES: readonly string[] = ["pwsh", "powershell", "powershell.exe"]
+
+/** 侧车启动参数（脚本经 UTF-16LE base64 传入，纯 ASCII，规避远端代码页/引号问题） */
+const PS_SIDECAR_ARGV = `-NoProfile -NonInteractive -NoLogo -EncodedCommand ${PS_SIDECAR_ENCODED_COMMAND}`
+
+/** 侧车协议响应行前缀 */
+const PWSH_RESPONSE_PREFIX = "ERRCOUNT="
+const PWSH_ERROR_PREFIX = "ERROR="
+
+/** 远程 pwsh 预检单次候选的结果 */
+type PwshCandidateOutcome =
+  | { kind: "result"; errors: ParseIssue[] }
+  | { kind: "unavailable" }
+  | { kind: "error" }
+  | { kind: "timeout" }
+
+/**
+ * 从侧车 stdout 取出协议响应行（容忍 CRLF、UTF-8 BOM 与前置 READY 行）。
+ * @param stdout 侧车标准输出
+ * @returns `ERRCOUNT=...` / `ERROR=...` 行；无响应返回 null
+ */
+function findPwshResponseLine(stdout: string): string | null {
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/^\uFEFF/, "")
+    if (line.startsWith(PWSH_RESPONSE_PREFIX) || line.startsWith(PWSH_ERROR_PREFIX)) return line
+  }
+  return null
+}
+
+/** 远端"解释器不存在/无法启动"的典型文案（仅在拿不到协议响应时用于决定是否换候选） */
+const PWSH_UNAVAILABLE_RE = /command not found|not found|not recognized|不是内部或外部命令|无法将.*识别|未找到命令|找不到命令/i
+
+/**
+ * 追加输出并保留尾部上限，避免异常输出撑爆内存。
+ * @param current 已收集文本
+ * @param chunk 新到片段
+ * @returns 截尾后的文本（上限 REMOTE_PRECHECK_OUTPUT_MAX）
+ */
+function appendBounded(current: string, chunk: string): string {
+  const next = current + chunk
+  return next.length > REMOTE_PRECHECK_OUTPUT_MAX ? next.slice(-REMOTE_PRECHECK_OUTPUT_MAX) : next
+}
+
+/**
+ * 候选解释器是否明显"没跑起来"（不存在/启动失败）。
+ * 只在没有协议响应时判定：非语法失败必须放行，绝不误拦。
+ * @param exitCode 远端退出码（null=未收到）
+ * @param stderr 远端标准错误输出
+ * @returns 可换下一候选时为 true
+ */
+function isPwshCandidateUnavailable(exitCode: number | null, stderr: string): boolean {
+  if (exitCode === null) return true
+  if (exitCode === 0) return false
+  return exitCode === 127 || exitCode === 9009 || PWSH_UNAVAILABLE_RE.test(stderr)
+}
 
 export interface SessionStatus {
   connected: boolean
@@ -215,6 +288,24 @@ export class SshSession extends BaseSession {
   }
 
   /**
+   * SSH 远程发送前语法预检（bash/zsh/pwsh）：独立 exec channel，只解析不执行。
+   * - bash/zsh：跑 `<shell> -n`，命令经 stdin 写入；
+   * - pwsh：启动 PowerShell 解析侧车（与本地 parse-check 同一脚本/协议），命令以 base64 写入 stdin；
+   * - 不占 PTY、不写 history、不翻转 busy、不修改 `_connected`；
+   * - 其他 shell（sh/dash/cmd/未知）或未连接时直接放行；cmd 无安全 parse-only 通道，明确跳过；
+   * - 通道异常、超时、拿不到响应、非语法失败一律 `{ok:true}`（绝不误拦）。
+   * @param command 待校验的命令文本（调用方已剥掉尾注释/尾运算符）
+   * @returns 通过或无法判定为 `{ok:true}`；确认语法错误为 `{ok:false,errors}`（含行号/片段）
+   */
+  async precheckSyntax(command: string): Promise<ParseCheckResult> {
+    const shell = this._adapter?.name
+    if (shell !== "bash" && shell !== "zsh" && shell !== "pwsh") return PRECHECK_PASS
+    if (!command || !this._connected || this._client === null) return PRECHECK_PASS
+    if (shell === "pwsh") return this._execPwshSyntaxCheck(this._client, command)
+    return this._execSyntaxCheck(this._client, shell, command)
+  }
+
+  /**
    * 串行化文件传输：前一个任务成功或失败后都继续执行下一个（失败不阻塞队列）。
    * @param job 传输任务
    * @returns 任务结果
@@ -363,6 +454,262 @@ export class SshSession extends BaseSession {
         })
       } catch (e) {
         failAfterJob(new TransferError("sftp_unavailable", undefined, e instanceof Error ? e.message : String(e)))
+      }
+    })
+  }
+
+  /**
+   * 用独立 SSH exec channel 跑 `<shell> -n`：命令文本经 stdin 写入（末尾补换行）后 EOF。
+   * 只解析不执行；通道结束/错误/超时都只结算本次预检，不触碰 PTY、busy、history 或连接状态。
+   * @param client 当前 SSH 客户端（调用方已确认非 null 且已连接）
+   * @param shell bash 或 zsh
+   * @param command 待校验命令文本
+   * @returns 确认语法错误 `{ok:false,errors}`；其余情况一律 `{ok:true}`（fail-open）
+   */
+  private _execSyntaxCheck(client: Client, shell: "bash" | "zsh", command: string): Promise<ParseCheckResult> {
+    return new Promise<ParseCheckResult>((resolve) => {
+      let settled = false
+      /** 远端退出码；未收到 exit 事件时为 null（按"无法判定"放行） */
+      let exitCode: number | null = null
+      let stderr = ""
+      let stdout = ""
+      let stream: ClientChannel | null = null
+      let timer: ReturnType<typeof setTimeout> | null = null
+
+      /** 单次结算：清定时器；abort=true 时销毁预检通道（超时/错误路径） */
+      const settle = (result: ParseCheckResult, abort = false): void => {
+        if (settled) return
+        settled = true
+        if (timer !== null) {
+          clearTimeout(timer)
+          timer = null
+        }
+        if (abort && stream !== null) {
+          try {
+            stream.destroy()
+          } catch {
+            /* 通道可能已关闭 */
+          }
+        }
+        resolve(result)
+      }
+
+      /** 通道关闭：只有"非 0 退出码 + stderr 确实像语法错误"才拦截，其余放行 */
+      const finish = (): void => {
+        if (settled) return
+        if (exitCode === null || exitCode === 0 || !looksLikePosixSyntaxError(stderr)) {
+          settle(PRECHECK_PASS)
+          return
+        }
+        const line = parsePosixSyntaxLine(stderr)
+        const detail = stderr.trim() ? stderr : stdout
+        settle({
+          ok: false,
+          errors: [{ errorId: `${shell}-syntax`, line, col: 1, text: pickSyntaxErrorText(command, line, detail) }],
+        })
+      }
+
+      timer = setTimeout(() => {
+        log.info(`远程语法预检超时，放行命令 (session ${this.sessionID}, term ${this.name})`)
+        settle(PRECHECK_PASS, true)
+      }, REMOTE_PRECHECK_TIMEOUT_MS)
+
+      try {
+        client.exec(`${shell} -n`, { pty: false }, (err, channel) => {
+          // 超时/错误之后才建好的通道：直接销毁，避免泄漏
+          if (settled) {
+            try {
+              channel?.destroy()
+            } catch {
+              /* 已关闭 */
+            }
+            return
+          }
+          if (err || !channel) {
+            log.info(`远程语法预检通道不可用，放行命令 (session ${this.sessionID}, term ${this.name})`)
+            settle(PRECHECK_PASS)
+            return
+          }
+          stream = channel
+          channel.on("error", (e: Error) => {
+            if (settled) return
+            log.info(`远程语法预检通道错误，放行命令 (session ${this.sessionID}, term ${this.name}): ${e.message}`)
+            settle(PRECHECK_PASS, true)
+          })
+          channel.stderr.on("error", () => settle(PRECHECK_PASS, true))
+          channel.stderr.setEncoding("utf8")
+          channel.stderr.on("data", (chunk: string) => { stderr = appendBounded(stderr, chunk) })
+          channel.setEncoding("utf8")
+          channel.on("data", (chunk: string) => { stdout = appendBounded(stdout, chunk) })
+          // 只认 exit 的退出码；close 用于确保 stdout/stderr 已消费完毕再结算
+          channel.on("exit", (code: number | null) => {
+            exitCode = typeof code === "number" ? code : null
+          })
+          channel.on("close", finish)
+          try {
+            channel.end(command.endsWith("\n") ? command : `${command}\n`)
+          } catch {
+            settle(PRECHECK_PASS, true)
+          }
+        })
+      } catch (e) {
+        log.error(`远程发送前语法预检异常，放行命令 (session ${this.sessionID}, term ${this.name})`, e instanceof Error ? e : String(e))
+        settle(PRECHECK_PASS)
+      }
+    })
+  }
+
+  /**
+   * 用独立 SSH exec channel 启动 PowerShell 解析侧车（只解析不执行）：
+   * 复用本地 parse-check 的侧车脚本/响应协议，命令以 base64(UTF-8) 写入 stdin，
+   * 随后写 `!QUIT` 让侧车自行退出；只读 stdout 的 `ERRCOUNT=` 行，不触碰 PTY/连接状态。
+   * 命令超长或编码失败直接放行（fail-open）。
+   * @param client 当前 SSH 客户端（调用方已确认非 null 且已连接）
+   * @param command 待校验命令文本
+   * @returns 确认语法错误 `{ok:false,errors}`；其余情况一律 `{ok:true}`
+   */
+  private _execPwshSyntaxCheck(client: Client, command: string): Promise<ParseCheckResult> {
+    if (command.length > REMOTE_PRECHECK_COMMAND_MAX) {
+      log.info(`远程 pwsh 语法预检：命令超长，放行命令 (session ${this.sessionID}, term ${this.name})`)
+      return Promise.resolve(PRECHECK_PASS)
+    }
+    let payload: string
+    try {
+      payload = encodePwshSidecarPayload(command)
+    } catch (e) {
+      log.error(`远程 pwsh 语法预检编码失败，放行命令 (session ${this.sessionID}, term ${this.name})`, e instanceof Error ? e : String(e))
+      return Promise.resolve(PRECHECK_PASS)
+    }
+    return this._runPwshCandidates(client, payload)
+  }
+
+  /**
+   * 按候选顺序（pwsh → powershell → powershell.exe）启动侧车，共享总超时预算。
+   * 只有"候选不可用"（找不到解释器/启动失败）才换下一个；拿到协议结果或通道异常/超时即结算，
+   * 除确认语法错误外一律返回 `{ok:true}`。
+   * @param client 当前 SSH 客户端
+   * @param payload base64(UTF-8 命令文本)
+   * @returns 预检结果（fail-open）
+   */
+  private async _runPwshCandidates(client: Client, payload: string): Promise<ParseCheckResult> {
+    const deadlineAt = Date.now() + REMOTE_PRECHECK_TIMEOUT_MS
+    for (const bin of REMOTE_PWSH_CANDIDATES) {
+      const remaining = deadlineAt - Date.now()
+      if (remaining <= 0) break
+      const outcome = await this._runPwshCandidate(client, bin, payload, remaining)
+      if (outcome.kind === "result") {
+        return outcome.errors.length === 0 ? PRECHECK_PASS : { ok: false, errors: outcome.errors }
+      }
+      if (outcome.kind === "unavailable") {
+        log.info(`远程 pwsh 语法预检候选不可用（${bin}），尝试下一候选 (session ${this.sessionID}, term ${this.name})`)
+        continue
+      }
+      // 侧车内部异常 / 超时：放行，不再重试（超时已耗尽预算）
+      log.info(`远程 pwsh 语法预检未获结果（${bin}:${outcome.kind}），放行命令 (session ${this.sessionID}, term ${this.name})`)
+      return PRECHECK_PASS
+    }
+    log.info(`远程 pwsh 语法预检无可用候选，放行命令 (session ${this.sessionID}, term ${this.name})`)
+    return PRECHECK_PASS
+  }
+
+  /**
+   * 单个候选解释器的一次预检：打开独立 exec channel、写入请求与 `!QUIT`、收集 stdout/stderr。
+   * 结算时清定时器/销毁通道；通道错误与"命令不存在"都只影响本次预检。
+   * @param client 当前 SSH 客户端
+   * @param bin 候选解释器名（pwsh / powershell / powershell.exe）
+   * @param payload base64(UTF-8 命令文本)
+   * @param timeoutMs 本次候选的剩余预算（毫秒）
+   * @returns 候选结果（result/unavailable/error/timeout）
+   */
+  private _runPwshCandidate(
+    client: Client,
+    bin: string,
+    payload: string,
+    timeoutMs: number,
+  ): Promise<PwshCandidateOutcome> {
+    return new Promise<PwshCandidateOutcome>((resolve) => {
+      let settled = false
+      /** 远端退出码；未收到 exit 事件时为 null（按"候选不可用"处理，交给下一个候选） */
+      let exitCode: number | null = null
+      let stdout = ""
+      let stderr = ""
+      let stream: ClientChannel | null = null
+      let timer: ReturnType<typeof setTimeout> | null = null
+
+      /** 单次结算：清定时器；destroy=true 时销毁预检通道（超时/错误路径） */
+      const settle = (outcome: PwshCandidateOutcome, destroy = false): void => {
+        if (settled) return
+        settled = true
+        if (timer !== null) {
+          clearTimeout(timer)
+          timer = null
+        }
+        if (destroy && stream !== null) {
+          try {
+            stream.destroy()
+          } catch {
+            /* 通道可能已关闭 */
+          }
+        }
+        stream = null
+        resolve(outcome)
+      }
+
+      /** 通道关闭：先找协议响应行；无响应时按退出码/错误文案判断是否换下一候选 */
+      const finishFromOutput = (): void => {
+        if (settled) return
+        const line = findPwshResponseLine(stdout)
+        if (line !== null) {
+          if (line.startsWith(PWSH_ERROR_PREFIX)) {
+            settle({ kind: "error" })
+            return
+          }
+          const errors = parsePwshSidecarResponse(line)
+          settle(errors === null ? { kind: "error" } : { kind: "result", errors })
+          return
+        }
+        settle(isPwshCandidateUnavailable(exitCode, stderr) ? { kind: "unavailable" } : { kind: "error" })
+      }
+
+      timer = setTimeout(() => settle({ kind: "timeout" }, true), Math.max(1, timeoutMs))
+
+      try {
+        client.exec(`${bin} ${PS_SIDECAR_ARGV}`, { pty: false }, (err, channel) => {
+          // 超时/错误之后才建好的通道：直接销毁，避免泄漏
+          if (settled) {
+            try {
+              channel?.destroy()
+            } catch {
+              /* 已关闭 */
+            }
+            return
+          }
+          if (err || !channel) {
+            settle({ kind: "unavailable" })
+            return
+          }
+          stream = channel
+          // 通道级错误只影响本候选（可能只是"命令不存在"导致写失败）：交给下一个候选
+          channel.on("error", () => settle({ kind: "unavailable" }, true))
+          channel.stderr.on("error", () => settle({ kind: "unavailable" }, true))
+          channel.stderr.setEncoding("utf8")
+          channel.stderr.on("data", (chunk: string) => { stderr = appendBounded(stderr, chunk) })
+          channel.setEncoding("utf8")
+          channel.on("data", (chunk: string) => { stdout = appendBounded(stdout, chunk) })
+          channel.on("exit", (code: number | null) => {
+            exitCode = typeof code === "number" ? code : null
+          })
+          channel.on("close", finishFromOutput)
+          try {
+            // 一行请求 + !QUIT：侧车解析后输出 ERRCOUNT 行并自行退出
+            channel.end(`${payload}\n!QUIT\n`)
+          } catch {
+            settle({ kind: "unavailable" }, true)
+          }
+        })
+      } catch (e) {
+        log.error(`远程 pwsh 语法预检通道异常，放行命令 (session ${this.sessionID}, term ${this.name})`, e instanceof Error ? e : String(e))
+        settle({ kind: "unavailable" })
       }
     })
   }

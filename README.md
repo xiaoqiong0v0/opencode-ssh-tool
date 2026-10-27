@@ -8,7 +8,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
 - **命令完成判定**：真实完成只认 `<SSH_DONE:<nonce>:<seq>:<退出码>>`；Ctrl-C 用独立 `<SSH_PROBE:...>` 探针标记收尾（写完 `\x03` 立即补发首条，之后按 `interruptProbeInterval` 周期补发）。**不设超时强杀**，也不把「静默窗口 / 动画」当完成判据——动画窗口只把长命令转后台继续监听；语法错误安静收尾、不再补发探针；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截；**断连兜底**
-- **发送前语法预检**：本机（本地/容器）命令发送前做语法预检，命中错误直接拦下、不写入终端；SSH 远程不预检、直接放行
+- **发送前语法预检**：本地/容器命令发送前做语法预检，命中错误直接拦下、不写入终端；SSH 远程按探测到的 shell 另开**独立 exec channel**：`bash`/`zsh` 跑 `bash -n` / `zsh -n`，`pwsh` 启动同一份 PowerShell 解析侧车（`-EncodedCommand`，只解析不执行）；CMD 没有安全的 parse-only 通道，明确跳过。不占 PTY、不写 history、不翻转 busy；通道异常/超时一律放行（fail-open）。**只查 shell 语法，不查 Python/Node 等程序代码**
 - **SFTP 文件传输（v1）**：`term_cli upload` / `download` 通过 SSH/SFTP 传普通文件（不使用 exec/scp/base64/PTY）。默认用**独占创建**（远端 `wx` / 本地 `wx`）保证目标存在即失败，`--overwrite` 才走临时文件 + rename 覆盖，`--mkdir` 才建父目录；仅 SSH 会话（本地/容器明确拒绝）；单文件上限 256 MiB；目录与符号链接拒绝；文件内容不进模型上下文、终端历史与日志
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **直接输入（焦点驱动）**：浏览器内直接向交互式程序输入。默认「命令框优先」——按键留在浏览器，回车走 `exec` 提交命令；点终端区域（transcript `#term` / raw `#xt`）或入口按钮 `#cmdKey` 切换为直接输入，按键按**真实控制字节**经 `send` keystroke 通道发往终端（**不产生 `exec`、不写命令记录**）；焦点回到命令框等可编辑控件即自动关闭；状态**不持久化**，每次打开都从命令框优先开始；离线/断线时入口不可点击、按键一律不发送
@@ -173,7 +173,7 @@ opencode（插件进程）
 ```bash
 npm install      # 安装依赖（dependencies + devDependencies）
 npm run build    # tsc（src → dist）+ node web/build.mjs（打包 Web 资源）
-npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer）
+npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer + shell-adapter + precheck + session-precheck）
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`
@@ -200,6 +200,8 @@ npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 - [ ] 交互场景：`term_cli exec("sudo ...")` 触发密码提示 → `term_cli read` 配合
 - [ ] 白名单命令不弹审批直接执行；`rm -rf` 被拒绝
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
+- [ ] SSH 远程 `pwsh`：`term_cli exec("if then")` 发送前被拦截（未写入终端）；合法命令正常执行；远程未安装 `pwsh` 时回落 `powershell` 或放行（不误拦）
+- [ ] SSH 远程 `cmd`：预检明确跳过，命令照常执行
 - [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
 - [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）
 - [ ] `term_cli upload ./a.txt ~/a.txt` 成功；重复执行（无 `--overwrite`）报目标已存在；加 `--overwrite` 覆盖；父目录不存在时加 `--mkdir` 成功

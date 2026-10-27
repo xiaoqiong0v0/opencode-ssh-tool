@@ -4,6 +4,7 @@
 import log, { debug, describeSend, infoDedup, infoDedupShared, tailLines } from "./log.js"
 import { INTERACTIVE_BUSY_MS, HEARTBEAT_INTERVAL_MS, HEARTBEAT_CLIENT_TIMEOUT_MS, AGENT_PUSH_MIN_INTERVAL_MS } from "./constants.js"
 import { precheckBeforeExec } from "./precheck.js"
+import type { ParseCheckResult } from "./parse-check.js"
 import type { TransferTask } from "./transfer-events.js"
 
 /** 代理可操作的会话接口（SshSession / LocalSession 子集） */
@@ -24,8 +25,10 @@ export interface AgentSession {
   readonly generation: string
   /** 探测到的 shell 适配器名（供发送前语法预检选择校验器） */
   readonly shellName: string | null
-  /** 是否本地会话（SSH 远程不接预检） */
+  /** 是否本地会话（false 为 SSH 远程，走可选 precheckSyntax） */
   readonly isLocal: boolean
+  /** SSH 远程语法预检（独立 exec channel；本地会话不实现） */
+  readonly precheckSyntax?: (command: string) => Promise<ParseCheckResult>
 }
 
 /** 代理状态 */

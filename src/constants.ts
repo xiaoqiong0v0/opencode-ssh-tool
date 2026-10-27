@@ -40,6 +40,23 @@ export const SYNTAX_QUIET_MS = 300
 export const SYNTAX_MAX_WAIT_MS = 1_000
 
 /**
+ * 远程发送前语法预检总超时（毫秒）：远程 bash/zsh 跑 `bash -n`/`zsh -n`，pwsh 启动解析侧车。
+ * 正常 <100ms（pwsh 冷启动约 1s）；超过此时长即销毁预检 channel 并**放行**命令（fail-open），
+ * 绝不阻塞主命令/PTY。pwsh 多候选（pwsh → powershell）共享该总预算。
+ */
+export const REMOTE_PRECHECK_TIMEOUT_MS = 5_000
+
+/** 远程预检单流（stdout/stderr）收集上限（字符）：只用于判错与提取片段，避免异常输出撑爆内存 */
+export const REMOTE_PRECHECK_OUTPUT_MAX = 16 * 1024
+
+/**
+ * 远程 pwsh 预检命令体长度上限（字符）：超长命令直接放行（fail-open）。
+ * pwsh 侧车协议为“一行 base64 请求”，超长单行在部分远程链路/管道上可能被截断；
+ * 预检只是拦截增强，不值得为此承担误判风险。
+ */
+export const REMOTE_PRECHECK_COMMAND_MAX = 32 * 1024
+
+/**
  * 中断探针补发间隔默认值（秒）：用户显式 Ctrl+C 后**立即**补发首条探针，
  * 之后每隔此间隔补发一次，直到命令结束（收到当前 seq 标记）。
  * 实际间隔取配置 interruptProbeInterval（秒），非法/缺失时回退此默认值。

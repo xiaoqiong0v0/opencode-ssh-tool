@@ -478,8 +478,8 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!command) return `${tr("cli_need_command", toolLang)}\n${tr("cli_exec_usage", toolLang)}\n\n${HELP_TEXT}`
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
-    // 发送前语法预检：本地会话命中语法错误即拦下并返回结构化错误（不写终端、不进权限询问）；
-    // SSH 会话 / cmd 等不支持的 shell / 校验模块故障 → 内部一律放行，维持现有行为
+    // 发送前语法预检：本地走 parse-check，SSH 远程走独立 exec channel；命中语法错误即拦下
+    // （不写终端、不进权限询问）；不支持的 shell / 通道异常 / 超时 → 内部一律放行（fail-open）
     const rejection = await precheckBeforeExec(session, command, undefined, toolLang)
     if (rejection) {
       log.tool("term_exec_precheck_rejected", {

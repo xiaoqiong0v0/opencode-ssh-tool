@@ -1,6 +1,6 @@
 {
   "name": "@xiaoqiong0v0/opencode-ssh-tool",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "type": "module",
   "description": "长驻交互式 SSH 会话工具插件，远程命令受 opencode 权限管控",
   "files": [
@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "tsc && node web/build.mjs",
-    "test": "npm run build && node --test test/cli-args.test.mjs test/payload.test.mjs test/transfer.test.mjs test/transfer-events.test.mjs test/server-transfer.test.mjs",
+    "test": "npm run build && node --test test/cli-args.test.mjs test/payload.test.mjs test/transfer.test.mjs test/transfer-events.test.mjs test/server-transfer.test.mjs test/shell-adapter.test.mjs test/precheck.test.mjs test/session-precheck.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "repository": {

@@ -436,7 +436,7 @@ export abstract class BaseSession {
    */
   get shellName(): string | null { return this._adapter?.name ?? null }
 
-  /** 是否本地会话：发送前语法预检只接本地（SSH 远程需会话内往返，另开一轮） */
+  /** 是否本地会话：true 走本机 parse-check；false（SSH）走会话可选的 precheckSyntax（独立 exec channel） */
   get isLocal(): boolean { return false }
 
   getRunningOutput(): string {

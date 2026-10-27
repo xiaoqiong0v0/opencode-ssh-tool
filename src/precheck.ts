@@ -1,8 +1,13 @@
 // 发送前语法预检（term_exec / web run-exec 共用）：
 // 只解析、绝不执行；命中语法错误即拦下并返回文案，模块自身异常一律放行。
+// - 本地会话：走 parse-check（本机/容器的校验器：pwsh 解析侧车 / `bash -n`、`zsh -n`）。
+// - SSH 远程：走会话提供的 `precheckSyntax`（独立 exec channel：bash/zsh 跑 `-n`，
+//   pwsh 启动解析侧车；不占 PTY）；两者互不复用，远程通道异常/超时一律 fail-open。
+//   CMD 没有安全的 parse-only 通道，明确跳过（只查 shell 语法，不查 Python/Node 等程序代码）。
 // 单独成文件是为了让 index（工具入口）与 agent（web 执行入口）共用，避免 index↔agent 循环依赖。
 
 import { stripCommandTail } from "./base-session.js"
+import { REMOTE_PRECHECK_TIMEOUT_MS } from "./constants.js"
 import { validateCommand, type ParseCheckResult, type ParseIssue } from "./parse-check.js"
 import log from "./log.js"
 import { getToolLang, tr, type Lang } from "./i18n.js"
@@ -12,6 +17,9 @@ const SYNTAX_REJECT_MAX_ERRORS = 5
 
 /** 拦截消息里出错片段的展示长度上限（超长截断，保留可定位性） */
 const SYNTAX_ISSUE_TEXT_MAX = 60
+
+/** 远程预检提取出错片段的长度上限（字符）：避免把超长命令整行塞进拦截文案 */
+const REMOTE_SYNTAX_FRAGMENT_MAX = 200
 
 /**
  * 适配器名 → parse-check 的 shell 标识（shell-adapter 的 `name` 与 classifyShell 兼容）。
@@ -31,8 +39,13 @@ export type CommandValidator = (shell: string, text: string) => Promise<ParseChe
 export interface PrecheckTarget {
   /** 探测到的 shell 适配器名；未探测到为 null */
   readonly shellName: string | null
-  /** 是否本地会话（SSH 远程本步不接） */
+  /** 是否本地会话（false 为 SSH 远程，走可选 precheckSyntax） */
   readonly isLocal: boolean
+  /**
+   * SSH 远程专用语法预检（独立 exec channel，不占 PTY）：未提供则远程直接放行。
+   * 只有 SshSession 实现；本地会话不使用本方法（本地走 parse-check）。
+   */
+  readonly precheckSyntax?: (command: string) => Promise<ParseCheckResult>
 }
 
 /**
@@ -92,14 +105,31 @@ export function formatSyntaxRejection(command: string, errors: ParseIssue[], lan
 }
 
 /**
- * 发送前语法预检（只解析、绝不执行）：命中语法错误即拦下并返回文案，放行返回 null。
- * - 只对本地会话生效：SSH 远程需会话内往返且涉及 `$?` 污染，本步不接。
- * - shell 映射：pwsh/bash/zsh → 对应校验器；cmd 等 → 跳过。
- * - 校验模块异常一律放行，绝不因预检故障阻塞命令。
- * @param session 已解析的会话（需提供 shellName/isLocal）
+ * 远程预检的出错片段：优先取命令中出错行的原文，取不到再退回解析器输出首行。
+ * 结果压成单行并限制长度，避免把整条超长命令回显进拦截文案。
  * @param command 待发送的命令文本
- * @param validate 校验函数（默认 validateCommand；仅供单测注入异常实现）
+ * @param line 解析出的错误行号（1 起；0/非法时只看 fallback）
+ * @param fallback 解析器 stderr（用于取首行）
+ * @returns 单行片段（可能为空串）
+ */
+export function pickSyntaxErrorText(command: string, line: number, fallback: string): string {
+  const fromCommand = line > 0 ? (command.split(/\r?\n/)[line - 1] ?? "") : ""
+  const source = fromCommand.trim() ? fromCommand : (fallback.split(/\r?\n/)[0] ?? "")
+  const flat = source.replace(/\s+/g, " ").trim()
+  return flat.length > REMOTE_SYNTAX_FRAGMENT_MAX ? `${flat.slice(0, REMOTE_SYNTAX_FRAGMENT_MAX)}…` : flat
+}
+
+/**
+ * 发送前语法预检（只解析、绝不执行）：命中语法错误即拦下并返回文案，放行返回 null。
+ * - 本地会话：parse-check（pwsh/bash/zsh；cmd 等跳过）。
+ * - SSH 远程：仅当会话提供 `precheckSyntax` 时调用（SshSession 对 bash/zsh/pwsh 启用，
+ *   CMD 无安全 parse-only 通道故跳过），与本地 parse-check 完全分离；未提供/抛异常/超时一律 fail-open。
+ * - 校验模块异常一律放行，绝不因预检故障阻塞命令。
+ * @param session 已解析的会话（需提供 shellName/isLocal，远程另需 precheckSyntax）
+ * @param command 待发送的命令文本
+ * @param validate 本地校验函数（默认 validateCommand；仅供单测注入异常实现）
  * @param lang 文案语言（默认取当前工具语言）
+ * @param remoteTimeoutMs 远程预检等待上限（毫秒；默认 REMOTE_PRECHECK_TIMEOUT_MS，仅供单测缩短）
  * @returns null=放行；非 null=拦截文案（调用方直接返回，不写终端）
  */
 export async function precheckBeforeExec(
@@ -107,8 +137,9 @@ export async function precheckBeforeExec(
   command: string,
   validate: CommandValidator = validateCommand,
   lang: Lang = getToolLang(),
+  remoteTimeoutMs: number = REMOTE_PRECHECK_TIMEOUT_MS,
 ): Promise<string | null> {
-  if (!session.isLocal) return null
+  if (!session.isLocal) return precheckRemote(session, command, lang, remoteTimeoutMs)
   const shell = CHECK_SHELL_BY_ADAPTER[session.shellName ?? ""]
   if (!shell) return null // cmd 等不支持的 shell：跳过校验
   try {
@@ -121,4 +152,57 @@ export async function precheckBeforeExec(
     log.error("发送前语法校验异常，放行命令", e instanceof Error ? e : String(e))
     return null // 预检故障绝不阻塞命令
   }
+}
+
+/**
+ * 远程会话的发送前预检：调用会话自带的 `precheckSyntax`（独立 exec channel）。
+ * 未实现、调用异常、超时、返回结构异常一律放行（fail-open），绝不误拦或阻塞主命令。
+ * @param session 已解析的远程会话
+ * @param command 待发送的命令文本
+ * @param lang 文案语言
+ * @param timeoutMs 等待上限（毫秒）
+ * @returns null=放行；非 null=拦截文案
+ */
+async function precheckRemote(
+  session: PrecheckTarget,
+  command: string,
+  lang: Lang,
+  timeoutMs: number,
+): Promise<string | null> {
+  const precheckSyntax = session.precheckSyntax
+  if (typeof precheckSyntax !== "function") return null
+  try {
+    // 与本地一致：校验实际会发送的命令体（剥掉尾注释/尾运算符，避免把合法命令误判）
+    const target = stripCommandTail(command, session.shellName ?? "")
+    if (!target) return null
+    const result = await withTimeout(precheckSyntax.call(session, target), timeoutMs)
+    if (!result || result.ok !== false) return null
+    const errors = Array.isArray(result.errors) ? result.errors : []
+    if (errors.length === 0) return null
+    return formatSyntaxRejection(target, errors, lang)
+  } catch (e) {
+    log.error("远程发送前语法校验异常，放行命令", e instanceof Error ? e : String(e))
+    return null // 预检故障绝不阻塞命令
+  }
+}
+
+/**
+ * 给远程预检加超时：到点返回 null（调用方按 fail-open 处理）。
+ * 原 Promise 后续的 rejection 也在此处消费，避免未捕获拒绝。
+ * @param task 远程预检 Promise
+ * @param timeoutMs 等待上限（毫秒，最小 1）
+ * @returns 预检结果；超时为 null
+ */
+function withTimeout(task: Promise<ParseCheckResult>, timeoutMs: number): Promise<ParseCheckResult | null> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (value: ParseCheckResult | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(null), Math.max(1, timeoutMs))
+    task.then((value) => finish(value), () => finish(null))
+  })
 }
