@@ -68,8 +68,8 @@ export const T = {
     zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read. NEVER add -w to servers, watchers, tail -f, builds, installs, scans, REPLs or commands waiting for input: -w blocks until completion and can hang. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected).",
-    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read。禁止对 server/watch/tail -f/构建/安装/扫描/REPL/等待输入的命令加 -w：-w 会一直等到结束，可能永久阻塞。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。",
+    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read. NEVER add -w to servers, watchers, tail -f, builds, installs, scans, REPLs or commands waiting for input: -w blocks until completion and can hang. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected). Terminal sessions exist only for the current opencode session: restarting or ending opencode closes them; after restart, reconnect with connect/local. This is expected, not a crash.",
+    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read。禁止对 server/watch/tail -f/构建/安装/扫描/REPL/等待输入的命令加 -w：-w 会一直等到结束，可能永久阻塞。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。终端会话只属于当前 opencode 会话：重启或退出 opencode 后旧终端会消失，需要重新 connect/local；这是正常生命周期，不是崩溃。",
   },
   term_cli_args: {
     en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\"' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
@@ -78,6 +78,7 @@ export const T = {
   term_cli_help: {
     en: `term_cli unified CLI tool: manage SSH / local (wsl, pwsh, bash) / container (docker exec) terminal sessions.
 Use 'local' for any terminal started on this machine (WSL, Docker containers, local shells).
+Terminal sessions belong to the current opencode session; restarting or ending opencode closes them. Reconnect with connect/local; this is expected, not a crash.
 
 Usage: term_cli <subcommand> [args]
 
@@ -131,6 +132,7 @@ Examples:
 `,
     zh: `term_cli 统一命令行工具：管理 SSH / 本地（wsl、pwsh、bash）/ 容器（docker exec）终端会话。
 本机可启动的终端（WSL、Docker 容器、本地 shell）一律用 'local' 子命令。
+终端会话绑定当前 opencode 会话；重启或退出 opencode 后旧终端会关闭，需重新 connect/local；这是正常生命周期，不是崩溃。
 
 用法: term_cli <子命令> [参数]
 
@@ -346,8 +348,8 @@ Examples:
     zh: "危险命令，已拒绝执行。",
   },
   not_connected: {
-    en: "No active terminal. Use term_cli connect (SSH) or term_cli local first.",
-    zh: "无活动终端。请先用 term_cli connect（SSH）或 term_cli local 建立。",
+    en: "No active terminal. Terminal sessions are tied to the current opencode session; after an opencode restart, reconnect with term_cli connect (SSH) or term_cli local.",
+    zh: "无活动终端。终端会话绑定当前 opencode 会话；重启 opencode 后请重新用 term_cli connect（SSH）或 term_cli local 建立。",
   },
   rejected_connect: {
     en: "Connection rejected.",
@@ -358,8 +360,8 @@ Examples:
     zh: "终端名非法。仅允许字母、数字、下划线、中划线、点（最多 64 字符），不得含路径分隔符。",
   },
   no_sessions: {
-    en: "No active terminals.",
-    zh: "当前没有活动的终端会话。",
+    en: "No active terminals. Terminal sessions are tied to the current opencode session; after an opencode restart, reconnect with connect/local.",
+    zh: "当前没有活动的终端会话。终端会话绑定当前 opencode 会话；重启 opencode 后请重新 connect/local。",
   },
   connect_ok: {
     en: "Connected: {user}@{host}:{port} (session {sid}, terminal {name})",

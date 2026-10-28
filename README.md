@@ -4,7 +4,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 
 ## 特性
 
-- **长驻会话**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
+- **长驻会话（绑定当前 opencode 会话）**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存；重启或退出 opencode 后旧终端会关闭，需重新 `connect`/`local`，属于正常生命周期，不是崩溃
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
 - **命令完成判定**：支持长命令前台运行；不设超时强杀，Ctrl-C 可中断并收尾；语法错误安静收尾；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截；断连有兜底
@@ -13,7 +13,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **直接输入（焦点驱动）**：浏览器内直接向交互式程序输入。默认「命令框优先」——按键留在浏览器，回车走 `exec` 提交命令；点终端区域（transcript `#term` / raw `#xt`）或入口按钮 `#cmdKey` 切换为直接输入，按键按**真实控制字节**经 `send` keystroke 通道发往终端（**不产生 `exec`、不写命令记录**）；焦点回到命令框等可编辑控件即自动关闭；状态**不持久化**，每次打开都从命令框优先开始；离线/断线时入口不可点击、按键一律不发送
 - **SSH 保活 + WS 心跳**：SSH 层按 `ServerAliveInterval` 语义定期发 `keepalive@openssh.com`（连接层**带外**消息，不写 channel/PTY），连续 3 次无响应判连接死亡并断连；WS 层 server 每 25s 下发 `ping`、10s 无 `pong` 判半开并断开，客户端静默超 2×间隔即主动断开重连——**保活与心跳都不写入 PTY，不污染终端输出与完成标记**
-- **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），重启不丢、会话关闭清理
+- **历史消息对**：命令+输出 全部存文件（`~/.opencode/plugins-cache/opencode-ssh-tool/<会话>/`），按对数保留（默认 100 对），opencode 重启不丢、会话关闭清理；终端连接本身不跨 opencode 重启，需重新建立
 - **HTTP 终端查看**：默认开启本地服务，浏览器打开可查看终端记录（WebSocket 实时推送，无轮询）
 - **多语言**：`toolLang`（工具描述/CLI/session 文案）与 `webLang`（页面 UI）独立配置，默认英文；环境变量 `SSH_TOOL_LANG` / `SSH_WEB_LANG` 分别覆盖
 
@@ -49,7 +49,7 @@ term_cli help                                                     # 完整用法
 
 > 复杂引号 / 目标 shell 转义 / 以 `-` 开头的载荷：`--base64` 会忽略空白后解码为 UTF-8 文本，`--file <path>` 读取**插件进程本机**的 UTF-8 文件（不是远程文件），二者互斥；两者都严格按 UTF-8 解码（剥掉开头的 BOM，非法 UTF-8 / 含 NUL 的 UTF-16 或二进制文件直接报错，不会静默发送）。**`send` 原样**交给终端（不再解释 `\n` / `\xHH` 等转义）；**`exec` 仍按 shell 命令执行**。选项终止用 `--`：`term_cli exec -- "-x"`、`term_cli send -- "-n"`。复杂引号场景优先 base64/file，不要在外层引号里猜转义。
 
-> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
+> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。终端只属于当前 opencode 会话：重启/退出 opencode 后旧终端会关闭，需要重新 connect/local。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
 > **read 语义（v0.7.3）**：未显式传 `-s` 时，命令仍在运行（`busy=true`）返回当前 buffer 快照（可能只有部分输出），并加 `[read source=buffer busy=true]` 警告；空闲（`busy=false`）读 history。**显式 `-s buffer` 读实时 buffer；`-s history` 只含已完成命令**。`read` 不等待命令完成：要等结果先 `term_cli status` 确认 `busy=false`，再 `read` 取最终结果。内部实现细节见 `docs/design/read读取语义说明.md`。
 
