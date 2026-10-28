@@ -90,11 +90,11 @@ Subcommands:
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; NEVER use -w for long-running / stdin-reading / interactive / server / watch / tail -f / build / install / scan / REPL commands, because -w keeps waiting as long as the command runs and can hang indefinitely; use the default and poll with status/read)
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
-      read terminal output: buffer (current snapshot, consumed) / history (default tail last N)
+      read terminal output: with no -s, a running command returns a current buffer snapshot (may be partial) and an idle terminal returns history; -s buffer reads the live buffer; -s history reads completed history. read never waits for completion: use status to wait, then read the final result
   send "<text>" [--base64 | --file <path>] [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
-      upload a regular file from this machine (plugin host) to the SSH session over SFTP
+      upload a regular file from this machine to the SSH session over SFTP
       local supports ~; remote supports absolute or home-relative paths and ~/ (expanded by SFTP, no shell; ~user unsupported); Windows drive paths must use forward slashes (C:/dir/file)
       fails if the target exists unless --overwrite; parents are not created unless --mkdir
       SSH sessions only; directories and symlinks are rejected; max 256 MiB
@@ -108,8 +108,8 @@ Subcommands:
       show this help
 
 Payload input (exec / send):
-  --base64           decode base64 (whitespace ignored) to strict UTF-8 text; send sends it raw (no \\n / \\xHH decoding), exec still runs the command pipeline and normalizes CRLF
-  --file <path>      read a LOCAL UTF-8 file on the plugin host (not remote); send sends it raw, exec still runs the command pipeline; strips BOM, rejects NUL; ~ is expanded
+  --base64           decode base64 (whitespace ignored) to strict UTF-8 text; send sends it raw (no \\n / \\xHH decoding), exec executes it as a command
+  --file <path>      read a LOCAL UTF-8 file on this machine (not remote); send sends it raw, exec executes it as a command; strips BOM, rejects NUL; ~ is expanded
   --                 end option parsing: exec -- "-x" / send -- "-n" (payload starting with "-")
   For complex quotes or shell-specific escaping, prefer --base64 / --file over guessing outer quotes.
 
@@ -143,11 +143,11 @@ Examples:
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；**禁止**对长时间运行 / 需要 stdin / 交互 / server / watch / tail -f / 构建 / 安装 / 扫描 / REPL 命令加 -w：只要命令没结束 -w 就会一直等，可能永久阻塞；这些命令请用默认模式，再用 status/read 轮询）
   read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
-      读终端输出：buffer 实时快照（读取后清空）/ history 历史快照（默认 tail 后 N 条）
+      读终端输出：不传 -s 时，命令运行中返回当前 buffer 快照（可能不完整），空闲时返回 history；-s buffer 读实时 buffer；-s history 读已完成历史。read 不等待命令完成：先用 status 等完成，再读最终结果
   send "<text>" [--base64 | --file <path>] [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
-      通过 SFTP 把本机（插件进程）普通文件上传到 SSH 会话
+      通过 SFTP 把本机普通文件上传到 SSH 会话
       local 支持 ~；remote 支持绝对路径、相对 home 路径与 ~/（由 SFTP 展开，不经过 shell；不支持 ~user）；Windows 盘符路径必须用正斜杠（C:/dir/file）
       目标已存在默认失败，需加 --overwrite；默认不建父目录，需加 --mkdir
       仅支持 SSH 会话；目录与符号链接会被拒绝；单文件上限 256 MiB
@@ -161,8 +161,8 @@ Examples:
       显示本帮助
 
 载荷输入（exec / send）:
-  --base64           解码 base64（忽略空白）为严格 UTF-8 文本；send 原样发送（不再解释 \\n / \\xHH 等转义），exec 仍走命令管线（CRLF 归一）
-  --file <path>      读取插件进程本机的 UTF-8 文件（不是远程文件）；send 原样发送，exec 仍走命令管线；剥 BOM、拒绝 NUL；支持 ~ 展开
+  --base64           解码 base64（忽略空白）为严格 UTF-8 文本；send 原样发送（不再解释 \\n / \\xHH 等转义），exec 作为命令执行
+  --file <path>      读取本机的 UTF-8 文件（不是远程文件）；send 原样发送，exec 作为命令执行；剥 BOM、拒绝 NUL；支持 ~ 展开
   --                 终止选项解析：exec -- "-x" / send -- "-n"（载荷以 "-" 开头时）
   复杂引号或目标 shell 专属转义，优先用 --base64 / --file，不要在外层引号里猜转义。
 
@@ -296,8 +296,8 @@ Examples:
     zh: "该 SSH 会话的 SFTP 不可用。请用 term_cli connect 重新连接后重试。",
   },
   transfer_err_timeout: {
-    en: "Transfer timed out ({seconds}s). The SFTP channel was aborted; no new rename/commit is started, but an already-issued rename may still run. A partially written file may remain at the target path or in a .part/.bak temp file.",
-    zh: "传输超时（{seconds}s）。已中止 SFTP 通道，不再主动发起新的 rename/commit，但已发出的 rename 仍可能被执行；目标路径或 `.part`/`.bak` 临时文件可能残留半截内容。",
+    en: "Transfer timed out ({seconds}s). The transfer was aborted; the target file or a temporary file may be partially written.",
+    zh: "传输超时（{seconds}s）。传输已中止；目标文件或临时文件可能残留部分内容。",
   },
   transfer_err_io: {
     en: "Transfer failed: {reason}",
@@ -331,7 +331,7 @@ Examples:
   st_type: { en: "type", zh: "类型" },
   st_connected: { en: "connected", zh: "已连接" },
   st_busy: { en: "busy", zh: "忙碌" },
-  st_pending: { en: "pending", zh: "待消费" },
+  st_pending: { en: "pending", zh: "待读" },
   st_bytes: { en: "bytes", zh: "字节" },
   st_host: { en: "host", zh: "主机" },
   st_program: { en: "program", zh: "程序" },
@@ -409,6 +409,14 @@ Examples:
     en: "Terminal history (first {n} / total {total})",
     zh: "终端历史（前 {n} 条 / 共 {total} 条）",
   },
+  read_busy_buffer_notice: {
+    en: "[read source=buffer busy=true]\nWarning: this is a partial buffer snapshot, not the final result; run status and wait for completion before reading the final result.",
+    zh: "[read source=buffer busy=true]\n警告：这是 buffer 部分快照，不是最终结果；请先用 status 等待命令完成后再读取最终结果。",
+  },
+  read_busy_history_notice: {
+    en: "[read source=history busy=true]\nWarning: history only contains completed commands; it does not include the current result.",
+    zh: "[read source=history busy=true]\n警告：history 只含已完成命令，不含当前结果。",
+  },
   web_title: { en: "Terminal Records", zh: "终端记录" },
   web_close: { en: "Close", zh: "关闭" },
   web_loading: { en: "Loading...", zh: "加载中..." },
@@ -432,8 +440,8 @@ Examples:
     zh: "未删除：该终端仍在活动（状态文件尚未陈旧），可能属于其他正在运行的 opencode 实例。",
   },
   web_delete_refused_active: {
-    en: "Not deleted: terminal is claimed by an agent (its instance is still online).",
-    zh: "未删除：该终端仍被 agent 认领（所属实例仍在线）。",
+    en: "Not deleted: this terminal is still in use by another online instance.",
+    zh: "未删除：该终端仍被其他在线实例占用。",
   },
   web_delete_blocked: {
     en: "Cannot delete this terminal (still active or owned by another instance).",

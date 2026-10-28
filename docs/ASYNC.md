@@ -1,7 +1,7 @@
 # 异步 / 并发交互点清单
 
 > 本文件登记本插件里**跨异步边界共享的状态与顺序契约**。新增或修改异步/并发逻辑时同批更新本文件。
-> 当前范围：SFTP 文件传输（v1）与发送前远程语法预检。终端命令执行/完成标记的并发细节见 `docs/design/结构设计.md` §5。
+> 当前范围：SFTP 文件传输（v1）、发送前远程语法预检与 read 只读快照（v0.7.3）。终端命令执行/完成标记的并发细节见 `docs/design/结构设计.md` §5。
 
 ## 1. 总览
 
@@ -26,6 +26,7 @@
 | 预检 channel 生命周期与超时 | 每次预检一个 `ClientChannel`、`timer`、`settled` 标志 | `settle()` 单次结算并清定时器；超时 `destroy()` 通道；`exit` 只记录退出码，`close` 结算；stdout/stderr 各截尾 16KB | 一次预检 = 一个独立 exec channel；bash/zsh 单通道；任何错误/超时/无退出码/非语法失败 → `{ok:true}`（fail-open），绝不让主命令等待 | `src/session.ts`（`_execSyntaxCheck` / `_runPwshCandidate`） |
 | pwsh 预检候选回落 vs 总超时 | 候选列表、共享 deadline | 只有「候选不可用」（127/9009/命令不存在文案）才换下一个；`ERROR=1`、通道错误、无协议响应非语法失败立即放行；每个候选独立 channel，结算时清 timer / `destroy()` | 候选串行、不重试同一候选；`pwsh → powershell → powershell.exe` 共享 `REMOTE_PRECHECK_TIMEOUT_MS` 总预算；绝不触碰 PTY/busy/history/`_connected` | `src/session.ts`（`_execPwshSyntaxCheck` / `_runPwshCandidates` / `_runPwshCandidate`） |
 | 预检失败 vs 命令拦截 | `ParseCheckResult` | 本地 parse-check 与远程 exec channel 两分支互不复用；远程未实现/异常/超时/结构异常一律 `null` | 只有 `{ok:false}` 且 `errors` 非空才拦截；预检故障不改变权限判定与执行队列 | `src/precheck.ts` |
+| read 只读快照 vs 命令运行/完成收尾 | `_buffer` / `_cursor` / `_streamPos` / `_runningStartPos` / history | `peekBuffer()` 在 `await toModelText` 前**同步**切出字符串快照；只读，不写任何会话状态，也不调用 `_completeRunning` | 等待渲染期间新到达的输出不进入本次结果；命令运行/收尾可并发改变缓冲，但读取路径绝不回写，故不会消费输出、写 history 或翻转 busy | `src/base-session.ts`（`peekBuffer`）/ `src/index.ts`（`doRead`） |
 
 ## 2. 不变量
 
@@ -38,6 +39,7 @@
 7. **进度回调是旁路**：`onProgress` 只读地接收 `(bytes,total)`，不得改变传输结果；回调抛错被吞掉。空文件也应收到一次 `(0,0)`。
 8. **任务事件只含元数据**：`TransferTask` 不含文件内容；index 只在上报前组装白名单字段，server 用 `parseTransferTask` 再校验一次；任务不写盘，server 重启即丢；无 agent 时 index 静默不上报。
 9. **字节数校验先于 done**：`pipeWithLimit` 在结算前校验 `totalSize > 0 && bytes !== totalSize`；不一致必须报 `io` 并清理，短读/短写不得被当作成功。
+10. **read 默认路径只读**：未显式 `-s` 且 `busy=true` 时只调用 `peekBuffer()`；任何读取路径都不得消费 `_buffer`、写 history、翻转 busy 或发 done。只有显式 `-s buffer` 保留旧的 `readBuffer()` 消费语义。
 
 ## 3. 验证方式（可核验）
 
@@ -48,3 +50,4 @@
 - 日志检查：`log.tool("file_upload" | "file_download", …)` 字段只允许路径/实际字节/耗时/ok/code，不包含文件内容。
 - 单测 `test/precheck.test.mjs`：远程 `precheckSyntax` 返回 ok → `null`；返回 errors → 拦截文案（含 pwsh 的真实 ErrorId）；抛异常/超时/未实现/结构异常 → `null`；本地仍走 parse-check 且不调用远程方法；`parsePwshSidecarResponse` / `PS_SIDECAR_ENCODED_COMMAND` / `encodePwshSidecarPayload` 协议稳定性。
 - 单测 `test/session-precheck.test.mjs`：fake SSH client 验证 `pty:false` + 命令经 stdin 写入；exit 0 / exit 2 语法错误（bash/zsh，含中文 `行 N`）/ 非语法 127 / 通道打开失败 / 通道 error / 非 bash-zsh-pwsh / 未连接 → 放行；pwsh 侧车 `ERRCOUNT=0`/`ERRCOUNT=1`/`ERROR=1`/`pwsh` 不存在回落 `powershell`/候选全不可用/无响应/命令超长/通道打开失败/单候选超时销毁通道。
+- 单测 `test/peek-buffer.test.mjs`：`peekBuffer` 多次读取后 `_buffer`/`_cursor`/`_streamPos`/`_runningStartPos`/busy/history 对数全部不变；运行中只返回 `_runningStartPos` 之后；未连接返回错误且不改状态；显式 `readBuffer` 空闲/命中完成标记仍按旧语义消费（清缓冲、写 history、busy=false）；`readBusyNotice` 仅在 busy=true 输出中英文前缀与警告。

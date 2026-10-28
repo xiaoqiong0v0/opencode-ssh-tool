@@ -7,8 +7,8 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 - **长驻会话**：`term_cli connect` 建立连接后，`term_cli exec` 在同一会话执行命令，保留 cwd/环境/后台进程/sudo 缓存
 - **PTY 交互**：分配伪终端，可处理 sudo 密码、vi、top 等交互程序
 - **权限管控**：只读白名单直接放行、危险命令黑名单硬拒、其余走 `context.ask()` 用户审批
-- **命令完成判定**：真实完成只认 `<SSH_DONE:<nonce>:<seq>:<退出码>>`；Ctrl-C 用独立 `<SSH_PROBE:...>` 探针标记收尾（写完 `\x03` 立即补发首条，之后按 `interruptProbeInterval` 周期补发）。**不设超时强杀**，也不把「静默窗口 / 动画」当完成判据——动画窗口只把长命令转后台继续监听；语法错误安静收尾、不再补发探针；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截；**断连兜底**
-- **发送前语法预检**：本地/容器命令发送前做语法预检，命中错误直接拦下、不写入终端；SSH 远程按探测到的 shell 另开**独立 exec channel**：`bash`/`zsh` 跑 `bash -n` / `zsh -n`，`pwsh` 启动同一份 PowerShell 解析侧车（`-EncodedCommand`，只解析不执行）；CMD 没有安全的 parse-only 通道，明确跳过。不占 PTY、不写 history、不翻转 busy；通道异常/超时一律放行（fail-open）。**只查 shell 语法，不查 Python/Node 等程序代码**
+- **命令完成判定**：支持长命令前台运行；不设超时强杀，Ctrl-C 可中断并收尾；语法错误安静收尾；未闭合引号/反引号等会触发 shell 续行的命令提交前拦截；断连有兜底
+- **发送前语法预检**：本地/远程 `bash`/`zsh`/`pwsh` 在发送前检查 shell 语法，命中即拦、不写入终端；`cmd` 跳过。**只查 shell 语法，不查 Python/Node 等程序代码**
 - **SFTP 文件传输（v1）**：`term_cli upload` / `download` 通过 SSH/SFTP 传普通文件（不使用 exec/scp/base64/PTY）。默认用**独占创建**（远端 `wx` / 本地 `wx`）保证目标存在即失败，`--overwrite` 才走临时文件 + rename 覆盖，`--mkdir` 才建父目录；仅 SSH 会话（本地/容器明确拒绝）；单文件上限 256 MiB；目录与符号链接拒绝；文件内容不进模型上下文、终端历史与日志
 - **双视图**：transcript（命令+输出消息对）与 raw（xterm.js 实时画面，支持 vi/top 等全屏程序）；终端尺寸前后端一致固定 `120×40`
 - **直接输入（焦点驱动）**：浏览器内直接向交互式程序输入。默认「命令框优先」——按键留在浏览器，回车走 `exec` 提交命令；点终端区域（transcript `#term` / raw `#xt`）或入口按钮 `#cmdKey` 切换为直接输入，按键按**真实控制字节**经 `send` keystroke 通道发往终端（**不产生 `exec`、不写命令记录**）；焦点回到命令框等可编辑控件即自动关闭；状态**不持久化**，每次打开都从命令框优先开始；离线/断线时入口不可点击、按键一律不发送
@@ -38,7 +38,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
 term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 只用于已知很快结束的命令；禁止对 server/watch/tail -f/构建/安装/扫描/交互命令用 -w）
-term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出
+term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出（未传 -s：运行中返回当前快照、空闲读历史；read 不等待完成）
 term_cli send "<text>" [--base64 | --file <path>] [-n name]         # 发送按键（sudo 密码等）
 term_cli upload <local> <remote> [-n name] [--overwrite] [--mkdir]  # SFTP 上传（仅 SSH）
 term_cli download <remote> <local> [-n name] [--overwrite] [--mkdir] # SFTP 下载（仅 SSH）
@@ -47,9 +47,11 @@ term_cli disconnect [-n name]                                     # 断开
 term_cli help                                                     # 完整用法
 ```
 
-> 复杂引号 / 目标 shell 转义 / 以 `-` 开头的载荷：`--base64` 会忽略空白后解码为 UTF-8 文本，`--file <path>` 读取**插件进程本机**的 UTF-8 文件（不是远程文件），二者互斥；两者都严格按 UTF-8 解码（剥掉开头的 BOM，非法 UTF-8 / 含 NUL 的 UTF-16 或二进制文件直接报错，不会静默发送）。**`send` 原样**交给终端（不再解释 `\n` / `\xHH` 等转义）；**`exec` 仍走命令管线**（strip / groupWrap / marker / 换行归一，CRLF 折成 LF，避免多出空行或双提交）。选项终止用 `--`：`term_cli exec -- "-x"`、`term_cli send -- "-n"`。复杂引号场景优先 base64/file，不要在外层引号里猜转义。
+> 复杂引号 / 目标 shell 转义 / 以 `-` 开头的载荷：`--base64` 会忽略空白后解码为 UTF-8 文本，`--file <path>` 读取**插件进程本机**的 UTF-8 文件（不是远程文件），二者互斥；两者都严格按 UTF-8 解码（剥掉开头的 BOM，非法 UTF-8 / 含 NUL 的 UTF-16 或二进制文件直接报错，不会静默发送）。**`send` 原样**交给终端（不再解释 `\n` / `\xHH` 等转义）；**`exec` 仍按 shell 命令执行**。选项终止用 `--`：`term_cli exec -- "-x"`、`term_cli send -- "-n"`。复杂引号场景优先 base64/file，不要在外层引号里猜转义。
 
 > 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
+
+> **read 语义（v0.7.3）**：未显式传 `-s` 时，命令仍在运行（`busy=true`）返回当前 buffer 快照（可能只有部分输出），并加 `[read source=buffer busy=true]` 警告；空闲（`busy=false`）读 history。**显式 `-s buffer` 读实时 buffer；`-s history` 只含已完成命令**。`read` 不等待命令完成：要等结果先 `term_cli status` 确认 `busy=false`，再 `read` 取最终结果。内部实现细节见 `docs/design/read读取语义说明.md`。
 
 ## 文件传输（v1）
 
@@ -69,7 +71,7 @@ term_cli download <remote> <local> [-n name] [--overwrite] [--mkdir]
 - 同一终端会话的传输串行执行（避免同目标竞争）；与 PTY 命令互不影响；并发契约见 `docs/ASYNC.md`
 - 权限：`file_upload` / `file_download` 在传输前走 `context.ask()`（参数含本地与远端路径、`overwrite`/`mkdir`；`always` 键也区分这两个选项，避免“总是允许”普通上传后同路径 `--overwrite` 不再询问）；拒绝即不传
 - 日志只记方向/路径/实际字节/耗时/ok/错误码；**文件内容不进**日志、终端历史、模型上下文
-- **传输任务事件（v0.7.0，协议 proto 21）**：审批通过后 agent 上报 `{type:"transfer", task}`，server 广播给 Web `{type:"transfer", task}`，并用 `{type:"transfers", tasks}` 响应 `list` / `subscribe` 快照（无任务也发空数组）。任务只含 `id/sessionID/name/direction/localPath/remotePath/state/bytes/total/startedAt/endedAt/errorCode`，**不含文件内容**；进度约 250ms 节流；`done`/`failed` 保留 10 分钟，`running` 10 分钟无更新清理。过期清理时 server 广播 `{type:"transfer-remove", id}` 让 Web 删除本地行；agent 断开时，该 agent 认领终端上仍为 `running` 的任务由 server 标记为 `failed`（`errorCode:"agent_disconnected"`）并广播，避免永久停留在 running；其他 agent/终端任务不受影响。无 agent 时静默。Web 传输面板已接入（见下文）。
+- **传输任务**：Web 可查看上传/下载任务的进度、状态与耗时；完成/失败保留 10 分钟；只展示元数据，不含文件内容。
 
 ## 配置
 
@@ -155,7 +157,7 @@ term_cli exec(command)
 
 页面按会话/终端切换，transcript 展示「命令 + 输出」历史对，raw 展示 xterm.js 实时画面。底部命令框提交命令；交互式程序（sudo 密码、REPL 等）需要逐键输入时，点终端区域或入口按钮切到**直接输入**（见「特性」），按键实时发往终端。
 
-**传输任务浮窗**（header 的“传输任务”按钮开关，默认关闭（开关状态本地记忆）；固定右下角、最大高度约 50vh，列表内滚动，不参与终端/命令框布局，底部留出命令框空间）：展示**当前选中终端**（会话 + 终端名）的传输任务，每行含方向（上传/下载）、终端名、本地↔远端路径、状态（running/done/failed）、已传/总字节、耗时（失败时附错误码）。进度条按 `bytes/total` 显示，`total=0` 的 running 为不确定态。浮窗可关闭，关闭后 header 按钮仍保留任务计数，点击可重新打开；切换终端时列表随之切换（只看该终端任务），切换会话按新会话/终端快照刷新，任务更新时照常刷新。面板只读元数据，不显示文件内容；任务由 agent 经同一 WS 通道上报（`transfer` 广播、`transfers` 快照、`transfer-remove` 删除，proto 22），done/failed 保留 10 分钟、running 10 分钟无更新清理。
+**传输任务浮窗**（header 的“传输任务”按钮开关，默认关闭（开关状态本地记忆）；固定右下角、最大高度约 50vh，列表内滚动，不参与终端/命令框布局，底部留出命令框空间）：展示**当前选中终端**（会话 + 终端名）的传输任务，每行含方向（上传/下载）、终端名、本地↔远端路径、状态（running/done/failed）、已传/总字节、耗时（失败时附错误码）。进度条按 `bytes/total` 显示，`total=0` 的 running 为不确定态。浮窗可关闭，关闭后 header 按钮仍保留任务计数，点击可重新打开；切换终端时列表随之切换（只看该终端任务），切换会话按新会话/终端快照刷新，任务更新时照常刷新。面板只读元数据，不显示文件内容；任务由工具上报；done/failed 保留 10 分钟、running 10 分钟无更新清理。
 
 ## 架构
 
@@ -163,7 +165,7 @@ term_cli exec(command)
 opencode（插件进程）
   ├─ agent：每会话多个命名终端，PTY 固定 120×40
   │    ├─ SSH（ssh2 PTY shell）/ 本地·容器（Bun.Terminal）
-  │    └─ 完成标记法执行命令（`command ;markerCmd` → `<SSH_DONE:<nonce>:<seq>:<退出码>>`）
+  │    └─ 执行命令（支持长命令、中断与完成检测）
   ├─ server：独立 HTTP 子进程（WS 统一事件流，proto 版本校验）
   └─ web：transcript（消息对）/ raw（xterm.js）双视图，浏览器实时查看
 ```
@@ -203,7 +205,7 @@ npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 - [ ] SSH 远程 `pwsh`：`term_cli exec("if then")` 发送前被拦截（未写入终端）；合法命令正常执行；远程未安装 `pwsh` 时回落 `powershell` 或放行（不误拦）
 - [ ] SSH 远程 `cmd`：预检明确跳过，命令照常执行
 - [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
-- [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）
+- [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）；运行中默认 read 返回当前快照（重复读取不消失），显式 `-s buffer` 读实时 buffer
 - [ ] `term_cli upload ./a.txt ~/a.txt` 成功；重复执行（无 `--overwrite`）报目标已存在；加 `--overwrite` 覆盖；父目录不存在时加 `--mkdir` 成功
 - [ ] `term_cli download ~/a.txt ./a.txt` 成功且字节一致；目录/符号链接被拒绝；`term_cli local ...` 会话上传/下载返回“仅支持 SSH 会话”
 - [ ] `term_cli status` / HTTP 页面浏览器可访问

@@ -24,6 +24,7 @@ import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates, writeSessionMeta } from "./session-store.js"
 import { precheckBeforeExec } from "./precheck.js"
+import { readBusyNotice, type ReadSource } from "./read-output.js"
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -522,16 +523,29 @@ export const OpenCodeSshTool: Plugin = async () => {
     return result.ok ? result.output : result.error ?? tr("exec_failed", toolLang)
   }
 
-  /** read：读取终端输出 */
+  /** read：读取终端输出（未显式 -s 时，运行中读只读快照、空闲读 history） */
   async function doRead(args: string[], ctx: CliCtx): Promise<string> {
     const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" }, source: { type: "string", short: "s" }, limit: { type: "string", short: "l" }, head: { type: "boolean" }, includeCommand: { type: "boolean" } }, allowPositionals: true })
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
-    const source = values.source ?? "history"
+    // 显式 -s 非 buffer 的值仍按旧的 history 分支处理（不因 busy 改走快照）
+    const explicitSource: ReadSource | undefined = values.source === undefined ? undefined : values.source === "buffer" ? "buffer" : "history"
+    const busy = session.getStatus().busy === true
+    // 未显式指定来源：运行中给 buffer 只读快照（不消费、不代表最终结果），空闲保持旧的 history 默认
+    const source: ReadSource = explicitSource ?? (busy ? "buffer" : "history")
     if (source === "buffer") {
-      const r = await session.readBuffer()
-      return r.output
+      if (explicitSource === "buffer") {
+        // 显式 -s buffer 保持旧语义：readBuffer 会消费缓冲，命中完成标记时完成命令（写 history/done/busy）
+        const r = await session.readBuffer()
+        // 完成标记已收尾时不再提示"部分快照"；仍在运行才提示（读取前后都可能变化，按调用后状态为准）
+        return readBusyNotice("buffer", session.getStatus().busy === true, toolLang) + r.output
+      }
+      // 未显式指定：只读快照，绝不消费；绝不调用 _completeRunning
+      const r = await session.peekBuffer()
+      if (!r.ok) return r.error ?? ""
+      return readBusyNotice("buffer", busy, toolLang) + r.output
     }
+    const notice = readBusyNotice("history", busy, toolLang)
     const history = session.getHistory()
     const all = history.getPairs()
     const limit = Math.max(1, parseInt(values.limit ?? "10", 10) || 10)
@@ -544,7 +558,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     const text = parts.join("\n")
     const url = await resolveHttpUrl()
     const browserLine = url ? tr("browser_full_record", toolLang).replace("{url}", url) : tr(httpUnavailableKey(), toolLang)
-    return `${tr(direction === "tail" ? "history_title" : "history_title_head", toolLang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
+    return `${notice}${tr(direction === "tail" ? "history_title" : "history_title_head", toolLang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
   }
 
   /** send：发送文本/按键到终端 */

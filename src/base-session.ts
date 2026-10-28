@@ -368,7 +368,25 @@ export abstract class BaseSession {
   }
 
   /**
-   * 读取并清空未消费缓冲（交互/轮询场景）
+   * 只读查看当前缓冲快照（绝不消费）：命令运行中只取 `_runningStartPos` 之后的片段，空闲取整段缓冲。
+   *
+   * 与 `readBuffer()` 的区别：不改 `_buffer` / `_cursor` / `_streamPos` / running 上下文，
+   * 不调用 `_completeRunning`（不写 history、不发 done、不翻转 busy），因此可在命令运行期间安全轮询。
+   * 展示处理与 `readBuffer()` 一致（探针回显剔除 + 终端文本还原 + 截断）。
+   * 注意：快照在 `await toModelText` 之前取定，等待期间新到达的输出不会进入本次结果。
+   * @returns ok=false 仅表示未连接；output 为只读快照文本
+   */
+  async peekBuffer(): Promise<{ ok: boolean; output: string; error?: string }> {
+    if (!this._connected) return { ok: false, output: "", error: tr("err_not_connected", this._lang) }
+    const start = this._runningStartPos
+    const snapshot = start !== null && this._runningCommand ? this._buffer.slice(start) : this._buffer
+    return { ok: true, output: this._truncate(await toModelText(this._stripProbeEchoes(snapshot))) }
+  }
+
+  /**
+   * 读取并消费未消费缓冲（交互/轮询场景，旧语义）：
+   * 运行中命令命中完成标记时先统一收尾（写 history / done / busy=false）再切片重置缓冲；
+   * 空闲时返回整段缓冲并清空。需要"只看不消费"请用 `peekBuffer()`。
    * @returns 未消费输出
    */
   async readBuffer(): Promise<{ ok: boolean; output: string; error?: string }> {
