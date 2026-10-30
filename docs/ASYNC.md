@@ -1,7 +1,7 @@
 # 异步 / 并发交互点清单
 
 > 本文件登记本插件里**跨异步边界共享的状态与顺序契约**。新增或修改异步/并发逻辑时同批更新本文件。
-> 当前范围：SFTP 文件传输（v1）、发送前远程语法预检与 read 只读快照（v0.7.3）。终端命令执行/完成标记的并发细节见 `docs/design/结构设计.md` §5。
+> 当前范围：SFTP 文件传输（v1）、发送前远程语法预检、read 只读快照（v0.7.3）、同名终端路由与 Web raw 重连基线（v0.7.4）。终端命令执行/完成标记的并发细节见 `docs/design/结构设计.md` §5。
 
 ## 1. 总览
 
@@ -26,6 +26,8 @@
 | 预检 channel 生命周期与超时 | 每次预检一个 `ClientChannel`、`timer`、`settled` 标志 | `settle()` 单次结算并清定时器；超时 `destroy()` 通道；`exit` 只记录退出码，`close` 结算；stdout/stderr 各截尾 16KB | 一次预检 = 一个独立 exec channel；bash/zsh 单通道；任何错误/超时/无退出码/非语法失败 → `{ok:true}`（fail-open），绝不让主命令等待 | `src/session.ts`（`_execSyntaxCheck` / `_runPwshCandidate`） |
 | pwsh 预检候选回落 vs 总超时 | 候选列表、共享 deadline | 只有「候选不可用」（127/9009/命令不存在文案）才换下一个；`ERROR=1`、通道错误、无协议响应非语法失败立即放行；每个候选独立 channel，结算时清 timer / `destroy()` | 候选串行、不重试同一候选；`pwsh → powershell → powershell.exe` 共享 `REMOTE_PRECHECK_TIMEOUT_MS` 总预算；绝不触碰 PTY/busy/history/`_connected` | `src/session.ts`（`_execPwshSyntaxCheck` / `_runPwshCandidates` / `_runPwshCandidate`） |
 | 预检失败 vs 命令拦截 | `ParseCheckResult` | 本地 parse-check 与远程 exec channel 两分支互不复用；远程未实现/异常/超时/结构异常一律 `null` | 只有 `{ok:false}` 且 `errors` 非空才拦截；预检故障不改变权限判定与执行队列 | `src/precheck.ts` |
+| 同名终端 vs SSH/local 路由 | `sshSessions` / `localSessions` | 同名单一 owner；`connect`/`local` 先清对端同名并做 await 后二次校验；JS 单线程 check→set 无 await | 一个 `sessionID:name` 只能有一个终端；新连接失败不恢复旧终端；并发抢名后完成方发现对端则关闭自己返回 `connect_conflict` | `src/index.ts`（`closeConflictingTransport` / `doConnect` / `doLocal`） |
+| raw 重连 vs history fallback | `rawBuf` / `generation` / `cmdCount` | server 单事件循环；新代次或 `reset:true` 以本帧替换基线；空 data 是合法基线 | 有 `rawBuf` 就不得回退 history；新代次清空旧 raw 与命令计数；后续增量只追加到新基线 | `src/server.ts`（raw 分支 / subscribe / setMode） |
 | read 只读快照 vs 命令运行/完成收尾 | `_buffer` / `_cursor` / `_streamPos` / `_runningStartPos` / history | `peekBuffer()` 在 `await toModelText` 前**同步**切出字符串快照；只读，不写任何会话状态，也不调用 `_completeRunning` | 等待渲染期间新到达的输出不进入本次结果；命令运行/收尾可并发改变缓冲，但读取路径绝不回写，故不会消费输出、写 history 或翻转 busy | `src/base-session.ts`（`peekBuffer`）/ `src/index.ts`（`doRead`） |
 
 ## 2. 不变量

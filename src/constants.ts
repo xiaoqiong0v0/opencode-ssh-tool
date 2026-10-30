@@ -246,5 +246,6 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * v20：新增传输任务事件（agent→server `transfer`，server→web `transfer`/`transfers` 快照）。
  * v21：传输面板改右下浮窗；新增 `transfer-remove` 清理广播与 agent 断线任务失败收尾。
  * v22：传输浮窗默认关闭/开关持久化与 Web 文案修正；强制重启独立服务刷新 Web 资源。
+ * v23：Web raw 订阅把“新代次空基线”视为合法清屏，不再回退旧 history。
  */
-export const SERVER_PROTO_VERSION = 22
+export const SERVER_PROTO_VERSION = 23

@@ -279,6 +279,43 @@ function cleanupAllSessions(sessionID: string): void {
   refreshAgent()
 }
 
+/**
+ * 同名终端在 SSH 与 local 之间互斥：connect 与 local 共用 name 查找，
+ * 若旧终端留在另一张 map 中，resolveSession 会优先取 SSH，导致 read/exec 落到旧会话。
+ * 连接新终端前清掉另一 transport 的同名会话（含 history/state），保持“一个 name 一个终端”。
+ * @param sessionID opencode 会话 ID
+ * @param name 终端名
+ * @param keep 即将建立的 transport
+ */
+function closeConflictingTransport(sessionID: string, name: string, keep: "ssh" | "local"): void {
+  if (keep === "ssh") {
+    if (getLocalSession(sessionID, name)) cleanupLocalSession(sessionID, name)
+    else {
+      // 目录名有前缀冲突：local 终端 X 用 local-X，而 SSH 终端 local-X 也用同一目录；
+      // 若 live SSH 终端叫 local-X，不能把它正在写入的历史目录当成 stale local 历史删掉。
+      try {
+        if (!getSession(sessionID, `local-${name}`)) {
+          rmSync(join(cacheRoot(), sessionID, `local-${name}`), { recursive: true, force: true })
+        }
+      } catch {
+        /* 忽略 */
+      }
+    }
+  } else if (getSession(sessionID, name)) {
+    cleanupSession(sessionID, name)
+  } else {
+    // 反向前缀冲突：local 终端 X 的历史目录是 local-X；连接 local 终端 local-X 时不能误删 X 的历史。
+    const localOwner = name.startsWith("local-") ? getLocalSession(sessionID, name.slice(6)) : undefined
+    if (!localOwner) {
+      try {
+        rmSync(join(cacheRoot(), sessionID, name), { recursive: true, force: true })
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+}
+
 // 发送前语法预检已抽到 ./precheck.ts，供 term_exec 与 web run-exec 共用。
 
 export const OpenCodeSshTool: Plugin = async () => {
@@ -402,12 +439,26 @@ export const OpenCodeSshTool: Plugin = async () => {
       old.close()
       map.delete(name)
     }
+    // 同名 local 终端若仍存在，会与 SSH 同名会话冲突（read/exec 优先命中 SSH），先清掉。
+    closeConflictingTransport(ctx.sessionID, name, "ssh")
     const session = new SshSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), name, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ host, user, port, password: values.password })
     log.tool("ssh_connect", { sessionID: ctx.sessionID, name, host, user, port: port ?? 22 })
     if (!result.ok) {
       session.close()
       return `${tr("connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
+    }
+    // await 期间可能已被 disconnect 全部/session.deleted 摘掉 map；重新取，避免写入孤儿 Map。
+    const liveMap = getSessionMap(ctx.sessionID)
+    if (!liveMap) {
+      session.close()
+      return tr("connect_cancelled", toolLang)
+    }
+    map = liveMap
+    // cleanup 与 await 之间可能被并发 local 同名连接抢先；完成后再次确认，避免两张 map 同时存在。
+    if (getLocalSession(ctx.sessionID, name)) {
+      session.close()
+      return tr("connect_conflict", toolLang)
     }
     map.set(name, session)
     hookBusyState(session, ctx.sessionID, name)
@@ -434,12 +485,26 @@ export const OpenCodeSshTool: Plugin = async () => {
       old.close()
       map.delete(name)
     }
+    // 同名 SSH 终端若仍存在，会与 local 同名会话冲突（read/exec 优先命中 SSH），先清掉。
+    closeConflictingTransport(ctx.sessionID, name, "local")
     const session = new LocalSession(ctx.sessionID, new SessionHistory(join(cacheRoot(), ctx.sessionID), `local-${name}`, cfg.history.maxMessages), name, toolLang, interruptProbeIntervalMs)
     const result = await session.connect({ command, cwd: values.cwd })
     log.tool("local_connect", { sessionID: ctx.sessionID, name, command })
     if (!result.ok) {
       session.close()
       return `${tr("local_connect_title_fail", toolLang)}: ${result.error ?? tr("unknown_error", toolLang)}`
+    }
+    // await 期间可能已被 disconnect 全部/session.deleted 摘掉 map；重新取，避免写入孤儿 Map。
+    const liveMap = getLocalSessionMap(ctx.sessionID)
+    if (!liveMap) {
+      session.close()
+      return tr("connect_cancelled", toolLang)
+    }
+    map = liveMap
+    // cleanup 与 await 之间可能被并发 SSH 同名连接抢先；完成后再次确认，避免两张 map 同时存在。
+    if (getSession(ctx.sessionID, name)) {
+      session.close()
+      return tr("connect_conflict", toolLang)
     }
     map.set(name, session)
     hookBusyState(session, ctx.sessionID, name)
@@ -528,6 +593,15 @@ export const OpenCodeSshTool: Plugin = async () => {
     const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" }, source: { type: "string", short: "s" }, limit: { type: "string", short: "l" }, head: { type: "boolean" }, includeCommand: { type: "boolean" } }, allowPositionals: true })
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
+    // 无内容日志：只记路由键/终端类型，供排查跨会话命中；不记录 buffer/命令内容。
+    const readStatus = session.getStatus()
+    log.tool("term_read", {
+      sessionID: ctx.sessionID,
+      name: values.name ?? DEFAULT_NAME,
+      kind: "host" in readStatus ? "ssh" : "local",
+      source: values.source,
+      busy: readStatus.busy,
+    })
     // 显式 -s 非 buffer 的值仍按旧的 history 分支处理（不因 busy 改走快照）
     const explicitSource: ReadSource | undefined = values.source === undefined ? undefined : values.source === "buffer" ? "buffer" : "history"
     const busy = session.getStatus().busy === true
@@ -863,6 +937,7 @@ export const OpenCodeSshTool: Plugin = async () => {
     if (!cmd || cmd === "help") return HELP_TEXT
     // 统一按根会话 ID 路由（主子会话共享终端）
     const rootID = await findRoot(ctx.sessionID)
+    if (rootID !== ctx.sessionID) log.info(`cli 路由 caller=${ctx.sessionID} root=${rootID} cmd=${cmd}`)
     const rootCtx: CliCtx = { ...ctx, sessionID: rootID }
     switch (cmd) {
       case "connect": return doConnect(rest, rootCtx)

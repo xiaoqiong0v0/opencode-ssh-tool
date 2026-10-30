@@ -68,8 +68,8 @@ export const T = {
     zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH (remote) / local shell (wsl, pwsh, bash) / container (docker exec) sessions. For ANY terminal you already have or can start locally — WSL, Docker containers, or local shells — use the 'local' subcommand INSTEAD of running commands via bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help. Use 'help' for full usage. Long-running, stdin-reading or interactive commands: use the default submit (returns immediately) and then status / read. NEVER add -w to servers, watchers, tail -f, builds, installs, scans, REPLs or commands waiting for input: -w blocks until completion and can hang. upload/download move regular files over SFTP and require an SSH session (local/container sessions are rejected). Terminal sessions exist only for the current opencode session: restarting or ending opencode closes them; after restart, reconnect with connect/local. This is expected, not a crash.",
-    zh: "统一终端命令行工具：SSH（远程）/ 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）会话。对任何本地可启动的终端——WSL、Docker 容器或本地 shell——应使用 'local' 子命令，而不是用 bash 直接执行。子命令: connect / local / exec / read / send / upload / download / status / disconnect / help。用 'help' 查看完整用法。可能长时间运行、需要 stdin 或交互的命令：用默认提交（立即返回）再用 status / read。禁止对 server/watch/tail -f/构建/安装/扫描/REPL/等待输入的命令加 -w：-w 会一直等到结束，可能永久阻塞。upload/download 通过 SFTP 传普通文件，仅支持 SSH 会话（本地/容器会话会明确拒绝）。终端会话只属于当前 opencode 会话：重启或退出 opencode 后旧终端会消失，需要重新 connect/local；这是正常生命周期，不是崩溃。",
+    en: "Unified terminal CLI: SSH / local shell (wsl, pwsh, bash) / container (docker exec); use 'local' for local terminals instead of bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help; use 'help' for usage. Long-running, stdin-reading or interactive commands: use the default submit, then status/read; never add -w. upload/download use SFTP and require an SSH session. Terminal sessions are scoped to this opencode session: restarting/ending opencode closes them; reconnect after restart. connect/local default to name 'default'; reusing a name (also across SSH/local) closes the old terminal first (running command lost; failed connect does not restore it). Use exec on an existing terminal; use distinct -n names to keep terminals separate.",
+    zh: "统一终端 CLI：SSH / 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）；本地终端用 'local'，不要用 bash 直接跑。子命令：connect / local / exec / read / send / upload / download / status / disconnect / help；用 'help' 查看用法。长命令、需 stdin 或交互的命令：用默认提交后 status/read；禁止 -w。upload/download 走 SFTP，仅支持 SSH 会话。终端会话仅属于当前 opencode 会话，重启或退出 opencode 会关闭，需重新连接。connect/local 未传 -n 时名为 default；同名（包括 SSH 与 local 之间）会先关闭旧终端（运行中命令丢失，新连接失败也不恢复）。已有终端用 exec；并行保留用不同 -n。",
   },
   term_cli_args: {
     en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\"' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
@@ -79,6 +79,7 @@ export const T = {
     en: `term_cli unified CLI tool: manage SSH / local (wsl, pwsh, bash) / container (docker exec) terminal sessions.
 Use 'local' for any terminal started on this machine (WSL, Docker containers, local shells).
 Terminal sessions belong to the current opencode session; restarting or ending opencode closes them. Reconnect with connect/local; this is expected, not a crash.
+-n defaults to "default". connect/local with an existing name (also across SSH/local) closes that terminal before attempting the new connection; its running command is lost, and a failed new connection does not restore it. Use exec for more commands in an existing terminal; use distinct -n values to keep terminals separate.
 
 Usage: term_cli <subcommand> [args]
 
@@ -133,6 +134,7 @@ Examples:
     zh: `term_cli 统一命令行工具：管理 SSH / 本地（wsl、pwsh、bash）/ 容器（docker exec）终端会话。
 本机可启动的终端（WSL、Docker 容器、本地 shell）一律用 'local' 子命令。
 终端会话绑定当前 opencode 会话；重启或退出 opencode 后旧终端会关闭，需重新 connect/local；这是正常生命周期，不是崩溃。
+-n 默认 default；connect/local 遇到同名终端（包括 SSH 与 local 之间）会先关闭旧终端再尝试新连接，其中正在运行的命令会丢失，新连接失败也不会恢复旧终端。已有终端继续执行命令请用 exec；需要并行保留请用不同的 -n。
 
 用法: term_cli <子命令> [参数]
 
@@ -371,6 +373,14 @@ Examples:
     en: "SSH connection failed",
     zh: "SSH 连接失败",
   },
+  connect_conflict: {
+    en: "Another terminal with this name was connected concurrently. Wait for it to finish, or retry with a different -n.",
+    zh: "同名终端正在并发连接。请等它完成，或改用不同的 -n 重试。",
+  },
+  connect_cancelled: {
+    en: "The terminal set was closed while connecting. Reconnect and retry.",
+    zh: "连接期间终端集合已被关闭，请重新连接后重试。",
+  },
   unknown_error: {
     en: "Unknown error",
     zh: "未知错误",
@@ -450,7 +460,7 @@ Examples:
     zh: "无法删除该终端（仍在活动或属于其他实例）。",
   },
   web_delete_failed: { en: "Delete failed.", zh: "删除失败。" },
-web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
+  web_cmd_placeholder: { en: "Enter command (Shift+Enter new line)", zh: "输入命令（Shift+Enter 换行）" },
   web_direct_input: { en: "Direct input (type here for interactive prompts)", zh: "直接输入（交互输入请直接在此输入）" },
   web_input_on: { en: "Direct input: ON — keys go to terminal", zh: "直接输入：已启用（按键发往终端）" },
   web_input_off: { en: "Direct input: OFF — keys stay in browser", zh: "直接输入：已关闭（按键留在浏览器）" },

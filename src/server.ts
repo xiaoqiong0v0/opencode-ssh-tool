@@ -833,6 +833,8 @@ export function startServer(
         // msg.reset=true（agent 重连重发全量/ring 裁剪）同样走 replace 语义，避免叠加重复。
         if (msg.reset === true || !existing || existing.generation !== generation) {
           rawBuf.set(k, { data, pos, generation })
+          // 新代次（无旧基线或 generation 变化）从零计数；同一代次的重发全量不清命令数。
+          if (!existing || existing.generation !== generation) cmdCount.set(k, 0)
           for (const c of subscribersOf(sid, name)) {
             if (c._mode !== "raw") continue
             send(c, { type: "raw", data, pos, reset: true })
@@ -899,7 +901,9 @@ export function startServer(
           if (!cmdCount.has(sKey)) cmdCount.set(sKey, snap.pairs.filter((p) => p.type === "cmd").length)
           send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
           const r = rawBuf.get(sKey)
-          if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+          // 只要有 rawBuf（即使 data 为空）就代表当前代次的基线，必须原样下发；
+          // 空 data 是“已重建/已清屏”的合法状态，不能回退旧 history，否则新输出会接在旧内容后。
+          if (r) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
           else {
             // 离线历史会话无实时 rawBuf：用 history 重建原始流供 raw 视图（rawActive 后画面即它）
             const hist = buildRawFromHistory(snap.pairs)
@@ -923,10 +927,12 @@ export function startServer(
         if (on) {
           ws._mode = "raw"
           const snap = buildSnapshot(sid, name)
-          cmdCount.set(sKey, snap.pairs.filter((p) => p.type === "cmd").length)
+          if (!cmdCount.has(sKey)) cmdCount.set(sKey, snap.pairs.filter((p) => p.type === "cmd").length)
           send(ws, { type: "meta", sessionID: sid, name, commands: cmdCount.get(sKey) })
           const r = rawBuf.get(sKey)
-          if (r?.data) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
+          // 只要有 rawBuf（即使 data 为空）就代表当前代次的基线，必须原样下发；
+          // 空 data 是“已重建/已清屏”的合法状态，不能回退旧 history，否则新输出会接在旧内容后。
+          if (r) send(ws, { type: "raw", data: r.data, pos: r.pos, reset: true })
           else {
             // 离线历史会话无实时 rawBuf：用 history 重建原始流供 raw 视图
             const hist = buildRawFromHistory(snap.pairs)

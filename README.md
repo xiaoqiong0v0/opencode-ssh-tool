@@ -49,7 +49,7 @@ term_cli help                                                     # 完整用法
 
 > 复杂引号 / 目标 shell 转义 / 以 `-` 开头的载荷：`--base64` 会忽略空白后解码为 UTF-8 文本，`--file <path>` 读取**插件进程本机**的 UTF-8 文件（不是远程文件），二者互斥；两者都严格按 UTF-8 解码（剥掉开头的 BOM，非法 UTF-8 / 含 NUL 的 UTF-16 或二进制文件直接报错，不会静默发送）。**`send` 原样**交给终端（不再解释 `\n` / `\xHH` 等转义）；**`exec` 仍按 shell 命令执行**。选项终止用 `--`：`term_cli exec -- "-x"`、`term_cli send -- "-n"`。复杂引号场景优先 base64/file，不要在外层引号里猜转义。
 
-> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；同名重复创建会先关闭旧的。终端只属于当前 opencode 会话：重启/退出 opencode 后旧终端会关闭，需要重新 connect/local。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
+> 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；未传 `-n` 时终端名为 `default`。`connect`/`local` 遇到同名终端（包括 SSH 与 local 之间）会先关闭旧终端再尝试新连接，其中正在运行的命令会丢失，新连接失败也不会恢复旧终端。终端只属于当前 opencode 会话：重启/退出 opencode 后旧终端会关闭，需要重新 connect/local。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
 > **read 语义（v0.7.3）**：未显式传 `-s` 时，命令仍在运行（`busy=true`）返回当前 buffer 快照（可能只有部分输出），并加 `[read source=buffer busy=true]` 警告；空闲（`busy=false`）读 history。**显式 `-s buffer` 读实时 buffer；`-s history` 只含已完成命令**。`read` 不等待命令完成：要等结果先 `term_cli status` 确认 `busy=false`，再 `read` 取最终结果。内部实现细节见 `docs/design/read读取语义说明.md`。
 
@@ -175,7 +175,7 @@ opencode（插件进程）
 ```bash
 npm install      # 安装依赖（dependencies + devDependencies）
 npm run build    # tsc（src → dist）+ node web/build.mjs（打包 Web 资源）
-npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer + shell-adapter + precheck + session-precheck）
+npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer + server-raw + shell-adapter + precheck + session-precheck + peek-buffer）
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`
@@ -208,6 +208,8 @@ npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 - [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）；运行中默认 read 返回当前快照（重复读取不消失），显式 `-s buffer` 读实时 buffer
 - [ ] `term_cli upload ./a.txt ~/a.txt` 成功；重复执行（无 `--overwrite`）报目标已存在；加 `--overwrite` 覆盖；父目录不存在时加 `--mkdir` 成功
 - [ ] `term_cli download ~/a.txt ./a.txt` 成功且字节一致；目录/符号链接被拒绝；`term_cli local ...` 会话上传/下载返回“仅支持 SSH 会话”
+- [ ] 同名跨 SSH/local 连接只保留一个终端；新连接失败不恢复旧终端
+- [ ] 会话重建后 Web raw 清屏，新输出不接在旧 history 后
 - [ ] `term_cli status` / HTTP 页面浏览器可访问
 - [ ] `term_cli disconnect` 后连接释放
 
