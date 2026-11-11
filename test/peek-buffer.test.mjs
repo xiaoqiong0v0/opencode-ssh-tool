@@ -7,7 +7,7 @@ import { join } from "node:path"
 
 import { SshSession } from "../dist/session.js"
 import { SessionHistory } from "../dist/history.js"
-import { readBusyNotice } from "../dist/read-output.js"
+import { formatReadHeader, formatReadResult, lastItem } from "../dist/read-output.js"
 
 /**
  * 建一个最小 SshSession（只操作内存态，不建连接）
@@ -133,24 +133,23 @@ test("显式 readBuffer 命中完成标记时按旧语义收尾并消费到标�
   assert.equal(history.getPairs()[0].command, "echo hi")
 })
 
-test("readBusyNotice 只在 busy=true 时返回前缀+警告", () => {
-  assert.equal(readBusyNotice("buffer", false, "en"), "")
-  assert.equal(readBusyNotice("history", false, "zh"), "")
+test("formatReadHeader/lastItem：首行元数据固定 ASCII key，只取最后一条", () => {
+  assert.equal(
+    formatReadHeader("en", "deps", "history", "busy", "completed-only"),
+    "[term_cli read] terminal=deps source=history state=busy note=completed-only",
+  )
+  assert.equal(
+    formatReadHeader("zh", "deps", "buffer", "busy", "partial"),
+    "[term_cli read] terminal=deps source=buffer state=busy note=partial",
+  )
+  assert.equal(lastItem([1, 2, 3]), 3)
+  assert.equal(lastItem([]), undefined)
+})
 
-  const bufEn = readBusyNotice("buffer", true, "en")
-  assert.ok(bufEn.startsWith("[read source=buffer busy=true]"))
-  assert.match(bufEn, /partial buffer snapshot/)
-  assert.match(bufEn, /not the final result/)
-
-  const histEn = readBusyNotice("history", true, "en")
-  assert.ok(histEn.startsWith("[read source=history busy=true]"))
-  assert.match(histEn, /only contains completed commands/)
-
-  const bufZh = readBusyNotice("buffer", true, "zh")
-  assert.ok(bufZh.startsWith("[read source=buffer busy=true]"))
-  assert.match(bufZh, /部分快照/)
-
-  const histZh = readBusyNotice("history", true, "zh")
-  assert.ok(histZh.startsWith("[read source=history busy=true]"))
-  assert.match(histZh, /不含当前结果/)
+test("formatReadResult：元数据与输出用空行分隔，空白输出返回提示", () => {
+  const header = "[term_cli read] terminal=deps source=history state=idle"
+  assert.equal(formatReadResult(header, "actual output", "no output"), `${header}\n\nactual output`)
+  assert.equal(formatReadResult(header, "", "暂时没有输出"), `${header}\n\n暂时没有输出`)
+  assert.equal(formatReadResult(header, "\n", "暂时没有输出"), `${header}\n\n暂时没有输出`)
+  assert.equal(formatReadResult(header, "a\nb", "no output"), `${header}\n\na\nb`)
 })

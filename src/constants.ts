@@ -247,5 +247,6 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * v21：传输面板改右下浮窗；新增 `transfer-remove` 清理广播与 agent 断线任务失败收尾。
  * v22：传输浮窗默认关闭/开关持久化与 Web 文案修正；强制重启独立服务刷新 Web 资源。
  * v23：Web raw 订阅把“新代次空基线”视为合法清屏，不再回退旧 history。
+ * v24：read 只返回当前/最后一条命令，工具元数据与输出分离，不再追加浏览器 URL。
  */
-export const SERVER_PROTO_VERSION = 23
+export const SERVER_PROTO_VERSION = 24

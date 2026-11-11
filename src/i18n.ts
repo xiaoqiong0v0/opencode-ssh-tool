@@ -91,8 +91,8 @@ Subcommands:
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; NEVER use -w for long-running / stdin-reading / interactive / server / watch / tail -f / build / install / scan / REPL commands, because -w keeps waiting as long as the command runs and can hang indefinitely; use the default and poll with status/read)
-  read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
-      read terminal output: with no -s, a running command returns a current buffer snapshot (may be partial) and an idle terminal returns history; -s buffer reads the live buffer; -s history reads completed history. read never waits for completion: use status to wait, then read the final result
+  read [-n name] [-s buffer|history] [--includeCommand]
+      read the current/last command output only: no -s returns the running command snapshot or the last completed result; -s buffer reads the live buffer only while busy (idle falls back to the last completed result); -s history reads the last completed result. Tool metadata is on the first line; actual output follows after a blank line. No output yet returns "No output yet." read never waits for completion
   send "<text>" [--base64 | --file <path>] [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
@@ -146,8 +146,8 @@ Examples:
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
   exec "<command>" [--base64 | --file <path>] [-n name] [-w]
       在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；**禁止**对长时间运行 / 需要 stdin / 交互 / server / watch / tail -f / 构建 / 安装 / 扫描 / REPL 命令加 -w：只要命令没结束 -w 就会一直等，可能永久阻塞；这些命令请用默认模式，再用 status/read 轮询）
-  read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]
-      读终端输出：不传 -s 时，命令运行中返回当前 buffer 快照（可能不完整），空闲时返回 history；-s buffer 读实时 buffer；-s history 读已完成历史。read 不等待命令完成：先用 status 等完成，再读最终结果
+  read [-n name] [-s buffer|history] [--includeCommand]
+      只读当前/最后一条命令的输出：不传 -s 时，运行中返回当前命令快照，空闲返回最后一条已完成结果；-s buffer 只在运行中读实时 buffer，空闲回退到最后一条已完成结果；-s history 读最后一条已完成结果。工具元数据在首行，空行后是实际输出；没有输出返回“暂时没有输出”。read 不等待命令完成
   send "<text>" [--base64 | --file <path>] [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
@@ -401,33 +401,13 @@ Examples:
     en: "\nHint: no command running. You can safely execute a new command or call term_cli read for remaining output.",
     zh: "\n提示：无命令在执行，可安全执行新命令或调用 term_cli read 读取剩余输出。",
   },
-  browser_full_record: {
-    en: "\nBrowser full record: {url}",
-    zh: "\n浏览器查看完整记录：{url}",
+  read_header: {
+    en: "[term_cli read] terminal={name} source={source} state={state}",
+    zh: "[term_cli read] terminal={name} source={source} state={state}",
   },
-  server_not_enabled: {
-    en: "\n(HTTP server not enabled)",
-    zh: "\n（HTTP 服务未启用）",
-  },
-  server_unavailable: {
-    en: "\n(Web record service not started; command execution is unaffected)",
-    zh: "\n（Web 记录服务未启动，命令执行不受影响）",
-  },
-  history_title: {
-    en: "Terminal history (last {n} / total {total})",
-    zh: "终端历史（最后 {n} 条 / 共 {total} 条）",
-  },
-  history_title_head: {
-    en: "Terminal history (first {n} / total {total})",
-    zh: "终端历史（前 {n} 条 / 共 {total} 条）",
-  },
-  read_busy_buffer_notice: {
-    en: "[read source=buffer busy=true]\nWarning: this is a partial buffer snapshot, not the final result; run status and wait for completion before reading the final result.",
-    zh: "[read source=buffer busy=true]\n警告：这是 buffer 部分快照，不是最终结果；请先用 status 等待命令完成后再读取最终结果。",
-  },
-  read_busy_history_notice: {
-    en: "[read source=history busy=true]\nWarning: history only contains completed commands; it does not include the current result.",
-    zh: "[read source=history busy=true]\n警告：history 只含已完成命令，不含当前结果。",
+  read_no_output: {
+    en: "No output yet.",
+    zh: "暂时没有输出。",
   },
   web_title: { en: "Terminal Records", zh: "终端记录" },
   web_close: { en: "Close", zh: "关闭" },

@@ -24,7 +24,7 @@ import { ensureServer, type ServerResult } from "./server-manager.js"
 import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates, writeSessionMeta } from "./session-store.js"
 import { precheckBeforeExec } from "./precheck.js"
-import { readBusyNotice, type ReadSource } from "./read-output.js"
+import { formatReadHeader, formatReadResult, lastItem, type ReadSource } from "./read-output.js"
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -391,15 +391,6 @@ export const OpenCodeSshTool: Plugin = async () => {
     return httpUrl
   }
 
-  /**
-   * Web 服务不可用时的提示文案键：配置关闭 → 未启用；已发起但未起来 → 未启动（命令执行不受影响）
-   * @returns i18n 文案键
-   */
-  function httpUnavailableKey(): FlatKey {
-    return serverStart ? "server_unavailable" : "server_not_enabled"
-  }
-
-
   // ===== CLI 风格单工具（term_cli）子命令实现 =====
 
   /** 完整用法（模型自学手册） */
@@ -602,37 +593,53 @@ export const OpenCodeSshTool: Plugin = async () => {
       source: values.source,
       busy: readStatus.busy,
     })
-    // 显式 -s 非 buffer 的值仍按旧的 history 分支处理（不因 busy 改走快照）
+    // 显式 -s 非 buffer 的值仍按 history 分支处理；-l/--head 仅为旧调用兼容，默认只返回最后一条命令。
     const explicitSource: ReadSource | undefined = values.source === undefined ? undefined : values.source === "buffer" ? "buffer" : "history"
     const busy = session.getStatus().busy === true
-    // 未显式指定来源：运行中给 buffer 只读快照（不消费、不代表最终结果），空闲保持旧的 history 默认
+    // 未显式指定来源：运行中给当前命令快照，空闲给最后一条已完成命令。
     const source: ReadSource = explicitSource ?? (busy ? "buffer" : "history")
-    if (source === "buffer") {
-      if (explicitSource === "buffer") {
-        // 显式 -s buffer 保持旧语义：readBuffer 会消费缓冲，命中完成标记时完成命令（写 history/done/busy）
-        const r = await session.readBuffer()
-        // 完成标记已收尾时不再提示"部分快照"；仍在运行才提示（读取前后都可能变化，按调用后状态为准）
-        return readBusyNotice("buffer", session.getStatus().busy === true, toolLang) + r.output
-      }
-      // 未显式指定：只读快照，绝不消费；绝不调用 _completeRunning
-      const r = await session.peekBuffer()
-      if (!r.ok) return r.error ?? ""
-      return readBusyNotice("buffer", busy, toolLang) + r.output
-    }
-    const notice = readBusyNotice("history", busy, toolLang)
-    const history = session.getHistory()
-    const all = history.getPairs()
-    const limit = Math.max(1, parseInt(values.limit ?? "10", 10) || 10)
-    const direction = values.head ? "head" : "tail"
-    const selected = direction === "tail" ? all.slice(-limit) : all.slice(0, limit)
+    const noOutput = tr("read_no_output", toolLang)
+    const name = values.name ?? DEFAULT_NAME
     const includeCommand = values.includeCommand ?? false
-    // 逐条顺序处理（toModelText 内部 headless write 为异步，不能放在同步 map 中）
-    const parts: string[] = []
-    for (const p of selected) parts.push((includeCommand ? `$ ${p.command}\n` : "") + await toModelText(history.readOutput(p)))
-    const text = parts.join("\n")
-    const url = await resolveHttpUrl()
-    const browserLine = url ? tr("browser_full_record", toolLang).replace("{url}", url) : tr(httpUnavailableKey(), toolLang)
-    return `${notice}${tr(direction === "tail" ? "history_title" : "history_title_head", toolLang).replace("{n}", String(selected.length)).replace("{total}", String(all.length))}\n${text}${browserLine}`
+    if (source === "buffer") {
+      // 空闲时 buffer 里会残留上一条命令的回显/完成标记；read 仍只返回最后一条已完成结果。
+      // -s buffer 只用于 busy 时的实时缓冲；空闲统一按最后一条命令处理。
+      if (!busy) {
+        const last = lastItem(session.getHistory().getPairs())
+        let output = ""
+        if (last) {
+          const body = await toModelText(session.getHistory().readOutput(last))
+          output = includeCommand ? `$ ${last.command}\n${body || noOutput}` : body
+        }
+        const header = formatReadHeader(toolLang, name, "history", "idle")
+        return formatReadResult(header, output, noOutput)
+      }
+      let output: string
+      let readError: string | undefined
+      if (explicitSource === "buffer") {
+        // 显式 -s buffer 保持旧语义：readBuffer 会消费缓冲，命中完成标记时完成命令。
+        const r = await session.readBuffer()
+        output = r.output
+        if (!r.ok) readError = r.error ?? noOutput
+      } else {
+        // 未显式指定：只读当前命令快照，绝不消费。
+        const r = await session.peekBuffer()
+        output = r.output
+        if (!r.ok) readError = r.error ?? noOutput
+      }
+      const state = session.getStatus().busy === true ? "busy" : "idle"
+      const header = formatReadHeader(toolLang, name, "buffer", state, state === "busy" ? "partial" : undefined)
+      return formatReadResult(header, readError ?? output, noOutput)
+    }
+    const history = session.getHistory()
+    const last = lastItem(history.getPairs())
+    let output = ""
+    if (last) {
+      const body = await toModelText(history.readOutput(last))
+      output = includeCommand ? `$ ${last.command}\n${body || noOutput}` : body
+    }
+    const header = formatReadHeader(toolLang, name, "history", busy ? "busy" : "idle", busy ? "completed-only" : undefined)
+    return formatReadResult(header, output, noOutput)
   }
 
   /** send：发送文本/按键到终端 */

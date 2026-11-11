@@ -38,7 +38,7 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
 term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 只用于已知很快结束的命令；禁止对 server/watch/tail -f/构建/安装/扫描/交互命令用 -w）
-term_cli read [-n name] [-s buffer|history] [-l limit] [--head] [--includeCommand]  # 读输出（未传 -s：运行中返回当前快照、空闲读历史；read 不等待完成）
+term_cli read [-n name] [-s buffer|history] [--includeCommand]  # 只读当前/最后一条命令；首行元数据、空行后输出；无浏览器 URL
 term_cli send "<text>" [--base64 | --file <path>] [-n name]         # 发送按键（sudo 密码等）
 term_cli upload <local> <remote> [-n name] [--overwrite] [--mkdir]  # SFTP 上传（仅 SSH）
 term_cli download <remote> <local> [-n name] [--overwrite] [--mkdir] # SFTP 下载（仅 SSH）
@@ -51,7 +51,7 @@ term_cli help                                                     # 完整用法
 
 > 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；未传 `-n` 时终端名为 `default`。`connect`/`local` 遇到同名终端（包括 SSH 与 local 之间）会先关闭旧终端再尝试新连接，其中正在运行的命令会丢失，新连接失败也不会恢复旧终端。终端只属于当前 opencode 会话：重启/退出 opencode 后旧终端会关闭，需要重新 connect/local。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
-> **read 语义（v0.7.3）**：未显式传 `-s` 时，命令仍在运行（`busy=true`）返回当前 buffer 快照（可能只有部分输出），并加 `[read source=buffer busy=true]` 警告；空闲（`busy=false`）读 history。**显式 `-s buffer` 读实时 buffer；`-s history` 只含已完成命令**。`read` 不等待命令完成：要等结果先 `term_cli status` 确认 `busy=false`，再 `read` 取最终结果。内部实现细节见 `docs/design/read读取语义说明.md`。
+> **read 语义**：只返回**当前/最后一条命令**的输出，不再把多条历史合并。无 `-s` 时运行中返回当前命令快照，空闲返回最后一条已完成命令；`-s buffer` 只在运行中读实时 buffer，空闲回退到最后一条已完成结果；`-s history` 读最后一条已完成结果。工具元数据首行以 `[term_cli read]` 开头，空行后才是实际输出；没有输出返回“暂时没有输出”。`read` 不再追加浏览器 URL，浏览器地址只在 `status` 显示。`read` 不等待命令完成：要等结果先 `term_cli status`。
 
 ## 文件传输（v1）
 
@@ -149,7 +149,7 @@ term_cli exec(command)
 
 ## HTTP 终端查看
 
-服务默认开启（配置 `server.enabled`）。`term_cli status` / `term_cli read`（history 模式）会返回实际地址（端口 0 时自动分配，避免冲突）：
+服务默认开启（配置 `server.enabled`）。`term_cli status` 会返回实际地址（端口 0 时自动分配，避免冲突）：
 
 ```
 浏览器访问 http://127.0.0.1:<port> 查看终端记录（WebSocket 实时推送）
@@ -205,7 +205,7 @@ npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 - [ ] SSH 远程 `pwsh`：`term_cli exec("if then")` 发送前被拦截（未写入终端）；合法命令正常执行；远程未安装 `pwsh` 时回落 `powershell` 或放行（不误拦）
 - [ ] SSH 远程 `cmd`：预检明确跳过，命令照常执行
 - [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
-- [ ] `term_cli read` 取前/后 N 条历史输出（含 `--includeCommand`、`source=buffer`）；运行中默认 read 返回当前快照（重复读取不消失），显式 `-s buffer` 读实时 buffer
+- [ ] `term_cli read` 只返回当前/最后一条命令输出；工具首行与实际输出分开；无输出返回“暂时没有输出”；不再追加浏览器 URL
 - [ ] `term_cli upload ./a.txt ~/a.txt` 成功；重复执行（无 `--overwrite`）报目标已存在；加 `--overwrite` 覆盖；父目录不存在时加 `--mkdir` 成功
 - [ ] `term_cli download ~/a.txt ./a.txt` 成功且字节一致；目录/符号链接被拒绝；`term_cli local ...` 会话上传/下载返回“仅支持 SSH 会话”
 - [ ] 同名跨 SSH/local 连接只保留一个终端；新连接失败不恢复旧终端
