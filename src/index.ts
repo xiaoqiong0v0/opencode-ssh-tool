@@ -25,6 +25,7 @@ import { startAgent, type AgentHandle, type AgentSession } from "./agent.js"
 import { writeSessionState, removeSessionState, removeAllSessionStates, writeSessionMeta } from "./session-store.js"
 import { precheckBeforeExec } from "./precheck.js"
 import { formatReadHeader, formatReadResult, lastItem, type ReadSource } from "./read-output.js"
+import { waitForIdle } from "./wait.js"
 
 /** 默认终端名（不传 name 时用） */
 const DEFAULT_NAME = "default"
@@ -517,9 +518,26 @@ export const OpenCodeSshTool: Plugin = async () => {
     return tr("payload_file_error", toolLang).replace("{path}", file ?? "")
   }
 
+  /**
+   * 取终端最后一条已完成命令的模型可读输出。
+   * @param session SSH/本地终端
+   * @returns 输出文本；无历史时为空串
+   */
+  async function lastHistoryOutput(session: SshSession | LocalSession, command: string, beforeSeq: number): Promise<string | undefined> {
+    const history = session.getHistory()
+    const last = lastItem(history.getPairs())
+    if (!last || last.seq <= beforeSeq || last.command !== command) return undefined
+    return await toModelText(history.readOutput(last))
+  }
+
   /** exec：在指定终端执行命令 */
   async function doExec(args: string[], ctx: CliCtx): Promise<string> {
-    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, waitResult: { type: "boolean", short: "w" }, base64: { type: "boolean" }, file: { type: "string" } }, allowPositionals: true })
+    const optionEnd = args.indexOf("--")
+    const optionArgs = optionEnd >= 0 ? args.slice(0, optionEnd) : args
+    if (optionArgs.includes("-w") || optionArgs.includes("--waitResult")) {
+      return `${tr("exec_w_removed", toolLang)}\n${tr("cli_exec_usage", toolLang)}\n\n${HELP_TEXT}`
+    }
+    const { values, positionals } = parseArgs({ args, options: { name: { type: "string", short: "n" }, async: { type: "boolean" }, base64: { type: "boolean" }, file: { type: "string" } }, allowPositionals: true })
     let payload: ResolvedPayload
     try {
       payload = await resolvePayload(positionals.join(" "), { base64: values.base64, file: values.file })
@@ -564,8 +582,10 @@ export const OpenCodeSshTool: Plugin = async () => {
       }
     }
     const name = values.name ?? DEFAULT_NAME
+    const asyncMode = values.async === true
+    const beforeSeq = lastItem(session.getHistory().getPairs())?.seq ?? 0
     syncSessionState(ctx.sessionID, name, "exec前")
-    const result = values.waitResult ? await session.exec(command) : await session.submit(command)
+    const result = await session.submit(command)
     syncSessionState(ctx.sessionID, name, "exec后")
     log.tool("term_exec", {
       sessionID: ctx.sessionID,
@@ -573,15 +593,26 @@ export const OpenCodeSshTool: Plugin = async () => {
       ...(payload.source === "text" ? { command } : { source: payload.source, length: command.length }),
       ok: result.ok,
       submitted: result.submitted,
-      running: result.running,
+      async: asyncMode || cfg.exec.timeoutMs <= 0,
+      timeoutMs: cfg.exec.timeoutMs,
     })
-    if (result.submitted) return tr("submitted", toolLang)
-    return result.ok ? result.output : result.error ?? tr("exec_failed", toolLang)
+    if (!result.ok) return result.error ?? tr("exec_failed", toolLang)
+    // --async 或配置 timeout=0：提交后立即返回；默认否则最多等待 timeout，超时不杀进程。
+    if (asyncMode || cfg.exec.timeoutMs <= 0) return tr("submitted", toolLang)
+    await waitForIdle(() => session.getStatus().busy, cfg.exec.timeoutMs, cfg.exec.pollMs)
+    if (session.getStatus().busy) {
+      return tr("exec_async_timeout", toolLang).replace("{seconds}", String(Math.max(1, Math.round(cfg.exec.timeoutMs / 1000))))
+    }
+    const output = await lastHistoryOutput(session, command, beforeSeq)
+    if (output === undefined) {
+      return session.getStatus().connected === false ? tr("exec_disconnected", toolLang) : tr("exec_no_result", toolLang)
+    }
+    return output || tr("exec_no_output", toolLang)
   }
 
   /** read：读取终端输出（未显式 -s 时，运行中读只读快照、空闲读 history） */
   async function doRead(args: string[], ctx: CliCtx): Promise<string> {
-    const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" }, source: { type: "string", short: "s" }, limit: { type: "string", short: "l" }, head: { type: "boolean" }, includeCommand: { type: "boolean" } }, allowPositionals: true })
+    const { values } = parseArgs({ args, options: { name: { type: "string", short: "n" }, source: { type: "string", short: "s" }, limit: { type: "string", short: "l" }, head: { type: "boolean" }, includeCommand: { type: "boolean" }, timeout: { type: "string", short: "t" } }, allowPositionals: true })
     const session = resolveSession(ctx.sessionID, values.name)
     if (!session) return tr("not_connected", toolLang)
     // 无内容日志：只记路由键/终端类型，供排查跨会话命中；不记录 buffer/命令内容。
@@ -595,12 +626,19 @@ export const OpenCodeSshTool: Plugin = async () => {
     })
     // 显式 -s 非 buffer 的值仍按 history 分支处理；-l/--head 仅为旧调用兼容，默认只返回最后一条命令。
     const explicitSource: ReadSource | undefined = values.source === undefined ? undefined : values.source === "buffer" ? "buffer" : "history"
-    const busy = session.getStatus().busy === true
+    let busy = session.getStatus().busy === true
     // 未显式指定来源：运行中给当前命令快照，空闲给最后一条已完成命令。
     const source: ReadSource = explicitSource ?? (busy ? "buffer" : "history")
     const noOutput = tr("read_no_output", toolLang)
     const name = values.name ?? DEFAULT_NAME
     const includeCommand = values.includeCommand ?? false
+    const requestedTimeout = values.timeout === undefined ? cfg.exec.timeoutMs : parseInt(values.timeout, 10)
+    const waitMs = Number.isFinite(requestedTimeout) && requestedTimeout >= 0 ? requestedTimeout : cfg.exec.timeoutMs
+    // read 遇到 busy 直接等待（与 exec/status 共用默认 timeout），完成即返回结果；--timeout 可覆盖。
+    if (busy && waitMs > 0) {
+      await waitForIdle(() => session.getStatus().busy, waitMs, cfg.exec.pollMs)
+      busy = session.getStatus().busy === true
+    }
     if (source === "buffer") {
       // 空闲时 buffer 里会残留上一条命令的回显/完成标记；read 仍只返回最后一条已完成结果。
       // -s buffer 只用于 busy 时的实时缓冲；空闲统一按最后一条命令处理。
@@ -612,7 +650,11 @@ export const OpenCodeSshTool: Plugin = async () => {
           output = includeCommand ? `$ ${last.command}\n${body || noOutput}` : body
         }
         const header = formatReadHeader(toolLang, name, "history", "idle")
-        return formatReadResult(header, output, noOutput)
+        return formatReadResult(header, output, noOutput, false)
+      }
+      // 默认 read 在 busy 超时后只返回状态信息，不读取 buffer；需要 buffer 必须显式 -s buffer。
+      if (explicitSource !== "buffer") {
+        return formatReadHeader(toolLang, name, "status", "busy")
       }
       let output: string
       let readError: string | undefined
@@ -639,7 +681,7 @@ export const OpenCodeSshTool: Plugin = async () => {
       output = includeCommand ? `$ ${last.command}\n${body || noOutput}` : body
     }
     const header = formatReadHeader(toolLang, name, "history", busy ? "busy" : "idle", busy ? "completed-only" : undefined)
-    return formatReadResult(header, output, noOutput)
+    return formatReadResult(header, output, noOutput, busy)
   }
 
   /** send：发送文本/按键到终端 */
@@ -879,6 +921,8 @@ export const OpenCodeSshTool: Plugin = async () => {
       sessions = [...(smap?.values() ?? []) as SshSession[], ...(lmap?.values() ?? []) as LocalSession[]]
     }
     const parts: string[] = []
+    // status 与 exec 共用同一组 timeout/poll：busy 时短暂等待，超时只返回当前状态，不杀进程。
+    await Promise.all(sessions.map((s) => waitForIdle(() => s.getStatus().busy, cfg.exec.timeoutMs, cfg.exec.pollMs)))
     for (const s of sessions) {
       const st = s.getStatus()
       if (!st.connected) {

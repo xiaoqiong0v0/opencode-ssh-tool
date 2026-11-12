@@ -8,24 +8,27 @@
 
 | 调用 | busy=false | busy=true |
 |---|---|---|
-| `read`（未传 `-s`） | 最后一条已完成命令的输出 | 当前命令的只读快照（`peekBuffer()`） |
-| `read -s buffer` | 最后一条已完成命令（空闲时不再消费旧 buffer） | `readBuffer()` 旧语义（可能收尾/消费） |
-| `read -s history` | 最后一条已完成命令的输出 | 最后一条已完成命令的输出 |
+| `read`（未传 `-s`） | 最后一条已完成命令的输出 | 先等 `timeoutMs`；完成返回结果，超时只返回状态信息（不读 buffer） |
+| `read -s buffer` | 最后一条已完成命令（空闲时不再消费旧 buffer） | 先等 `timeoutMs`；完成后返回结果，超时才显式读 buffer |
+| `read -s history` | 最后一条已完成命令的输出 | 先等 `timeoutMs`；完成返回结果，超时返回最后一条已完成命令 |
 
 - `-l` / `--head` 仅为旧调用兼容保留，**不再选择多条历史**；默认永远只取最后一条命令。
 - `-s buffer` 只用于 busy 时的实时缓冲；空闲时统一回退到最后一条已完成结果，避免把上一条命令回显/完成标记带出来。
-- `read` 不是等待机制：不会阻塞到命令完成。要等结果先 `status`，确认 `busy=false` 后再读。
+- `read` busy 时默认等待 `exec.timeoutMs`（可用 `--timeout <ms>` 覆盖）；完成直接返回结果，超时只返回状态信息，不读 buffer；显式 `-s buffer` 才读缓冲。
 - 没有结果时返回本地化的“暂时没有输出”，不返回空字符串。
 
 ## 输出格式
 
-```text
-[term_cli read] terminal=deps source=history state=idle
+正常 idle 结果只返回 `<actual output>`，不显示工具元数据。
 
-<actual output>
+只有 busy/超时/错误时显示：
+
+```text
+[term_cli read] terminal=deps source=status state=busy
+
+<actual output/snapshot>
 ```
 
-- 首行 `[...]` 是工具元数据；空行之后才是实际命令输出。
 - 不再追加浏览器 URL；浏览器地址只在 `term_cli status` 显示。
 - `--includeCommand` 仍可在实际输出前加 `$ <command>` 行。
 

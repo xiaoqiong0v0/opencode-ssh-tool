@@ -15,21 +15,23 @@ export type ReadSource = "buffer" | "history"
  * @param note 可选提示（partial / completed-only）
  * @returns 首行元数据
  */
-export function formatReadHeader(lang: Lang, name: string, source: ReadSource, state: "busy" | "idle", note?: "partial" | "completed-only"): string {
+export function formatReadHeader(lang: Lang, name: string, source: ReadSource | "status", state: "busy" | "idle", note?: "partial" | "completed-only"): string {
   const header = tr("read_header", lang).replace("{name}", name).replace("{source}", source).replace("{state}", state)
   return note ? `${header} note=${note}` : header
 }
 
 /**
- * 统一 read 输出布局：首行工具元数据，空行后是实际输出。
+ * 统一 read 输出布局。
+ * 正常 idle 结果不显示工具元数据；只有 busy/超时/错误等需要提示时才显示 header。
  * @param header 元数据行（含 [term_cli read]）
  * @param output 实际命令输出
  * @param emptyText 无输出时的提示
- * @returns header + 空行 + output（或 emptyText）
+ * @param showHeader 是否显示工具元数据
+ * @returns header + 空行 + output（或 emptyText），showHeader=false 时只返回 output/emptyText
  */
-export function formatReadResult(header: string, output: string, emptyText: string): string {
+export function formatReadResult(header: string, output: string, emptyText: string, showHeader = true): string {
   const actual = output.trim() ? output : emptyText
-  return `${header}\n\n${actual}`
+  return showHeader ? `${header}\n\n${actual}` : actual
 }
 
 /**

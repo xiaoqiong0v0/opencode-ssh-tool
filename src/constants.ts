@@ -248,5 +248,6 @@ export const SHELL_ID_RE = /\b__SHELL_ID__\b/
  * v22：传输浮窗默认关闭/开关持久化与 Web 文案修正；强制重启独立服务刷新 Web 资源。
  * v23：Web raw 订阅把“新代次空基线”视为合法清屏，不再回退旧 history。
  * v24：read 只返回当前/最后一条命令，工具元数据与输出分离，不再追加浏览器 URL。
+ * v25：exec 默认同步等待/超时转异步，status busy 共用 timeout/poll；移除 -w。
  */
-export const SERVER_PROTO_VERSION = 24
+export const SERVER_PROTO_VERSION = 25

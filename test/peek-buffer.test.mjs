@@ -142,6 +142,10 @@ test("formatReadHeader/lastItem：首行元数据固定 ASCII key，只取最后
     formatReadHeader("zh", "deps", "buffer", "busy", "partial"),
     "[term_cli read] terminal=deps source=buffer state=busy note=partial",
   )
+  assert.equal(
+    formatReadHeader("en", "deps", "status", "busy"),
+    "[term_cli read] terminal=deps source=status state=busy",
+  )
   assert.equal(lastItem([1, 2, 3]), 3)
   assert.equal(lastItem([]), undefined)
 })
@@ -152,4 +156,6 @@ test("formatReadResult：元数据与输出用空行分隔，空白输出返回�
   assert.equal(formatReadResult(header, "", "暂时没有输出"), `${header}\n\n暂时没有输出`)
   assert.equal(formatReadResult(header, "\n", "暂时没有输出"), `${header}\n\n暂时没有输出`)
   assert.equal(formatReadResult(header, "a\nb", "no output"), `${header}\n\na\nb`)
+  assert.equal(formatReadResult(header, "actual output", "no output", false), "actual output")
+  assert.equal(formatReadResult(header, "", "暂时没有输出", false), "暂时没有输出")
 })

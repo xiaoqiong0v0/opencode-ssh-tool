@@ -37,8 +37,8 @@ opencode 插件：让 opencode 像人一样操作**长驻交互式终端会话**
 ```text
 term_cli connect root@host:22 [-n name] [-p password|file:path]   # SSH 连接
 term_cli local "pwsh|docker exec -it <容器> sh" [-n name] [-c cwd] # 本地/容器终端
-term_cli exec "<command>" [--base64 | --file <path>] [-n name] [-w]  # 执行命令（默认提交后立即返回；-w 只用于已知很快结束的命令；禁止对 server/watch/tail -f/构建/安装/扫描/交互命令用 -w）
-term_cli read [-n name] [-s buffer|history] [--includeCommand]  # 只读当前/最后一条命令；首行元数据、空行后输出；无浏览器 URL
+term_cli exec "<command>" [--base64 | --file <path>] [-n name] [--async]  # 默认最多同步等 5s（可配置）；超时转异步；--async 立即返回
+term_cli read [-n name] [-s buffer|history] [--timeout ms] [--includeCommand]  # busy 默认等到 exec.timeoutMs；完成返回结果，超时返回快照
 term_cli send "<text>" [--base64 | --file <path>] [-n name]         # 发送按键（sudo 密码等）
 term_cli upload <local> <remote> [-n name] [--overwrite] [--mkdir]  # SFTP 上传（仅 SSH）
 term_cli download <remote> <local> [-n name] [--overwrite] [--mkdir] # SFTP 下载（仅 SSH）
@@ -51,7 +51,7 @@ term_cli help                                                     # 完整用法
 
 > 一个 opencode 会话可创建**多个命名终端**（如 `db`、`web`、`prod`），用不同 `name` 并行维护；未传 `-n` 时终端名为 `default`。`connect`/`local` 遇到同名终端（包括 SSH 与 local 之间）会先关闭旧终端再尝试新连接，其中正在运行的命令会丢失，新连接失败也不会恢复旧终端。终端只属于当前 opencode 会话：重启/退出 opencode 后旧终端会关闭，需要重新 connect/local。工具只暴露一个 `args` 字符串参数，模型像敲命令行一样调用，`help` 引导其学会所有用法（单工具多命令模式，省 token）。
 
-> **read 语义**：只返回**当前/最后一条命令**的输出，不再把多条历史合并。无 `-s` 时运行中返回当前命令快照，空闲返回最后一条已完成命令；`-s buffer` 只在运行中读实时 buffer，空闲回退到最后一条已完成结果；`-s history` 读最后一条已完成结果。工具元数据首行以 `[term_cli read]` 开头，空行后才是实际输出；没有输出返回“暂时没有输出”。`read` 不再追加浏览器 URL，浏览器地址只在 `status` 显示。`read` 不等待命令完成：要等结果先 `term_cli status`。
+> **read 语义**：只返回**当前/最后一条命令**的输出，不再把多条历史合并。无 `-s` 时 busy 默认等待完成（超时只返回状态），空闲返回最后一条已完成命令；`-s buffer` 显式读实时 buffer；`-s history` 读最后一条已完成结果。正常 idle 结果只返回实际输出；只有 busy/超时/错误时才显示 `[term_cli read]` 元数据。没有输出返回“暂时没有输出”。`read` 不再追加浏览器 URL，浏览器地址只在 `status` 显示。busy 时 `read` 默认等待 `exec.timeoutMs`（可加 `--timeout <ms>` 覆盖）；完成直接返回最后结果，超时只返回状态信息，不读 buffer；需要 buffer 必须显式 `-s buffer`。
 
 ## 文件传输（v1）
 
@@ -89,6 +89,12 @@ term_cli download <remote> <local> [-n name] [--overwrite] [--mkdir]
   "history": {
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
     "maxMessages": 100
+  },
+  "exec": {
+    // exec 默认同步 / status busy 的最长等待（毫秒）；0 = 立即异步/不等待
+    "timeoutMs": 5000,
+    // busy 时的轮询间隔（毫秒）
+    "pollMs": 1000
   },
   // 工具语言（工具描述 / CLI / agent·session 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
@@ -175,7 +181,7 @@ opencode（插件进程）
 ```bash
 npm install      # 安装依赖（dependencies + devDependencies）
 npm run build    # tsc（src → dist）+ node web/build.mjs（打包 Web 资源）
-npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer + server-raw + shell-adapter + precheck + session-precheck + peek-buffer）
+npm test         # 构建后跑 node:test 单测（cli-args + payload + transfer + transfer-events + server-transfer + server-raw + config + shell-adapter + precheck + session-precheck + peek-buffer + wait）
 ```
 
 - TS 源码在 `src/`，编译产物 `dist/`
@@ -204,7 +210,7 @@ npm publish      # 发布 dist/ + README.md（见 package.json 的 files）
 - [ ] 白名单外命令弹 `context.ask()`，`:deny` 拒绝 / `:allow` 放行
 - [ ] SSH 远程 `pwsh`：`term_cli exec("if then")` 发送前被拦截（未写入终端）；合法命令正常执行；远程未安装 `pwsh` 时回落 `powershell` 或放行（不误拦）
 - [ ] SSH 远程 `cmd`：预检明确跳过，命令照常执行
-- [ ] 长命令：`term_cli exec("sleep 60")` 超 5s 动画窗口转后台 watch，等待其完成（不设超时、不挂死会话），`Ctrl-C` 可中断，结果从 history 可读
+- [ ] 长命令：`term_cli exec("sleep 60")` 默认等待 `exec.timeoutMs`（默认 5s）后返回异步，命令继续；`status` 共用 timeout/poll 等待；`Ctrl-C` 可中断，结果从 history 可读
 - [ ] `term_cli read` 只返回当前/最后一条命令输出；工具首行与实际输出分开；无输出返回“暂时没有输出”；不再追加浏览器 URL
 - [ ] `term_cli upload ./a.txt ~/a.txt` 成功；重复执行（无 `--overwrite`）报目标已存在；加 `--overwrite` 覆盖；父目录不存在时加 `--mkdir` 成功
 - [ ] `term_cli download ~/a.txt ./a.txt` 成功且字节一致；目录/符号链接被拒绝；`term_cli local ...` 会话上传/下载返回“仅支持 SSH 会话”

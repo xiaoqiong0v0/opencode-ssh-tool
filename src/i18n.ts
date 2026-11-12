@@ -40,8 +40,8 @@ export function getWebLang(configured: Lang = "en"): Lang {
 /** 工具描述与参数说明字典 */
 export const T = {
   submitted: {
-    en: "Command submitted (this call did not wait for the result). It is still running in the terminal's foreground: use term_cli status to check completion, then term_cli read to read output.",
-    zh: "命令已提交（本次调用未等待结果），命令仍在该终端前台执行：用 term_cli status 查完成状态，再用 term_cli read 读取输出。",
+    en: "Command submitted in async mode; it is still running in the terminal's foreground. Use term_cli status to check completion, then term_cli read to read output.",
+    zh: "命令已按异步模式提交，仍在该终端前台执行；用 term_cli status 查完成状态，再用 term_cli read 读取输出。",
   },
   send_ok: {
     en: "Sent: {text}",
@@ -68,8 +68,8 @@ export const T = {
     zh: "service 的 PATH 找不到可执行文件：{cmd}。请改用不含空格的全路径，或 \"powershell\"。",
   },
   term_cli: {
-    en: "Unified terminal CLI: SSH / local shell (wsl, pwsh, bash) / container (docker exec); use 'local' for local terminals instead of bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help; use 'help' for usage. Long-running, stdin-reading or interactive commands: use the default submit, then status/read; never add -w. upload/download use SFTP and require an SSH session. Terminal sessions are scoped to this opencode session: restarting/ending opencode closes them; reconnect after restart. connect/local default to name 'default'; reusing a name (also across SSH/local) closes the old terminal first (running command lost; failed connect does not restore it). Use exec on an existing terminal; use distinct -n names to keep terminals separate.",
-    zh: "统一终端 CLI：SSH / 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）；本地终端用 'local'，不要用 bash 直接跑。子命令：connect / local / exec / read / send / upload / download / status / disconnect / help；用 'help' 查看用法。长命令、需 stdin 或交互的命令：用默认提交后 status/read；禁止 -w。upload/download 走 SFTP，仅支持 SSH 会话。终端会话仅属于当前 opencode 会话，重启或退出 opencode 会关闭，需重新连接。connect/local 未传 -n 时名为 default；同名（包括 SSH 与 local 之间）会先关闭旧终端（运行中命令丢失，新连接失败也不恢复）。已有终端用 exec；并行保留用不同 -n。",
+    en: "Unified terminal CLI: SSH / local shell (wsl, pwsh, bash) / container (docker exec); use 'local' for local terminals instead of bash. Subcommands: connect / local / exec / read / send / upload / download / status / disconnect / help; use 'help' for usage. exec waits up to 5s by default (configurable); if still running it returns async. Use --async to return immediately. Use status/read for long/interactive commands; there is no -w. upload/download use SFTP and require an SSH session. Terminal sessions are scoped to this opencode session: restarting/ending opencode closes them; reconnect after restart. connect/local default to name 'default'; reusing a name (also across SSH/local) closes the old terminal first (running command lost; failed connect does not restore it). Use exec on an existing terminal; use distinct -n names to keep terminals separate.",
+    zh: "统一终端 CLI：SSH / 本地 shell（wsl、pwsh、bash）/ 容器（docker exec）；本地终端用 'local'，不要用 bash 直接跑。子命令：connect / local / exec / read / send / upload / download / status / disconnect / help；用 'help' 查看用法。exec 默认最多同步等待 5 秒（可配置）；超时自动转异步，--async 可立即异步。长命令/交互命令用 status/read；不再提供 -w。upload/download 走 SFTP，仅支持 SSH 会话。终端会话仅属于当前 opencode 会话，重启或退出 opencode 会关闭，需重新连接。connect/local 未传 -n 时名为 default；同名（包括 SSH 与 local 之间）会先关闭旧终端（运行中命令丢失，新连接失败也不恢复）。已有终端用 exec；并行保留用不同 -n。",
   },
   term_cli_args: {
     en: "Full command line string, e.g. 'local \"wsl bash\"' / 'exec \"ls -la\"' / 'connect user@host' / 'upload ./a.txt ~/a.txt'; defaults to 'help' when empty.",
@@ -89,10 +89,10 @@ Subcommands:
       -p accepts plain text or file:<path> (read password from file, avoids exposure)
   local "<command>" [-n name] [-c cwd]
       start a local/container terminal (e.g. "pwsh" / "docker exec -it <container> sh")
-  exec "<command>" [--base64 | --file <path>] [-n name] [-w]
-      run a command in the terminal (default: submit and return immediately without waiting for the result; -w waits until the command actually finishes — use it only for commands expected to finish quickly; NEVER use -w for long-running / stdin-reading / interactive / server / watch / tail -f / build / install / scan / REPL commands, because -w keeps waiting as long as the command runs and can hang indefinitely; use the default and poll with status/read)
-  read [-n name] [-s buffer|history] [--includeCommand]
-      read the current/last command output only: no -s returns the running command snapshot or the last completed result; -s buffer reads the live buffer only while busy (idle falls back to the last completed result); -s history reads the last completed result. Tool metadata is on the first line; actual output follows after a blank line. No output yet returns "No output yet." read never waits for completion
+  exec "<command>" [--base64 | --file <path>] [-n name] [--async]
+      run a command in the terminal (default: wait up to exec.timeoutMs, then return async if still running; --async returns immediately; no -w)
+  read [-n name] [-s buffer|history] [--timeout ms] [--includeCommand]
+      read the current/last command output only: when busy, wait up to exec.timeoutMs (or --timeout) for completion; if it finishes, return the result; otherwise return status only. Use -s buffer to explicitly read the live buffer; -s history reads the last completed result. Tool metadata appears only for busy/timeout/error; a normal idle result is output only. No output yet returns "No output yet."
   send "<text>" [--base64 | --file <path>] [-n name]
       send text/keystrokes (\\xHH any hex byte, \\t Tab, \\r/\\n Enter, \\x03 Ctrl-C, \\x04 Ctrl-D, \\x1a Ctrl-Z, \\x1b Esc)
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
@@ -144,10 +144,10 @@ Examples:
       -p 支持明文或 file:<路径>（从文件读密码，避免暴露）
   local "<command>" [-n name] [-c cwd]
       启动本地/容器终端（如 "pwsh" / "docker exec -it <容器> sh"）
-  exec "<command>" [--base64 | --file <path>] [-n name] [-w]
-      在指定终端执行命令（默认：提交后立即返回、不等结果；-w 等到命令真正结束 —— 只适用于预期很快结束的命令；**禁止**对长时间运行 / 需要 stdin / 交互 / server / watch / tail -f / 构建 / 安装 / 扫描 / REPL 命令加 -w：只要命令没结束 -w 就会一直等，可能永久阻塞；这些命令请用默认模式，再用 status/read 轮询）
-  read [-n name] [-s buffer|history] [--includeCommand]
-      只读当前/最后一条命令的输出：不传 -s 时，运行中返回当前命令快照，空闲返回最后一条已完成结果；-s buffer 只在运行中读实时 buffer，空闲回退到最后一条已完成结果；-s history 读最后一条已完成结果。工具元数据在首行，空行后是实际输出；没有输出返回“暂时没有输出”。read 不等待命令完成
+  exec "<command>" [--base64 | --file <path>] [-n name] [--async]
+      在指定终端执行命令（默认最多同步等待 exec.timeoutMs，超时自动转异步；--async 立即异步；不再提供 -w）
+  read [-n name] [-s buffer|history] [--timeout ms] [--includeCommand]
+      只读当前/最后一条命令的输出：busy 时最多等待 exec.timeoutMs（可用 --timeout 覆盖）等完成，完成则直接返回结果，超时只返回状态信息；需要读实时 buffer 必须显式 -s buffer；-s history 读最后一条已完成结果。工具元数据只在 busy/超时/错误时显示；正常 idle 结果只返回实际输出；没有输出返回“暂时没有输出”。
   send "<text>" [--base64 | --file <path>] [-n name]
       发送文本/按键（\\xHH 任意十六进制字节、\\t Tab、\\r/\\n 回车、\\x03 Ctrl-C、\\x04 Ctrl-D、\\x1a Ctrl-Z、\\x1b Esc）
   upload <local> <remote> [-n name] [--overwrite] [--mkdir]
@@ -208,8 +208,8 @@ Examples:
     zh: "用法: local \"<command>\" [-n name] [-c cwd]",
   },
   cli_exec_usage: {
-    en: "Usage: exec \"<command>\" [--base64 | --file <path>] [-n name] [-w]",
-    zh: "用法: exec \"<command>\" [--base64 | --file <path>] [-n name] [-w]",
+    en: "Usage: exec \"<command>\" [--base64 | --file <path>] [-n name] [--async]",
+    zh: "用法: exec \"<command>\" [--base64 | --file <path>] [-n name] [--async]",
   },
   cli_send_usage: {
     en: "Usage: send \"<text>\" [--base64 | --file <path>] [-n name]",
@@ -389,13 +389,33 @@ Examples:
     en: "Execution failed",
     zh: "执行失败",
   },
+  exec_async_timeout: {
+    en: "Command still running after {seconds}s; it was not interrupted. Use term_cli status to check completion, then term_cli read.",
+    zh: "命令运行超过 {seconds}s，仍在继续（未中断）。用 term_cli status 查完成状态，再用 term_cli read 读取。",
+  },
+  exec_no_output: {
+    en: "Command completed with no output.",
+    zh: "命令已完成，没有输出。",
+  },
+  exec_no_result: {
+    en: "Command finished but no matching result was recorded (terminal may have changed). Check status.",
+    zh: "命令已结束，但没有记录到对应结果（终端状态可能已变化）。请用 status 检查。",
+  },
+  exec_disconnected: {
+    en: "Terminal disconnected while waiting for the command result.",
+    zh: "等待命令结果时终端已断开。",
+  },
+  exec_w_removed: {
+    en: "-w has been removed. exec waits up to exec.timeoutMs by default; use --async for immediate return.",
+    zh: "-w 已移除。exec 默认最多等待 exec.timeoutMs；需要立即异步请用 --async。",
+  },
   session_disconnected: {
     en: "Terminal disconnected",
     zh: "终端已断开",
   },
   status_busy_hint: {
-    en: "\nHint: a command is still running. Wait and retry, or call term_cli read for partial output. Do not re-run it with -w.",
-    zh: "\n提示：已有命令在运行。等它结束，或直接用 term_cli read 读取部分输出；不要用 -w 重跑。",
+    en: "\nHint: a command is still running. Wait and retry, or call term_cli read for partial output. Do not re-run it.",
+    zh: "\n提示：已有命令在运行。等它结束，或直接用 term_cli read 读取部分输出；不要重跑。",
   },
   status_idle_hint: {
     en: "\nHint: no command running. You can safely execute a new command or call term_cli read for remaining output.",
@@ -468,8 +488,8 @@ Examples:
     zh: "未连接",
   },
   cmd_busy: {
-    en: "Previous command still running; poll with `term_cli status` first",
-    zh: "上一条命令仍在运行，请先用 `term_cli status` 查询状态",
+    en: "Previous command is still running; wait for it to finish, or use term_cli read to wait for its result.",
+    zh: "上一条命令仍在运行；请等它结束，或用 term_cli read 等待结果。",
   },
   cmd_continuation: {
     en: "Command would enter shell continuation (unclosed quote/backtick/escape); aborted",

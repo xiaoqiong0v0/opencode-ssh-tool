@@ -28,10 +28,19 @@ export interface PermissionConfig {
   allow: string[]
 }
 
+/** exec/status 共享的超时与轮询配置 */
+export interface ExecConfig {
+  /** 同步等待上限（ms）；0=立即异步/不等待 */
+  timeoutMs: number
+  /** busy 时的轮询间隔（ms） */
+  pollMs: number
+}
+
 /** 工具整体配置 */
 export interface ToolConfig {
   server: ServerConfig
   history: HistoryConfig
+  exec: ExecConfig
   /** 工具语言：工具描述 / CLI / agent·session 文案（默认 en，可用环境变量 SSH_TOOL_LANG 覆盖） */
   toolLang: Lang
   /** Web 界面语言：仅页面 UI 文案（默认 en，可用环境变量 SSH_WEB_LANG 覆盖） */
@@ -56,6 +65,10 @@ const DEFAULT_CONFIG: ToolConfig = {
   history: {
     // 保留的消息对数（最小 1，保留最新）
     maxMessages: 100,
+  },
+  exec: {
+    timeoutMs: 5000,
+    pollMs: 1000,
   },
   toolLang: "en",
   webLang: "en",
@@ -88,6 +101,12 @@ const CONFIG_TEMPLATE = `{
   "history": {
     // 保留的消息对数上限（默认 100，最小 1）。超出时移除最旧的一对
     "maxMessages": 100
+  },
+  "exec": {
+    // exec 默认同步等待 / status busy 的最长等待（毫秒）；0 = 立即异步/不等待
+    "timeoutMs": 5000,
+    // busy 时的轮询间隔（毫秒）
+    "pollMs": 1000
   },
   // 工具语言（工具描述 / CLI / agent·session 文案）："en" | "zh"（默认 "en"，可用环境变量 SSH_TOOL_LANG 覆盖）
   "toolLang": "en",
@@ -141,6 +160,7 @@ export function loadConfig(): ToolConfig {
     const raw = parseJsonc(readFileSync(path, "utf8"))
     const server = (raw.server ?? {}) as Partial<ServerConfig>
     const history = (raw.history ?? {}) as Partial<HistoryConfig>
+    const exec = (raw.exec ?? {}) as Partial<ExecConfig>
     const permission = (raw.permission ?? {}) as Partial<PermissionConfig>
     // 语言：toolLang（工具）/ webLang（Web 界面）独立配置；向后兼容旧字段 lang（同时作为两者）
     const legacyLang: Lang | undefined = raw.lang === "zh" ? "zh" : raw.lang === "en" ? "en" : undefined
@@ -160,6 +180,14 @@ export function loadConfig(): ToolConfig {
       },
       history: {
         maxMessages: Math.max(1, history.maxMessages ?? DEFAULT_CONFIG.history.maxMessages),
+      },
+      exec: {
+        timeoutMs: typeof exec.timeoutMs === "number" && Number.isFinite(exec.timeoutMs) && exec.timeoutMs >= 0
+          ? exec.timeoutMs
+          : DEFAULT_CONFIG.exec.timeoutMs,
+        pollMs: typeof exec.pollMs === "number" && Number.isFinite(exec.pollMs) && exec.pollMs >= 1
+          ? exec.pollMs
+          : DEFAULT_CONFIG.exec.pollMs,
       },
       toolLang,
       webLang,
